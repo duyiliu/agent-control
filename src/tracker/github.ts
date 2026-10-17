@@ -112,10 +112,10 @@ export class GitHubTracker {
 
   /** Returns MERGED | CLOSED | OPEN for an existing PR number. */
   async getPrState(repo: string, prNumber: number): Promise<'MERGED' | 'CLOSED' | 'OPEN'> {
-    const r = await this.ghJson<{ state: string; merged: boolean }>([
-      'pr', 'view', String(prNumber), '-R', repo, '--json', 'state,merged',
+    const r = await this.ghJson<{ state: string }>([
+      'pr', 'view', String(prNumber), '-R', repo, '--json', 'state',
     ]);
-    if (r.merged) return 'MERGED';
+    if (r.state === 'MERGED') return 'MERGED';
     return r.state === 'CLOSED' ? 'CLOSED' : 'OPEN';
   }
 
