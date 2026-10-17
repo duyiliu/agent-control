@@ -4,6 +4,9 @@ import { runCodex } from '../runners/codex.js';
 import { REVIEW_SCHEMA, buildReviewPrompt, type PromptContext } from '../scheduler/prompts.js';
 import type { AppConfig, ReviewResult } from '../types.js';
 
+/** The review PROCESS failed (exit/timeout/spawn) — not a code verdict. */
+export class ReviewInfraError extends Error {}
+
 export interface ReviewDeps {
   agentConfig: AppConfig['agent'];
   timeoutMs: number;
@@ -20,6 +23,7 @@ export interface ReviewDeps {
 export async function runReview(
   ctx: PromptContext,
   testEvidence: string,
+  diffEvidence: string,
   deps: ReviewDeps,
 ): Promise<{ result: ReviewResult; logPath: string }> {
   mkdirSync(deps.artifactsDir, { recursive: true });
@@ -28,32 +32,37 @@ export async function runReview(
   const logPath = join(deps.artifactsDir, 'review-codex.jsonl');
   writeFileSync(schemaPath, JSON.stringify(REVIEW_SCHEMA), 'utf8');
 
-  const proc = await runCodex(
-    {
-      workdir: ctx.worktreePath,
-      prompt: buildReviewPrompt(ctx, testEvidence),
-      sandbox: 'read-only',
-      timeoutMs: deps.timeoutMs,
-      logPath,
-      schemaPath,
-      lastMessagePath: lastMsgPath,
-      signal: deps.signal,
-      onSpawn: deps.onSpawn,
-    },
-    deps.agentConfig,
-  );
+  const callReview = () =>
+    runCodex(
+      {
+        workdir: ctx.worktreePath,
+        prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence),
+        sandbox: 'read-only',
+        timeoutMs: deps.timeoutMs,
+        logPath,
+        schemaPath,
+        lastMessagePath: lastMsgPath,
+        signal: deps.signal,
+        onSpawn: deps.onSpawn,
+      },
+      deps.agentConfig,
+    );
+
+  let proc = await callReview();
+  // One retry for transient infra failures (e.g. model-list refresh timeouts).
+  if (!proc.aborted && (proc.exitCode !== 0 || proc.timedOut)) {
+    await new Promise((r) => setTimeout(r, 10_000));
+    proc = await callReview();
+  }
 
   if (proc.aborted) {
     return { result: { verdict: 'BLOCK', summary: 'review aborted (cancelled)', findings: [] }, logPath };
   }
   if (proc.timedOut) {
-    return { result: { verdict: 'BLOCK', summary: 'review timed out', findings: [] }, logPath };
+    throw new ReviewInfraError(`review timed out after ${deps.timeoutMs}ms`);
   }
   if (proc.exitCode !== 0) {
-    return {
-      result: { verdict: 'BLOCK', summary: `review process exited ${proc.exitCode}: ${proc.stderrTail.slice(-2000)}`, findings: [] },
-      logPath,
-    };
+    throw new ReviewInfraError(`review process exited ${proc.exitCode}: ${proc.stderrTail.slice(-2000)}`);
   }
   if (!existsSync(lastMsgPath)) {
     return { result: { verdict: 'BLOCK', summary: 'review produced no structured output', findings: [] }, logPath };

@@ -14,7 +14,7 @@ projects:
     ready_label: agent-ready
     branch_prefix: agent/issue-
     checks:
-      - argv: [node, --test, tests/]
+      - argv: [node, --test]
         timeout_seconds: 300
 
 agent:

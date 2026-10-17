@@ -120,6 +120,7 @@ export interface RunRow {
   phase: Phase;
   return_phase: Phase | null;
   resume_count: number;
+  fix_count: number;
   cancel_requested: number;
   pid: number | null;
   process_identity: string | null;

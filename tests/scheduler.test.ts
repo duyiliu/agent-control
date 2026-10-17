@@ -18,6 +18,7 @@ function fakeWorkspace(): GitWorkspace {
   return {
     ensureWorktree: async (i: { worktreePath: string }) => ({ path: i.worktreePath, created: true }),
     isDirty: async () => false,
+    commitAll: async () => false,
     aheadCount: async () => 1,
     diffVsBase: async () => 'diff',
     push: async () => {},
@@ -304,6 +305,13 @@ test('workspace ensureWorktree creates and reuses (real git)', async () => {
     assert.equal(second.created, false);
     assert.equal(await ws.isDirty(wt), false);
     assert.equal(await ws.aheadCount(wt, 'main'), 0);
+
+    // Host-side fallback commit: dirty work → committed verbatim.
+    writeFileSync(join(wt, 'b.txt'), 'new');
+    assert.equal(await ws.isDirty(wt), true);
+    assert.equal(await ws.commitAll(wt, 'agent-control: commit uncommitted agent work'), true);
+    assert.equal(await ws.isDirty(wt), false);
+    assert.equal(await ws.aheadCount(wt, 'main'), 1);
   } finally {
     try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* temp residue ok */ }
   }

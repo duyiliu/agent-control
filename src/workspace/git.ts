@@ -69,6 +69,14 @@ export class GitWorkspace {
     return res.stdoutTail.trim().length > 0;
   }
 
+  /** Host-side fallback: commit leftover agent changes verbatim. */
+  async commitAll(worktreePath: string, message: string): Promise<boolean> {
+    if (!(await this.isDirty(worktreePath))) return false;
+    await this.git(['add', '-A'], worktreePath);
+    await this.git(['commit', '-m', message], worktreePath);
+    return true;
+  }
+
   async aheadCount(worktreePath: string, baseBranch: string): Promise<number> {
     const res = await this.git(['rev-list', '--count', `${baseBranch}..HEAD`], worktreePath);
     const n = Number(res.stdoutTail.trim());
@@ -76,12 +84,16 @@ export class GitWorkspace {
   }
 
   async diffVsBase(worktreePath: string, baseBranch: string, maxChars = 200_000): Promise<string> {
-    const stat = await this.git(['diff', '--stat', `${baseBranch}...HEAD`], worktreePath);
-    const diff = await this.git(
-      ['diff', '--find-renames', `${baseBranch}...HEAD`],
-      worktreePath,
-      120_000,
-    );
+    // Three-dot (merge-base) diff matches GitHub PR semantics; fall back to a
+    // two-dot tip diff when base history was rewritten and no merge base exists.
+    const mb = await this.exec({
+      argv: ['git', 'merge-base', baseBranch, 'HEAD'],
+      cwd: worktreePath,
+      timeoutMs: 15_000,
+    });
+    const range = mb.exitCode === 0 ? `${baseBranch}...HEAD` : `${baseBranch}..HEAD`;
+    const stat = await this.git(['diff', '--stat', range], worktreePath);
+    const diff = await this.git(['diff', '--find-renames', range], worktreePath, 120_000);
     let out = `## STAT\n${stat.stdoutTail}\n## DIFF\n${diff.stdoutTail}`;
     if (out.length > maxChars) out = `${out.slice(0, maxChars)}\n...[truncated ${out.length - maxChars} chars]`;
     return out;

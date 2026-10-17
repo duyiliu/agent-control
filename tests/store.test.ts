@@ -9,7 +9,7 @@ test('migrations are idempotent and schema_version recorded', () => {
     s1.close();
     const s2 = makeStore(dir); // reopen same db
     const v = s2.db.prepare('SELECT MAX(version) v FROM schema_version').get() as { v: number };
-    assert.equal(v.v, 1);
+    assert.equal(v.v, 2);
     s2.close();
   } finally {
     cleanup(dir);

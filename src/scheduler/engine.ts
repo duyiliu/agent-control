@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { Store } from '../store/sqlite.js';
 import { RunLog, type AppLog } from '../telemetry/logging.js';
@@ -286,6 +286,7 @@ export class Engine {
               this.finish(run, task, 'FAILED', `codex exited ${res.exitCode}${res.timedOut ? ' (timeout)' : ''}`);
               return;
             }
+            await this.commitLeftovers(run, log, worktreePath, task);
             store.transition(runId, phase, (phase = 'VERIFYING'));
             break;
           }
@@ -296,7 +297,7 @@ export class Engine {
               store.transition(runId, phase, (phase = 'REVIEWING'));
             } else {
               lastFailureEvidence = summary.failureEvidence;
-              if (this.canFix(task)) {
+              if (this.canFix(run)) {
                 store.transition(runId, phase, (phase = 'FIXING'), { return_to: 'VERIFYING' });
                 this.setReturnPhase(runId, 'VERIFYING');
                 returnAfterFix = 'VERIFYING';
@@ -311,17 +312,34 @@ export class Engine {
           case 'REVIEWING': {
             const issue = await this.requireIssue(project, task);
             if (!issue) { this.finish(run, task, 'CANCELED', 'issue closed/label revoked mid-run'); return; }
-            const { result, logPath } = await this.runReviewFn(
+            let diffEvidence: string;
+            try {
+              diffEvidence = await this.workspace.diffVsBase(worktreePath, project.base_branch);
+              writeFileSync(join(this.artifactsDirFor(run), 'review-diff.patch'), diffEvidence, 'utf8');
+            } catch (err) {
+              diffEvidence = `(host could not produce diff: ${String(err).slice(0, 300)})`;
+            }
+            let reviewOutcome: Awaited<ReturnType<typeof runReview>>;
+            try {
+              reviewOutcome = await this.runReviewFn(
               ctx,
               this.testEvidenceFor(run),
+              diffEvidence,
               {
                 agentConfig: this.config.agent,
                 timeoutMs: this.config.server.max_task_minutes * 60_000,
                 artifactsDir: this.artifactsDirFor(run),
-                signal,
-                onSpawn: (pid, identity) => store.updateRunFields(runId, { pid, process_identity: identity }),
-              },
-            );
+                  signal,
+                  onSpawn: (pid, identity) => store.updateRunFields(runId, { pid, process_identity: identity }),
+                },
+              );
+            } catch (err) {
+              // Review infrastructure failure (process exit/timeout/network) is
+              // not a verdict — fail the run without burning fix budget.
+              this.finish(run, task, 'FAILED', `review infra: ${String(err).slice(0, 400)}`);
+              return;
+            }
+            const { result, logPath } = reviewOutcome;
             store.addCheck({
               run_id: runId, kind: 'review', command: 'codex exec (read-only review)',
               exit_code: null, artifact_path: logPath, verdict: result.verdict,
@@ -331,7 +349,7 @@ export class Engine {
             } else if (result.verdict === 'HUMAN_REVIEW_REQUIRED') {
               this.finish(run, task, 'BLOCKED', `review requires human: ${result.summary}`);
               return;
-            } else if (this.canFix(task)) {
+            } else if (this.canFix(run)) {
               lastFailureEvidence = `Review BLOCK: ${result.summary}\n${result.findings.join('\n')}`;
               store.transition(runId, phase, (phase = 'FIXING'), { return_to: 'REVIEWING', verdict: result });
               this.setReturnPhase(runId, 'REVIEWING');
@@ -344,7 +362,7 @@ export class Engine {
           }
 
           case 'FIXING': {
-            this.store.bumpFixRounds(task.id);
+            this.store.bumpRunFixCount(runId);
             const evidence = lastFailureEvidence || this.lastCheckEvidence(run);
             const res = await this.callCoder(run, log, ctx, { workdir: worktreePath }, buildFixPrompt(ctx, evidence), signal);
             if (res.aborted) { this.finish(run, task, 'CANCELED', 'cancelled'); return; }
@@ -352,6 +370,7 @@ export class Engine {
               this.finish(run, task, 'FAILED', `fix attempt exited ${res.exitCode}${res.timedOut ? ' (timeout)' : ''}`);
               return;
             }
+            await this.commitLeftovers(run, log, worktreePath, task);
             const next = returnAfterFix ?? 'VERIFYING';
             this.setReturnPhase(runId, null);
             store.transition(runId, phase, (phase = next));
@@ -376,7 +395,7 @@ export class Engine {
             } catch (err) {
               if (err instanceof PublishError && err.reason === 'uncommitted_changes') {
                 lastFailureEvidence = '发布前工作区存在未提交改动。请提交所有改动 (git add -A && git commit)。';
-                if (this.canFix(task)) {
+                if (this.canFix(run)) {
                   store.transition(runId, phase, (phase = 'FIXING'), { return_to: 'PUBLISHING_PR', reason: err.reason });
                   this.setReturnPhase(runId, 'PUBLISHING_PR');
                   returnAfterFix = 'PUBLISHING_PR';
@@ -395,6 +414,23 @@ export class Engine {
   }
 
   // ---------------- helpers ----------------
+
+  /**
+   * Host-side fallback commit: the agent's sandbox may block `git commit`
+   * (observed on Windows, exit 0xC0000142). Commit leftovers verbatim so
+   * later phases (review diff, publish) see a clean, committed state.
+   */
+  private async commitLeftovers(run: RunRow, log: RunLog, worktreePath: string, task: TaskRow) {
+    try {
+      const msg = `agent-control: commit uncommitted agent work for issue #${task.issue_number}`;
+      if (await this.workspace.commitAll(worktreePath, msg)) {
+        log.event('host_fallback_commit', { run: run.run_id });
+      }
+    } catch (err) {
+      log.event('host_fallback_commit_failed', { run: run.run_id, error: String(err).slice(0, 300) });
+    }
+  }
+
 
   private async makePromptContext(run: RunRow, task: TaskRow, project: ProjectConfig): Promise<PromptContext> {
     const issue = await this.tracker.getIssue(project.repo, task.issue_number);
@@ -466,9 +502,9 @@ export class Engine {
     return last ? `最近验证: ${last.command} → ${last.verdict}` : '(no recorded evidence)';
   }
 
-  private canFix(task: TaskRow): boolean {
-    const fresh = this.store.getTaskById(task.id);
-    return (fresh?.fix_rounds ?? 0) < this.config.server.retry_limit;
+  private canFix(run: RunRow): boolean {
+    const fresh = this.store.getRun(run.run_id);
+    return (fresh?.fix_count ?? 0) < this.config.server.retry_limit;
   }
 
   /**

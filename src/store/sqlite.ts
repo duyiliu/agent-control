@@ -10,7 +10,7 @@ import type {
 } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -104,16 +104,25 @@ export class Store {
       .prepare('SELECT MAX(version) AS v FROM schema_version')
       .get() as { v: number | null } | undefined;
     const current = row?.v ?? 0;
+    if (current > SCHEMA_VERSION) {
+      throw new Error(`database schema v${current} is newer than supported v${SCHEMA_VERSION}`);
+    }
     if (current < 1) {
       this.tx(() => {
         this.db.exec(DDL);
         this.db
           .prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)')
-          .run(SCHEMA_VERSION, now());
+          .run(1, now());
       });
     }
-    if (current > SCHEMA_VERSION) {
-      throw new Error(`database schema v${current} is newer than supported v${SCHEMA_VERSION}`);
+    if (current < 2) {
+      // v2: per-run fix budget (fix rounds must not accumulate across attempts).
+      this.tx(() => {
+        this.db.exec('ALTER TABLE runs ADD COLUMN fix_count INTEGER NOT NULL DEFAULT 0');
+        this.db
+          .prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)')
+          .run(2, now());
+      });
     }
   }
 
@@ -212,6 +221,12 @@ export class Store {
     return (this.getTaskById(id)?.fix_rounds ?? 0);
   }
 
+  /** Per-attempt fix counter — the budget lives on the run, not the task. */
+  bumpRunFixCount(runId: string): number {
+    this.db.prepare('UPDATE runs SET fix_count = fix_count + 1 WHERE run_id = ?').run(runId);
+    return (this.getRun(runId)?.fix_count ?? 0);
+  }
+
   // ---------- runs ----------
 
   /** Atomically verify no active run exists and create a new attempt. */
@@ -302,6 +317,7 @@ export class Store {
       branch: string | null;
       pr_url: string | null;
       resume_count: number;
+      fix_count: number;
     }>,
   ) {
     const sets: string[] = [];

@@ -28,10 +28,19 @@ export async function publishDraftPr(input: {
   const { project, worktreePath, branch, issue, workspace, tracker } = input;
 
   if (await workspace.isDirty(worktreePath)) {
-    throw new PublishError(
-      `worktree has uncommitted changes at publish time`,
-      'uncommitted_changes',
+    // The agent is asked to commit, but sandbox quirks (e.g. codex on Windows
+    // failing to spawn git) can leave uncommitted leftovers. Commit them
+    // verbatim as the host — never fabricate content, just record what exists.
+    await workspace.commitAll(
+      worktreePath,
+      `agent-control: commit uncommitted agent work for issue #${issue.number}`,
     );
+    if (await workspace.isDirty(worktreePath)) {
+      throw new PublishError(
+        `worktree still has uncommitted changes after fallback commit`,
+        'uncommitted_changes',
+      );
+    }
   }
   if ((await workspace.aheadCount(worktreePath, project.base_branch)) === 0) {
     throw new PublishError(`branch ${branch} has no commits vs ${project.base_branch}`, 'no_commits');

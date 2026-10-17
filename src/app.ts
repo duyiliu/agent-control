@@ -7,7 +7,7 @@ import { reconcile } from './scheduler/recovery.js';
 import { GitHubTracker } from './tracker/github.js';
 import { GitWorkspace } from './workspace/git.js';
 import { AppLog } from './telemetry/logging.js';
-import { pidAlive, processStartedAt, runProc, which } from './proc.js';
+import { pidAlive, runProc, which } from './proc.js';
 import { resolveCodexInvocation } from './runners/codex.js';
 import type { AppConfig } from './types.js';
 
@@ -146,7 +146,7 @@ export async function runDoctor(config: AppConfig | null, configError?: string):
     ? { name: 'node', status: 'PASS', detail: `v${process.versions.node}` }
     : { name: 'node', status: 'FAIL', detail: `v${process.versions.node} — need >=22.13 (node:sqlite)` });
 
-  for (const tool of ['git', 'gh', 'codex']) {
+  for (const tool of ['git', 'gh']) {
     const p = which(tool);
     if (!p) { items.push({ name: tool, status: 'FAIL', detail: 'not on PATH' }); continue; }
     const res = await runProc({ argv: [tool, '--version'], timeoutMs: 15_000 });
@@ -155,22 +155,31 @@ export async function runDoctor(config: AppConfig | null, configError?: string):
       : { name: tool, status: 'FAIL', detail: `${p} exists but --version failed` });
   }
 
+  // codex is probed through its resolved invocation (npm .cmd shims cannot be
+  // spawned without a shell on Windows — that would be a false FAIL).
   const inv = resolveCodexInvocation();
-  items.push(
-    inv.prefix.length > 0 && inv.argv0 === process.execPath
-      ? { name: 'codex-invocation', status: 'PASS', detail: `node ${inv.prefix[0]}` }
-      : { name: 'codex-invocation', status: 'UNVERIFIED', detail: `${inv.argv0} ${inv.prefix.join(' ')}` },
-  );
+  const codexArgv = (args: string[]) => [inv.argv0, ...inv.prefix, ...args];
+  const codexFound = inv.argv0 === 'codex' ? false : true;
+  if (!codexFound) {
+    items.push({ name: 'codex', status: 'FAIL', detail: 'not on PATH' });
+    items.push({ name: 'codex-invocation', status: 'FAIL', detail: 'unresolved' });
+    items.push({ name: 'codex-auth', status: 'FAIL', detail: 'codex not on PATH' });
+  } else {
+    const v = await runProc({ argv: codexArgv(['--version']), timeoutMs: 20_000 });
+    items.push(v.exitCode === 0
+      ? { name: 'codex', status: 'PASS', detail: `${inv.argv0 === process.execPath ? 'node ' + inv.prefix[0] : inv.argv0} — ${v.stdoutTail.trim().split('\n')[0]}` }
+      : { name: 'codex', status: 'FAIL', detail: v.stderrTail.trim().slice(0, 200) });
+    items.push({ name: 'codex-invocation', status: 'PASS', detail: codexArgv(['exec', '…']).join(' ') });
+    const codexAuth = await runProc({ argv: codexArgv(['login', 'status']), timeoutMs: 20_000 });
+    items.push(codexAuth.exitCode === 0
+      ? { name: 'codex-auth', status: 'PASS', detail: codexAuth.stdoutTail.trim().slice(0, 120) }
+      : { name: 'codex-auth', status: 'FAIL', detail: codexAuth.stderrTail.trim().slice(0, 200) });
+  }
 
   const ghAuth = await runProc({ argv: ['gh', 'auth', 'status'], timeoutMs: 20_000 });
   items.push(ghAuth.exitCode === 0
     ? { name: 'gh-auth', status: 'PASS', detail: 'authenticated' }
     : { name: 'gh-auth', status: 'FAIL', detail: ghAuth.stderrTail.trim().slice(0, 200) });
-
-  const codexAuth = await runProc({ argv: ['codex', 'login', 'status'], timeoutMs: 20_000 });
-  items.push(codexAuth.exitCode === 0
-    ? { name: 'codex-auth', status: 'PASS', detail: codexAuth.stdoutTail.trim().slice(0, 120) }
-    : { name: 'codex-auth', status: 'FAIL', detail: codexAuth.stderrTail.trim().slice(0, 200) });
 
   if (!config) {
     items.push({ name: 'config', status: 'FAIL', detail: configError ?? 'not loaded' });
