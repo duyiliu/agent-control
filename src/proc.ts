@@ -230,7 +230,8 @@ export async function findProcessesReferencing(needle: string): Promise<number[]
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        `(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${esc}*' }).ProcessId -join ','`,
+        // Exclude $PID: the scanner's own command line contains the needle.
+        `(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*${esc}*' }).ProcessId -join ','`,
       ],
       timeoutMs: 20_000,
     });
