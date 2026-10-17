@@ -37,7 +37,7 @@ export async function runReview(
       {
         workdir: ctx.worktreePath,
         prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence),
-        sandbox: 'read-only',
+        sandbox: deps.agentConfig.review_sandbox,
         timeoutMs: deps.timeoutMs,
         logPath,
         schemaPath,

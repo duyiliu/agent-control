@@ -341,9 +341,15 @@ export class Engine {
             }
             const { result, logPath } = reviewOutcome;
             store.addCheck({
-              run_id: runId, kind: 'review', command: 'codex exec (read-only review)',
+              run_id: runId, kind: 'review', command: 'codex exec (review)',
               exit_code: null, artifact_path: logPath, verdict: result.verdict,
             });
+            // Guardrail (sandbox-free review): the reviewer must not modify
+            // the worktree. Anything dirty at this point is tampering.
+            if (await this.workspace.isDirty(worktreePath)) {
+              this.finish(run, task, 'BLOCKED', 'worktree modified during review; refusing to continue');
+              return;
+            }
             if (result.verdict === 'PASS') {
               store.transition(runId, phase, (phase = 'PUBLISHING_PR'));
             } else if (result.verdict === 'HUMAN_REVIEW_REQUIRED') {
@@ -389,6 +395,15 @@ export class Engine {
                 beforeCreate: () => this.gateApproval(project, task),
               });
               store.updateRunFields(runId, { pr_url: pr.url });
+              // Post-create check: no atomic approve+publish exists on
+              // GitHub, so bound the residual window — if approval was
+              // revoked during publish, close the PR we just created.
+              const postGate = await this.gateApproval(project, task);
+              if (postGate !== 'ok') {
+                try { await this.tracker.closePr(project.repo, pr.number); } catch { /* best effort */ }
+                this.finish(run, task, postGate, 'approval revoked just after PR create; PR closed');
+                return;
+              }
               this.finish(run, task, 'AWAITING_MERGE', undefined, { pr_url: pr.url });
               await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-pr');
               await this.labelQuietly(project.repo, task.issue_number, 'remove', 'agent-running');

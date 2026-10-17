@@ -76,9 +76,14 @@ export function loadConfig(path: string): AppConfig {
   const agent = asObj(root['agent'] ?? {}, 'agent');
   const provider = agent['provider'] ?? 'codex';
   if (provider !== 'codex') fail('agent.provider: only "codex" is supported in MVP');
-  const sandbox = agent['sandbox'] ?? 'workspace-write';
-  if (sandbox !== 'workspace-write' && sandbox !== 'read-only') {
-    fail('agent.sandbox must be workspace-write or read-only');
+  const sandboxModes = ['read-only', 'workspace-write', 'danger-full-access'];
+  const sandbox = agent['sandbox'] ?? 'danger-full-access';
+  if (!sandboxModes.includes(sandbox as string)) {
+    fail('agent.sandbox must be read-only, workspace-write or danger-full-access');
+  }
+  const reviewSandbox = agent['review_sandbox'] ?? 'danger-full-access';
+  if (!sandboxModes.includes(reviewSandbox as string)) {
+    fail('agent.review_sandbox must be read-only, workspace-write or danger-full-access');
   }
   const envDeny = agent['env_deny'] ?? [];
   if (!Array.isArray(envDeny) || envDeny.some((e) => typeof e !== 'string')) {
@@ -102,8 +107,8 @@ export function loadConfig(path: string): AppConfig {
     agent: {
       provider: 'codex',
       model: agent['model'] !== undefined ? asStr(agent['model'], 'agent.model') : undefined,
-      sandbox: sandbox as 'workspace-write' | 'read-only',
-      review_sandbox: 'read-only',
+      sandbox: sandbox as AppConfig['agent']['sandbox'],
+      review_sandbox: reviewSandbox as AppConfig['agent']['review_sandbox'],
       env_deny: envDeny as string[],
     },
     approvals: {

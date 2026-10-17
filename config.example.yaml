@@ -19,8 +19,8 @@ projects:
 
 agent:
   provider: codex
-  sandbox: workspace-write
-  review_sandbox: read-only
+  sandbox: danger-full-access
+  review_sandbox: danger-full-access
   # model: gpt-5-codex   # optional override
   env_deny:
     - GH_TOKEN

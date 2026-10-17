@@ -69,8 +69,8 @@ export interface AppConfig {
   agent: {
     provider: 'codex';
     model?: string;
-    sandbox: 'read-only' | 'workspace-write';
-    review_sandbox: 'read-only';
+    sandbox: SandboxMode;
+    review_sandbox: SandboxMode;
     env_deny: string[];
   };
   approvals: {
@@ -79,6 +79,8 @@ export interface AppConfig {
     allow_auto_deploy: boolean;
   };
 }
+
+export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 
 export interface IssueData {
   number: number;

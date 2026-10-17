@@ -34,7 +34,7 @@ export function resolveCodexInvocation(envPath = process.env.PATH ?? ''): CodexI
 export interface CodexCallOpts {
   workdir: string;
   prompt: string;
-  sandbox: 'workspace-write' | 'read-only';
+  sandbox: AppConfig['agent']['sandbox'];
   timeoutMs: number;
   logPath?: string;
   schemaPath?: string;

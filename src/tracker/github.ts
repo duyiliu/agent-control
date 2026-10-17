@@ -134,6 +134,11 @@ export class GitHubTracker {
     return { number: num, url, state: 'OPEN', isDraft: true };
   }
 
+  /** Best-effort close of a PR (used when approval is revoked right after create). */
+  async closePr(repo: string, prNumber: number): Promise<void> {
+    await this.gh(['pr', 'close', String(prNumber), '-R', repo]);
+  }
+
   async ensureLabels(repo: string, labels: string[]): Promise<{ ok: boolean; missing: string[] }> {
     const rows = await this.ghJson<{ name: string }[]>([
       'label', 'list', '-R', repo, '--json', 'name', '--limit', '200',
