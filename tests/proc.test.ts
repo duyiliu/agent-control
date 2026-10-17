@@ -45,13 +45,22 @@ test('runProc stdinData is piped and stdin closed', async () => {
   assert.match(res.stdoutTail, /got:payload-123/);
 });
 
-test('scrubEnvForAgent strips GitHub tokens, keeps PATH', () => {
-  const env = { PATH: '/x', GH_TOKEN: 't1', GITHUB_TOKEN: 't2', CUSTOM: 'v', SECRET_KEY: 'keep?' };
+test('scrubEnvForAgent: allowlist only — ambient secrets never pass', () => {
+  const env = {
+    PATH: '/x',
+    USERPROFILE: '/u/me',
+    GH_TOKEN: 't1',
+    GITHUB_TOKEN: 't2',
+    CUSTOM: 'v',
+    SECRET_KEY: 's',
+    AWS_SECRET_ACCESS_KEY: 'aws',
+  };
   const out = scrubEnvForAgent(env, ['CUSTOM']);
-  assert.equal(out.GH_TOKEN, undefined);
-  assert.equal(out.GITHUB_TOKEN, undefined);
-  assert.equal(out.CUSTOM, undefined);
   assert.equal(out.PATH, '/x');
+  assert.equal(out.USERPROFILE, '/u/me');
+  for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'SECRET_KEY', 'AWS_SECRET_ACCESS_KEY', 'CUSTOM']) {
+    assert.equal(out[k], undefined, k);
+  }
 });
 
 test('which finds node on this machine', () => {

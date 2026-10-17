@@ -5,7 +5,7 @@ import type { IssueData, PrInfo, ProjectConfig } from '../types.js';
 export class PublishError extends Error {
   constructor(
     message: string,
-    readonly reason: 'uncommitted_changes' | 'no_commits' | 'push_failed' | 'create_failed',
+    readonly reason: 'uncommitted_changes' | 'no_commits' | 'push_failed' | 'create_failed' | 'approval_revoked',
   ) {
     super(message);
   }
@@ -24,6 +24,12 @@ export async function publishDraftPr(input: {
   prBody: string;
   workspace: GitWorkspace;
   tracker: GitHubTracker;
+  /**
+   * Final approval re-check invoked immediately before `gh pr create`
+   * (after push). Returns 'ok' or the terminal phase the run should end with.
+   * Closes the TOCTOU window between the PUBLISHING_PR gate and the create.
+   */
+  beforeCreate?: () => Promise<string>;
 }): Promise<PrInfo> {
   const { project, worktreePath, branch, issue, workspace, tracker } = input;
 
@@ -49,6 +55,11 @@ export async function publishDraftPr(input: {
   const existing = await tracker.findPrForBranch(project.repo, branch);
   await workspace.push(worktreePath, branch);
   if (existing) return existing;
+
+  const gate = await input.beforeCreate?.();
+  if (gate && gate !== 'ok') {
+    throw new PublishError(`approval revoked before PR create: ${gate}`, 'approval_revoked');
+  }
 
   return tracker.createDraftPr(project.repo, {
     head: branch,

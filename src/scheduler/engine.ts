@@ -386,6 +386,7 @@ export class Engine {
               const pr = await publishDraftPr({
                 project, worktreePath, branch: run.branch ?? `${project.branch_prefix}${task.issue_number}`,
                 issue, prBody, workspace: this.workspace, tracker: this.tracker,
+                beforeCreate: () => this.gateApproval(project, task),
               });
               store.updateRunFields(runId, { pr_url: pr.url });
               this.finish(run, task, 'AWAITING_MERGE', undefined, { pr_url: pr.url });
@@ -393,6 +394,12 @@ export class Engine {
               await this.labelQuietly(project.repo, task.issue_number, 'remove', 'agent-running');
               return;
             } catch (err) {
+              if (err instanceof PublishError && err.reason === 'approval_revoked') {
+                // Re-evaluate to pick the right terminal phase.
+                const gate = await this.gateApproval(project, task);
+                this.finish(run, task, gate === 'ok' ? 'BLOCKED' : gate, 'approval revoked during publish');
+                return;
+              }
               if (err instanceof PublishError && err.reason === 'uncommitted_changes') {
                 lastFailureEvidence = '发布前工作区存在未提交改动。请提交所有改动 (git add -A && git commit)。';
                 if (this.canFix(run)) {

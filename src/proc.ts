@@ -112,6 +112,9 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
       } catch {
         /* already dead */
       }
+      // Windows: child.kill only terminates the direct process. Kill the
+      // whole tree so grandchildren spawned by codex cannot linger.
+      if (process.platform === 'win32' && child.pid != null) taskkillTree(child.pid);
       // Escalate if still alive after grace period.
       killTimer = setTimeout(() => {
         try {
@@ -119,6 +122,7 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
         } catch {
           /* noop */
         }
+        if (process.platform === 'win32' && child.pid != null) taskkillTree(child.pid);
       }, 5000);
     };
 
@@ -153,30 +157,94 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
   });
 }
 
-const DEFAULT_ENV_DENY = [
-  'GH_TOKEN',
-  'GITHUB_TOKEN',
-  'GH_ENTERPRISE_TOKEN',
-  'GITHUB_ENTERPRISE_TOKEN',
+/**
+ * Minimal environment passed to the agent child. An allowlist is the
+ * boundary: ambient secrets (CI tokens, cloud creds, arbitrary *_KEY) must
+ * never reach a process that executes model-chosen commands. Proxy vars are
+ * allowed because codex may need them to reach the provider; codex auth is
+ * file-based (~/.codex) and needs no env.
+ */
+const AGENT_ENV_ALLOW = [
+  'PATH', 'PATHEXT', 'COMSPEC', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR',
+  'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'USERNAME', 'USERDOMAIN', 'LOGONSERVER',
+  'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA', 'PUBLIC', 'ALLUSERSPROFILE',
+  'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432',
+  'COMMONPROGRAMFILES', 'COMMONPROGRAMFILES(X86)', 'COMMONPROGRAMW6432',
+  'TEMP', 'TMP', 'TMPDIR', 'OS', 'NUMBER_OF_PROCESSORS',
+  'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER', 'PROCESSOR_LEVEL', 'PROCESSOR_REVISION',
+  'PSMODULEPATH', 'POWERSHELL_EXE',
+  'HOME', 'SHELL', 'TERM', 'USER', 'LOGNAME',
+  'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME',
+  'LANG', 'LC_ALL', 'LC_CTYPE',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+  'CODEX_HOME', 'CODEX_CI',
 ];
 
 /**
- * Build an environment for the coding/review agent that strips GitHub
- * credentials and operator-defined secrets. The agent authenticates to the
- * model provider via its own login; it must never inherit repo write tokens.
+ * Build the agent environment: allowlist only, minus `extraDeny`. Never
+ * inherits GitHub tokens or other ambient secrets.
  */
 export function scrubEnvForAgent(
   env: NodeJS.ProcessEnv,
   extraDeny: string[] = [],
 ): NodeJS.ProcessEnv {
-  const deny = new Set([...DEFAULT_ENV_DENY, ...extraDeny]);
+  const allow = new Set(AGENT_ENV_ALLOW);
+  const deny = new Set(extraDeny.map((k) => k.toUpperCase()));
   const out: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(env)) {
     if (v === undefined) continue;
-    if (deny.has(k.toUpperCase())) continue;
+    const key = k.toUpperCase();
+    if (!allow.has(key) || deny.has(key)) continue;
     out[k] = v;
   }
   return out;
+}
+
+/** Kill a Windows process tree (best effort, fire and forget). */
+function taskkillTree(pid: number) {
+  try {
+    const t = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    t.on('error', () => {});
+    t.unref();
+  } catch {
+    /* noop */
+  }
+}
+
+/**
+ * PIDs of live processes whose command line contains `needle` (typically a
+ * worktree path). Used at recovery to detect orphaned agent processes.
+ * Returns null when the scan itself fails — callers must treat that as
+ * "cannot prove clean".
+ */
+export async function findProcessesReferencing(needle: string): Promise<number[] | null> {
+  if (process.platform === 'win32') {
+    const ps = process.env.POWERSHELL_EXE ?? 'powershell.exe';
+    const esc = needle.replace(/'/g, "''");
+    const res = await runProc({
+      argv: [
+        ps,
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${esc}*' }).ProcessId -join ','`,
+      ],
+      timeoutMs: 20_000,
+    });
+    if (res.exitCode !== 0) return null;
+    const out = res.stdoutTail.trim();
+    if (!out) return [];
+    return out.split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
+  }
+  const res = await runProc({ argv: ['pgrep', '-f', needle], timeoutMs: 10_000 });
+  if (res.exitCode == null || res.exitCode > 1) return null;
+  return res.stdoutTail
+    .split('\n')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
 }
 
 /** Locate a command on PATH (Windows-aware PATHEXT handling). */

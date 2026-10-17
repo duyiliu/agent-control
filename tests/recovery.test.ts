@@ -49,7 +49,7 @@ test('dead child at VERIFYING → resumed in place', async () => {
     const { run } = await seedRun(env.store, 'VERIFYING', { pid: 999999, identity: '999999:1', workspace: wt });
     const report = await reconcile({
       store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
-      appLog: nullLog, engine: env.fakeEngine,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [],
       isPidAlive: () => false,
       processStartedAt: async () => null,
     });
@@ -67,7 +67,7 @@ test('child possibly alive (pid+start match) → RECOVERY_REQUIRED, no resume', 
     const { task, run } = await seedRun(env.store, 'RUNNING', { pid: 1234, identity: `1234:${t0}`, workspace: env.dir });
     const report = await reconcile({
       store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
-      appLog: nullLog, engine: env.fakeEngine,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [],
       isPidAlive: () => true,
       processStartedAt: async () => t0 + 500,
     });
@@ -87,7 +87,7 @@ test('pid alive but identity mismatch (reuse) → treated as dead, resumed', asy
     const { run } = await seedRun(env.store, 'VERIFYING', { pid: 1234, identity: `1234:${t0}`, workspace: wt });
     const report = await reconcile({
       store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
-      appLog: nullLog, engine: env.fakeEngine,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [],
       isPidAlive: () => true,
       processStartedAt: async () => t0 + 60_000,
     });
@@ -103,7 +103,7 @@ test('crash after PR create → AWAITING_MERGE, no second PR', async () => {
     const { task, run } = await seedRun(env.store, 'PUBLISHING_PR', { workspace: env.dir });
     const report = await reconcile({
       store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
-      appLog: nullLog, engine: env.fakeEngine,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [],
       isPidAlive: () => false,
     });
     assert.deepEqual(report.finalized, [run.run_id]);
@@ -119,12 +119,45 @@ test('crash before PR create → publish re-run (idempotent check first)', async
     const { run } = await seedRun(env.store, 'PUBLISHING_PR', { workspace: env.dir });
     const report = await reconcile({
       store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
-      appLog: nullLog, engine: env.fakeEngine,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [],
       isPidAlive: () => false,
     });
     assert.deepEqual(report.resumed, [run.run_id]);
     assert.deepEqual(env.resumed, [run.run_id]);
     assert.equal(env.store.getRun(run.run_id)!.phase, 'PUBLISHING_PR');
+  } finally { env.done(); }
+});
+
+test('orphaned process referencing worktree → RECOVERY_REQUIRED', async () => {
+  const env = setup();
+  try {
+    const wt = join(env.dir, 'wt'); mkdirSync(wt, { recursive: true });
+    const { run } = await seedRun(env.store, 'RUNNING', { workspace: wt });
+    const report = await reconcile({
+      store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
+      appLog: nullLog, engine: env.fakeEngine,
+      isPidAlive: () => false,
+      findProcs: async () => [4321],
+    });
+    assert.equal(report.resumed.length, 0);
+    assert.equal(report.recoveryRequired.length, 1);
+    assert.match(env.store.getRun(run.run_id)!.reason ?? '', /orphaned/);
+  } finally { env.done(); }
+});
+
+test('orphan scan failure → RECOVERY_REQUIRED (cannot prove clean)', async () => {
+  const env = setup();
+  try {
+    const wt = join(env.dir, 'wt'); mkdirSync(wt, { recursive: true });
+    const { run } = await seedRun(env.store, 'RUNNING', { workspace: wt });
+    const report = await reconcile({
+      store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
+      appLog: nullLog, engine: env.fakeEngine,
+      isPidAlive: () => false,
+      findProcs: async () => null,
+    });
+    assert.equal(report.recoveryRequired.length, 1);
+    assert.equal(env.store.getRun(run.run_id)!.phase, 'RECOVERY_REQUIRED');
   } finally { env.done(); }
 });
 
@@ -134,7 +167,7 @@ test('missing workspace for RUNNING → RECOVERY_REQUIRED', async () => {
     const { run } = await seedRun(env.store, 'RUNNING', { workspace: join(env.dir, 'nonexistent') });
     const report = await reconcile({
       store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
-      appLog: nullLog, engine: env.fakeEngine,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [],
       isPidAlive: () => false,
     });
     assert.equal(report.recoveryRequired.length, 1);
@@ -148,7 +181,7 @@ test('resume budget exhausted → RECOVERY_REQUIRED', async () => {
     const { run } = await seedRun(env.store, 'VERIFYING', { workspace: env.dir, resumeCount: 2 });
     const report = await reconcile({
       store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
-      appLog: nullLog, engine: env.fakeEngine,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [],
       isPidAlive: () => false,
     });
     assert.equal(report.recoveryRequired.length, 1);

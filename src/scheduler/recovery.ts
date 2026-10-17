@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { pidAlive, processStartedAt } from '../proc.js';
+import { findProcessesReferencing, pidAlive, processStartedAt } from '../proc.js';
 import type { Store } from '../store/sqlite.js';
 import type { AppLog } from '../telemetry/logging.js';
 import type { Phase, RunRow, TaskRow } from '../types.js';
@@ -15,6 +15,8 @@ export interface RecoveryDeps {
   engine: Engine;
   isPidAlive?: (pid: number) => boolean;
   processStartedAt?: (pid: number) => Promise<number | null>;
+  /** Scan for live processes referencing a path (orphan detection). */
+  findProcs?: (needle: string) => Promise<number[] | null>;
 }
 
 export interface RecoveryReport {
@@ -51,6 +53,28 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
       markRecoveryRequired(store, task, run, 'child process still alive; refusing duplicate');
       report.recoveryRequired.push({ run_id: run.run_id, why: 'child alive' });
       continue;
+    }
+
+    // Orphan scan: the recorded child is gone, but a killed host may have left
+    // grandchildren behind. Refuse to resume a phase that could have spawned
+    // subprocesses while anything still references the worktree — and also
+    // refuse when we cannot prove the worktree is clean.
+    const childPhases = ['RUNNING', 'FIXING', 'VERIFYING', 'REVIEWING', 'PUBLISHING_PR'];
+    if (childPhases.includes(run.phase) && run.workspace && existsSync(run.workspace)) {
+      const scan = deps.findProcs ?? findProcessesReferencing;
+      const strays = await scan(run.workspace)
+        .then((pids) => pids?.filter((p) => p !== process.pid) ?? null)
+        .catch(() => null);
+      if (strays === null) {
+        markRecoveryRequired(store, task, run, 'cannot verify no orphaned processes on worktree');
+        report.recoveryRequired.push({ run_id: run.run_id, why: 'orphan scan failed' });
+        continue;
+      }
+      if (strays.length > 0) {
+        markRecoveryRequired(store, task, run, `orphaned process(es) on worktree: ${strays.join(', ')}`);
+        report.recoveryRequired.push({ run_id: run.run_id, why: 'orphans alive' });
+        continue;
+      }
     }
 
     switch (run.phase) {
