@@ -7,26 +7,28 @@ import { reconcile } from './scheduler/recovery.js';
 import { GitHubTracker } from './tracker/github.js';
 import { GitWorkspace } from './workspace/git.js';
 import { AppLog } from './telemetry/logging.js';
-import { pidAlive, runProc, which } from './proc.js';
+import { pidAlive, processStartedAt, runProc, which } from './proc.js';
 import { resolveCodexInvocation } from './runners/codex.js';
 import type { AppConfig } from './types.js';
 
 /**
- * Single-instance file lock. Contents: {pid, identity, heartbeat_at}.
+ * Single-instance file lock. Contents: {pid, started_ms, heartbeat_at}.
  * A fresh heartbeat + live PID means another scheduler owns the lock.
- * A stale heartbeat means the holder died — the lock is stolen, which is
- * safe because recovery reconciliation runs before any dispatch.
+ * A stale heartbeat is NOT proof of death on its own: the holder may be a
+ * paused/stalled process. Steal only when the recorded PID is dead or was
+ * reused by an unrelated process (start-time mismatch). Otherwise refuse.
  */
 export class InstanceLock {
   private file: string;
   private timer: NodeJS.Timeout | null = null;
   private held = false;
+  private readonly startedMs = Date.now() - Math.floor(process.uptime() * 1000);
 
   constructor(databasePath: string) {
     this.file = join(dirname(databasePath), 'agent-control.lock');
   }
 
-  acquire(staleAfterMs = 45_000): void {
+  async acquire(staleAfterMs = 45_000): Promise<void> {
     mkdirSync(dirname(this.file), { recursive: true });
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
@@ -38,7 +40,8 @@ export class InstanceLock {
         this.timer.unref();
         return;
       } catch {
-        if (!this.stale(staleAfterMs)) {
+        const verdict = await this.holderState(staleAfterMs);
+        if (verdict === 'alive') {
           const holder = safeRead(this.file);
           throw new Error(
             `another agent-control instance holds the lock (pid=${holder?.pid ?? '?'}, heartbeat=${holder?.heartbeat_at ?? '?'}). Stop it first or delete ${this.file} if it is stale.`,
@@ -51,16 +54,31 @@ export class InstanceLock {
   }
 
   private payload(): string {
-    return JSON.stringify({ pid: process.pid, heartbeat_at: new Date().toISOString() });
+    return JSON.stringify({
+      pid: process.pid,
+      started_ms: this.startedMs,
+      heartbeat_at: new Date().toISOString(),
+    });
   }
 
-  private stale(staleAfterMs: number): boolean {
+  /**
+   * 'alive' → another instance owns the lock (never steal from a live
+   * holder). 'stale' → holder is dead or the pid was reused; safe to steal.
+   * When liveness cannot be proven, answer 'alive' (conservative).
+   */
+  private async holderState(staleAfterMs: number): Promise<'alive' | 'stale'> {
     const holder = safeRead(this.file);
-    if (!holder) return true;
+    if (!holder?.pid) return 'stale';
+    if (!pidAlive(holder.pid)) return 'stale';
     const hb = Date.parse(holder.heartbeat_at ?? '');
-    const fresh = Number.isFinite(hb) && Date.now() - hb < staleAfterMs;
-    if (fresh && holder.pid && pidAlive(holder.pid)) return false;
-    return true;
+    if (Number.isFinite(hb) && Date.now() - hb < staleAfterMs) return 'alive';
+    // Stale heartbeat but the pid is alive: paused/frozen holder, or an
+    // unrelated process that reused the pid. Only a start-time match proves
+    // it is really the lock holder.
+    if (typeof holder.started_ms !== 'number') return 'alive';
+    const actual = await processStartedAt(holder.pid);
+    if (actual == null) return 'alive';
+    return Math.abs(actual - holder.started_ms) < 10_000 ? 'alive' : 'stale';
   }
 
   release() {
@@ -70,7 +88,7 @@ export class InstanceLock {
   }
 }
 
-function safeRead(file: string): { pid?: number; heartbeat_at?: string } | null {
+function safeRead(file: string): { pid?: number; heartbeat_at?: string; started_ms?: number } | null {
   try {
     return JSON.parse(readFileSync(file, 'utf8'));
   } catch {
@@ -101,7 +119,7 @@ export function createApp(config: AppConfig): App {
 
 export async function startService(app: App): Promise<void> {
   const { config, store, engine, lock } = app;
-  lock.acquire();
+  await lock.acquire();
   const appLog = new AppLog(config.server.logs_dir);
   appLog.event('service_start', { pid: process.pid });
 
