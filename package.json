@@ -1,0 +1,24 @@
+{
+  "name": "agent-control",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal AI dev-task scheduler: GitHub Issues -> isolated Codex runs -> verified Draft PRs",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "ac": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "yaml": "^2.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

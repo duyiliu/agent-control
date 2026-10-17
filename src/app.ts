@@ -1,0 +1,206 @@
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { Store } from './store/sqlite.js';
+import { Engine } from './scheduler/engine.js';
+import { reconcile } from './scheduler/recovery.js';
+import { GitHubTracker } from './tracker/github.js';
+import { GitWorkspace } from './workspace/git.js';
+import { AppLog } from './telemetry/logging.js';
+import { pidAlive, processStartedAt, runProc, which } from './proc.js';
+import { resolveCodexInvocation } from './runners/codex.js';
+import type { AppConfig } from './types.js';
+
+/**
+ * Single-instance file lock. Contents: {pid, identity, heartbeat_at}.
+ * A fresh heartbeat + live PID means another scheduler owns the lock.
+ * A stale heartbeat means the holder died — the lock is stolen, which is
+ * safe because recovery reconciliation runs before any dispatch.
+ */
+export class InstanceLock {
+  private file: string;
+  private timer: NodeJS.Timeout | null = null;
+  private held = false;
+
+  constructor(databasePath: string) {
+    this.file = join(dirname(databasePath), 'agent-control.lock');
+  }
+
+  acquire(staleAfterMs = 45_000): void {
+    mkdirSync(dirname(this.file), { recursive: true });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        writeFileSync(this.file, this.payload(), { flag: 'wx' });
+        this.held = true;
+        this.timer = setInterval(() => {
+          try { writeFileSync(this.file, this.payload()); } catch { /* lost */ }
+        }, Math.max(5_000, staleAfterMs / 3));
+        this.timer.unref();
+        return;
+      } catch {
+        if (!this.stale(staleAfterMs)) {
+          const holder = safeRead(this.file);
+          throw new Error(
+            `another agent-control instance holds the lock (pid=${holder?.pid ?? '?'}, heartbeat=${holder?.heartbeat_at ?? '?'}). Stop it first or delete ${this.file} if it is stale.`,
+          );
+        }
+        rmSync(this.file, { force: true });
+      }
+    }
+    throw new Error(`failed to acquire instance lock ${this.file}`);
+  }
+
+  private payload(): string {
+    return JSON.stringify({ pid: process.pid, heartbeat_at: new Date().toISOString() });
+  }
+
+  private stale(staleAfterMs: number): boolean {
+    const holder = safeRead(this.file);
+    if (!holder) return true;
+    const hb = Date.parse(holder.heartbeat_at ?? '');
+    const fresh = Number.isFinite(hb) && Date.now() - hb < staleAfterMs;
+    if (fresh && holder.pid && pidAlive(holder.pid)) return false;
+    return true;
+  }
+
+  release() {
+    if (this.timer) clearInterval(this.timer);
+    if (this.held) rmSync(this.file, { force: true });
+    this.held = false;
+  }
+}
+
+function safeRead(file: string): { pid?: number; heartbeat_at?: string } | null {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export interface App {
+  config: AppConfig;
+  store: Store;
+  engine: Engine;
+  lock: InstanceLock;
+}
+
+export function createApp(config: AppConfig): App {
+  const store = new Store(config.server.database);
+  const appLog = new AppLog(config.server.logs_dir);
+  const tracker = new GitHubTracker();
+  const workspace = new GitWorkspace();
+  // src/app.ts (tsx) or dist/app.js (built) → repo/install root is one level up.
+  const installDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+  const engine = new Engine({
+    store, config, tracker, workspace, appLog, installDir,
+  });
+  const lock = new InstanceLock(config.server.database);
+  return { config, store, engine, lock };
+}
+
+export async function startService(app: App): Promise<void> {
+  const { config, store, engine, lock } = app;
+  lock.acquire();
+  const appLog = new AppLog(config.server.logs_dir);
+  appLog.event('service_start', { pid: process.pid });
+
+  // Reconcile BEFORE any dispatch.
+  const tracker = new GitHubTracker();
+  const report = await reconcile({
+    store, config, tracker, appLog, engine,
+  });
+  appLog.event('recovery_report', { ...report });
+
+  const tickMs = config.server.poll_interval_seconds * 1000;
+  const tick = () =>
+    engine.tick().catch((err) => appLog.event('tick_error', { error: String(err) }));
+  await tick();
+  const timer = setInterval(tick, tickMs);
+
+  let stopping = false;
+  const shutdown = async (sig: string) => {
+    if (stopping) return;
+    stopping = true;
+    appLog.event('service_stop', { sig });
+    clearInterval(timer);
+    for (const run of store.activeRuns()) engine.abortRun(run.run_id, 'service shutdown');
+    // Give in-flight runs a moment to land in CANCELED.
+    await new Promise((r) => setTimeout(r, 3_000));
+    lock.release();
+    store.close();
+    process.exit(0);
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+}
+
+// ---------------- doctor ----------------
+
+export interface DoctorItem { name: string; status: 'PASS' | 'FAIL' | 'UNVERIFIED'; detail: string }
+
+export async function runDoctor(config: AppConfig | null, configError?: string): Promise<DoctorItem[]> {
+  const items: DoctorItem[] = [];
+  const nodeMajor = Number(process.versions.node.split('.')[0]);
+  items.push(nodeMajor >= 22
+    ? { name: 'node', status: 'PASS', detail: `v${process.versions.node}` }
+    : { name: 'node', status: 'FAIL', detail: `v${process.versions.node} — need >=22.13 (node:sqlite)` });
+
+  for (const tool of ['git', 'gh', 'codex']) {
+    const p = which(tool);
+    if (!p) { items.push({ name: tool, status: 'FAIL', detail: 'not on PATH' }); continue; }
+    const res = await runProc({ argv: [tool, '--version'], timeoutMs: 15_000 });
+    items.push(res.exitCode === 0
+      ? { name: tool, status: 'PASS', detail: `${p} — ${res.stdoutTail.trim().split('\n')[0]}` }
+      : { name: tool, status: 'FAIL', detail: `${p} exists but --version failed` });
+  }
+
+  const inv = resolveCodexInvocation();
+  items.push(
+    inv.prefix.length > 0 && inv.argv0 === process.execPath
+      ? { name: 'codex-invocation', status: 'PASS', detail: `node ${inv.prefix[0]}` }
+      : { name: 'codex-invocation', status: 'UNVERIFIED', detail: `${inv.argv0} ${inv.prefix.join(' ')}` },
+  );
+
+  const ghAuth = await runProc({ argv: ['gh', 'auth', 'status'], timeoutMs: 20_000 });
+  items.push(ghAuth.exitCode === 0
+    ? { name: 'gh-auth', status: 'PASS', detail: 'authenticated' }
+    : { name: 'gh-auth', status: 'FAIL', detail: ghAuth.stderrTail.trim().slice(0, 200) });
+
+  const codexAuth = await runProc({ argv: ['codex', 'login', 'status'], timeoutMs: 20_000 });
+  items.push(codexAuth.exitCode === 0
+    ? { name: 'codex-auth', status: 'PASS', detail: codexAuth.stdoutTail.trim().slice(0, 120) }
+    : { name: 'codex-auth', status: 'FAIL', detail: codexAuth.stderrTail.trim().slice(0, 200) });
+
+  if (!config) {
+    items.push({ name: 'config', status: 'FAIL', detail: configError ?? 'not loaded' });
+    return items;
+  }
+  items.push({ name: 'config', status: 'PASS', detail: `${config.projects.length} project(s)` });
+
+  const tracker = new GitHubTracker();
+  for (const p of config.projects) {
+    const ok = existsSync(join(p.local_repo, '.git'));
+    items.push(ok
+      ? { name: `project:${p.repo}`, status: 'PASS', detail: `local repo ${p.local_repo}` }
+      : { name: `project:${p.repo}`, status: 'FAIL', detail: `${p.local_repo} is not a git repo` });
+    try {
+      const labels = await tracker.ensureLabels(p.repo, ['agent-ready', 'agent-running', 'agent-blocked', 'agent-pr']);
+      items.push(labels.ok
+        ? { name: `labels:${p.repo}`, status: 'PASS', detail: 'required labels exist' }
+        : { name: `labels:${p.repo}`, status: 'UNVERIFIED', detail: `missing: ${labels.missing.join(', ')}` });
+    } catch (err) {
+      items.push({ name: `labels:${p.repo}`, status: 'UNVERIFIED', detail: `gh label list failed: ${String(err).slice(0, 120)}` });
+    }
+  }
+
+  for (const dir of [config.server.worktree_root, dirname(config.server.database), config.server.logs_dir]) {
+    try {
+      mkdirSync(dir, { recursive: true });
+      items.push({ name: `dir:${dir}`, status: 'PASS', detail: 'writable' });
+    } catch (err) {
+      items.push({ name: `dir:${dir}`, status: 'FAIL', detail: String(err).slice(0, 120) });
+    }
+  }
+  return items;
+}

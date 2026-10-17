@@ -1,0 +1,34 @@
+server:
+  poll_interval_seconds: 30
+  max_concurrent: 1
+  retry_limit: 3
+  max_task_minutes: 45
+  worktree_root: C:/Users/zhangqianfeng/git/agent-control-data/worktrees
+  database: C:/Users/zhangqianfeng/git/agent-control-data/agent-control.db
+  logs_dir: C:/Users/zhangqianfeng/git/agent-control-data/logs
+
+projects:
+  - repo: duyiliu/agent-control-sandbox
+    local_repo: C:/Users/zhangqianfeng/git/agent-control-sandbox
+    base_branch: main
+    ready_label: agent-ready
+    branch_prefix: agent/issue-
+    checks:
+      - argv: [node, --test, tests/]
+        timeout_seconds: 300
+
+agent:
+  provider: codex
+  sandbox: workspace-write
+  review_sandbox: read-only
+  # model: gpt-5-codex   # optional override
+  env_deny:
+    - GH_TOKEN
+    - GITHUB_TOKEN
+    - GH_ENTERPRISE_TOKEN
+    - GITHUB_ENTERPRISE_TOKEN
+
+approvals:
+  require_design_approval: true
+  require_manual_merge: true
+  allow_auto_deploy: false
