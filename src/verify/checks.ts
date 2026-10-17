@@ -1,5 +1,5 @@
 import type { CheckSpec } from '../types.js';
-import { runProc } from '../proc.js';
+import { runProc, scrubEnvForAgent } from '../proc.js';
 
 export interface CheckOutcome {
   spec: CheckSpec;
@@ -18,7 +18,10 @@ export interface ChecksSummary {
 
 /**
  * Run the trusted check list from repo config inside the worktree.
- * Commands come from config only — never from issue content.
+ * Commands come from config only — never from issue content. The env is
+ * scrubbed with the same allowlist as the agent: check commands execute
+ * agent-written code (test files, npm scripts), which must not see host
+ * credentials either.
  */
 export async function runChecks(
   checks: CheckSpec[],
@@ -33,6 +36,7 @@ export async function runChecks(
     const res = await exec({
       argv: spec.argv,
       cwd: workdir,
+      env: scrubEnvForAgent(process.env),
       timeoutMs: (spec.timeout_seconds ?? 600) * 1000,
       logPath,
     });
