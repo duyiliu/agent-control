@@ -23,7 +23,7 @@ npm run ac -- start                           # 启动常驻调度
 
 ## 安全边界（MVP）
 
-- 只接入可信测试仓库；Issue 正文只作数据，不会变成 shell 命令（测试命令只能来自仓库配置白名单）。注意：Issue 正文仍是**不可信输入**——提示词里的"数据边界"只是约定，真正的安全边界是下面三层的组合：子进程环境白名单（无任何凭据）+ worktree 文件系统隔离 + 人工合并闸门。恶意 Issue 最坏只能诱导 agent 在 worktree 里写坏代码，无法取走凭据或直接发布；坏代码由检查、独立 review 与人工合并拦截。不要对不可信来源的 Issue 启用本工具。
+- 只接入可信测试仓库；Issue 正文只作数据，不会变成 shell 命令（测试命令只能来自仓库配置白名单）。注意：Issue 正文仍是**不可信输入**——提示词里的"数据边界"只是约定而非强制边界。环境白名单只限制传入子进程的环境变量；worktree 是工作目录约定，不构成文件访问隔离。恶意 Issue 最坏能诱导 agent 在 worktree 里写坏代码——坏代码由检查、独立 review 与人工合并拦截。不要对非本人撰写/未确认可信的 Issue 启用本工具。
 - 编码/审查子进程的环境是**白名单**：只继承 PATH/用户目录/代理等最小集合，`GH_TOKEN` 及任何 `*_KEY`/`SECRET` 一律不传递（Windows 上 gh keyring 凭据仍对本机进程可见 —— 已记录的平台限制，所以只跑可信 Issue）。默认 `danger-full-access`（Codex 的 Windows 沙箱会导致其子进程 spawn 失败而不可用），因此 Review 后宿主会校验 worktree 必须仍然干净——被改动即 BLOCKED。**注意**：无沙箱意味着 agent 拥有当前用户级的文件与命令权限（包括读取 gh keyring 凭据的可能性），prompt 禁令只是约定而非强制边界——因此本工具只应处理你本人撰写并确认可信的 Issue。
 - push / 建 PR 由宿主调度器执行，编码子进程无发布权限；所有 PR 均为 Draft，合并永远是人工操作。
 - 审批内容哈希快照（SHA-256）：批准后 Issue 被改动 → `BLOCKED_APPROVAL_CHANGED`，需人工 `retry` 重批。

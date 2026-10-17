@@ -4,7 +4,7 @@ import type { Store } from '../store/sqlite.js';
 import type { AppLog } from '../telemetry/logging.js';
 import type { Phase, RunRow, TaskRow } from '../types.js';
 import type { Engine } from './engine.js';
-import type { GitHubTracker } from '../tracker/github.js';
+import { approvalHash, type GitHubTracker } from '../tracker/github.js';
 import type { AppConfig } from '../types.js';
 
 export interface RecoveryDeps {
@@ -79,16 +79,28 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
 
     switch (run.phase) {
       case 'PUBLISHING_PR': {
-        const project = deps.config.projects.find((p) => p.repo === task.repo);
+        const project = deps.config.projects.find((p) => p.repo === task.repo)!;
         const branch = run.branch ?? (project ? `${project.branch_prefix}${task.issue_number}` : null);
         let existing = null;
         if (project && branch) {
           existing = await deps.tracker.findPrForBranch(project.repo, branch).catch(() => null);
         }
         if (existing) {
-          // Side effect already happened before the crash.
-          store.endRun(run.run_id, 'AWAITING_MERGE', 'recovered: PR already exists');
-          store.setTaskStatus(task.id, 'AWAITING_MERGE', { pr_url: existing.url });
+          // Side effect already happened before the crash. Re-validate
+          // approval — the crash may have landed between PR create and the
+          // engine's post-create gate. If revoked, close the stray PR.
+          const issue = await deps.tracker.getIssue(project.repo, task.issue_number).catch(() => null);
+          const labelled = !!issue && issue.state === 'OPEN' && issue.labels.includes(project.ready_label);
+          const hashOk = !!issue && (!task.approved_hash || approvalHash(issue) === task.approved_hash);
+          if (labelled && hashOk) {
+            store.endRun(run.run_id, 'AWAITING_MERGE', 'recovered: PR already exists');
+            store.setTaskStatus(task.id, 'AWAITING_MERGE', { pr_url: existing.url });
+          } else {
+            try { await deps.tracker.closePr(project.repo, existing.number); } catch { /* best effort */ }
+            const phase: Phase = labelled ? 'BLOCKED_APPROVAL_CHANGED' : 'CANCELED';
+            store.endRun(run.run_id, phase, 'approval revoked before recovery finalize; PR closed');
+            store.setTaskStatus(task.id, phase, { pr_url: existing.url });
+          }
           report.finalized.push(run.run_id);
         } else if (run.resume_count >= MAX_RESUMES) {
           markRecoveryRequired(store, task, run, 'publish resume budget exhausted');

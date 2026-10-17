@@ -99,6 +99,7 @@ test('pid alive but identity mismatch (reuse) → treated as dead, resumed', asy
 test('crash after PR create → AWAITING_MERGE, no second PR', async () => {
   const env = setup();
   try {
+    env.tracker.issues.set(1, { title: 't', body: 'b', labels: ['agent-ready'], state: 'OPEN', url: 'u' });
     env.tracker.prs.set('agent/issue-1', { number: 9, url: 'https://x/pull/9', state: 'OPEN', isDraft: true });
     const { task, run } = await seedRun(env.store, 'PUBLISHING_PR', { workspace: env.dir });
     const report = await reconcile({
@@ -110,6 +111,25 @@ test('crash after PR create → AWAITING_MERGE, no second PR', async () => {
     assert.equal(env.store.getRun(run.run_id)!.phase, 'AWAITING_MERGE');
     assert.equal(env.store.getTaskById(task.id)!.status, 'AWAITING_MERGE');
     assert.equal(env.store.getTaskById(task.id)!.pr_url, 'https://x/pull/9');
+  } finally { env.done(); }
+});
+
+test('crash after PR create + approval revoked → PR closed, task CANCELED', async () => {
+  const env = setup();
+  try {
+    let closed = 0;
+    env.tracker.issues.set(1, { title: 't', body: 'b', labels: [], state: 'OPEN', url: 'u' });
+    env.tracker.prs.set('agent/issue-1', { number: 9, url: 'https://x/pull/9', state: 'OPEN', isDraft: true });
+    (env.tracker as { closePr?: (r: string, n: number) => Promise<void> }).closePr = async () => { closed++; };
+    const { task } = await seedRun(env.store, 'PUBLISHING_PR', { workspace: env.dir });
+    const report = await reconcile({
+      store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [],
+      isPidAlive: () => false,
+    });
+    assert.equal(report.resumed.length, 0);
+    assert.equal(closed, 1);
+    assert.equal(env.store.getTaskById(task.id)!.status, 'CANCELED');
   } finally { env.done(); }
 });
 
