@@ -273,7 +273,9 @@ export async function processStartedAt(pid: number): Promise<number | null> {
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        `(Get-Process -Id ${pid} -ErrorAction SilentlyContinue).StartTime.Ticks`,
+        // StartTime is a LOCAL DateTime; normalize to UTC before converting
+        // ticks -> unix ms (a raw .Ticks read is off by the TZ offset).
+        `(Get-Process -Id ${pid} -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().Ticks`,
       ],
       timeoutMs: 15_000,
     });
