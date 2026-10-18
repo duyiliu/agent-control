@@ -2,7 +2,7 @@
   "name": "agent-control",
   "version": "0.1.0",
   "private": true,
-  "description": "Personal AI dev-task scheduler: GitHub Issues -> isolated Codex runs -> verified Draft PRs",
+  "description": "Personal AI dev-task scheduler: GitHub Issues -> isolated pi agent runs -> verified Draft PRs",
   "type": "module",
   "engines": {
     "node": ">=22.13.0"

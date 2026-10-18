@@ -4,8 +4,7 @@ import type { Store } from '../store/sqlite.js';
 import { RunLog, type AppLog } from '../telemetry/logging.js';
 import { approvalHash, GitHubTracker } from '../tracker/github.js';
 import { GitWorkspace } from '../workspace/git.js';
-import type { CodexCallOpts, CodexCallResult } from '../runners/codex.js';
-import { pickRunner } from '../runners/dispatch.js';
+import { runPi, type PiCallOpts, type PiCallResult } from '../runners/pi.js';
 import { runChecks, type ChecksSummary } from '../verify/checks.js';
 import { runReview } from '../verify/review.js';
 import { publishDraftPr, PublishError } from '../publish/pr.js';
@@ -21,7 +20,7 @@ export interface EngineDeps {
   appLog: AppLog;
   /** Install dir of agent-control (for WORKFLOW.md). */
   installDir: string;
-  runCoderFn?: (opts: CodexCallOpts, agentCfg: AppConfig['agent']) => Promise<CodexCallResult>;
+  runCoderFn?: (opts: PiCallOpts, agentCfg: AppConfig['agent']) => Promise<PiCallResult>;
   runReviewFn?: typeof runReview;
   runChecksFn?: typeof runChecks;
 }
@@ -41,7 +40,7 @@ export class Engine {
   private runChecksFn: NonNullable<EngineDeps['runChecksFn']>;
 
   constructor(private deps: EngineDeps) {
-    this.runCoderFn = deps.runCoderFn ?? ((o, cfg) => pickRunner(cfg)(o, cfg));
+    this.runCoderFn = deps.runCoderFn ?? runPi;
     this.runReviewFn = deps.runReviewFn ?? runReview;
     this.runChecksFn = deps.runChecksFn ?? runChecks;
   }
@@ -292,7 +291,7 @@ export class Engine {
             const res = await this.callCoder(run, log, ctx, { workdir: worktreePath }, buildCoderPrompt(ctx), signal);
             if (res.aborted) { this.finish(run, task, 'CANCELED', 'cancelled'); return; }
             if (res.exitCode !== 0 || res.timedOut) {
-              this.finish(run, task, 'FAILED', `codex exited ${res.exitCode}${res.timedOut ? ' (timeout)' : ''}`);
+              this.finish(run, task, 'FAILED', `pi exited ${res.exitCode}${res.timedOut ? ' (timeout)' : ''}`);
               return;
             }
             await this.commitLeftovers(run, log, worktreePath, task);
@@ -353,7 +352,7 @@ export class Engine {
             }
             const { result, logPath } = reviewOutcome;
             store.addCheck({
-              run_id: runId, kind: 'review', command: 'codex exec (review)',
+              run_id: runId, kind: 'review', command: 'pi (review)',
               exit_code: null, artifact_path: logPath, verdict: result.verdict,
             });
             // Guardrail (sandbox-free review): the reviewer must not modify
@@ -489,16 +488,15 @@ export class Engine {
     extra: { workdir: string },
     prompt: string,
     signal: AbortSignal,
-  ): Promise<CodexCallResult> {
+  ): Promise<PiCallResult> {
     const artifactsDir = this.artifactsDirFor(run);
     mkdirSync(artifactsDir, { recursive: true });
     const res = await this.runCoderFn(
       {
         workdir: extra.workdir,
         prompt,
-        sandbox: this.config.agent.sandbox,
         timeoutMs: this.config.server.max_task_minutes * 60_000,
-        logPath: join(artifactsDir, `codex-${Date.now()}.jsonl`),
+        logPath: join(artifactsDir, `agent-${Date.now()}.jsonl`),
         lastMessagePath: join(artifactsDir, `coder-last-${Date.now()}.txt`),
         signal,
         onSpawn: (pid, identity) => this.store.updateRunFields(run.run_id, { pid, process_identity: identity }),

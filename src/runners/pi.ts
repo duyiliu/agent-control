@@ -1,17 +1,34 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { runProc, scrubEnvForAgent, which } from '../proc.js';
+import { runProc, scrubEnvForAgent, which, type ProcResult } from '../proc.js';
 import type { AppConfig } from '../types.js';
-import type { CodexCallOpts, CodexCallResult } from './codex.js';
 
 export interface PiInvocation {
   argv0: string;
   prefix: string[];
 }
 
+export interface PiCallOpts {
+  workdir: string;
+  prompt: string;
+  timeoutMs: number;
+  logPath?: string;
+  lastMessagePath: string;
+  model?: string;
+  /** Tool allowlist — confinement primitive (pi has no sandbox flag). */
+  tools?: string[];
+  signal?: AbortSignal;
+  /** Called with the child PID and a pid:startMs identity token at spawn. */
+  onSpawn?: (pid: number | null, identity: string | null) => void;
+}
+
+export interface PiCallResult extends ProcResult {
+  pid: number | null;
+}
+
 /**
- * Resolve `pi` like resolveCodexInvocation: the npm .cmd shim spawns poorly
- * without a shell on Windows, so invoke the bundled cli.js via node directly.
+ * Resolve `pi`: the npm .cmd shim spawns poorly without a shell on Windows,
+ * so invoke the bundled cli.js via node directly.
  */
 export function resolvePiInvocation(envPath = process.env.PATH ?? ''): PiInvocation {
   const found = which('pi', envPath);
@@ -40,7 +57,7 @@ const PI_ALL_TOOLS = ['read', 'bash', 'powershell', 'edit', 'write', 'grep', 'fi
  * templates or context files into the run.
  */
 export function buildPiArgv(
-  opts: Pick<CodexCallOpts, 'tools'> & { promptPath: string; model?: string },
+  opts: Pick<PiCallOpts, 'tools'> & { promptPath: string; model?: string },
   inv: PiInvocation,
 ): string[] {
   return [
@@ -62,8 +79,8 @@ export function buildPiArgv(
 }
 
 /**
- * Last assistant text from a `--mode json` event stream — the equivalent of
- * codex's `-o <lastMessage>` file, extracted host-side after the run.
+ * Last assistant text from a `--mode json` event stream — extracted
+ * host-side after the run (pi has no `-o` flag for this).
  */
 export function extractLastMessage(jsonl: string): string | null {
   let last: string | null = null;
@@ -91,10 +108,10 @@ export function extractLastMessage(jsonl: string): string | null {
  * pi has no sandbox flag: confinement is the tool allowlist + scrubbed env.
  */
 export async function runPi(
-  opts: CodexCallOpts,
+  opts: PiCallOpts,
   config: AppConfig['agent'],
   invocation?: PiInvocation,
-): Promise<CodexCallResult> {
+): Promise<PiCallResult> {
   const inv = invocation ?? resolvePiInvocation();
   const promptPath = join(dirname(opts.lastMessagePath), `pi-prompt-${Date.now()}.txt`);
   writeFileSync(promptPath, opts.prompt, 'utf8');

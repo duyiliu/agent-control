@@ -34,9 +34,9 @@ export async function publishDraftPr(input: {
   const { project, worktreePath, branch, issue, workspace, tracker } = input;
 
   if (await workspace.isDirty(worktreePath)) {
-    // The agent is asked to commit, but sandbox quirks (e.g. codex on Windows
-    // failing to spawn git) can leave uncommitted leftovers. Commit them
-    // verbatim as the host — never fabricate content, just record what exists.
+    // The agent is asked to commit, but it may leave uncommitted leftovers.
+    // Commit them verbatim as the host — never fabricate content, just
+    // record what exists.
     await workspace.commitAll(
       worktreePath,
       `agent-control: commit uncommitted agent work for issue #${issue.number}`,

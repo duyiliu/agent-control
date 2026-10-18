@@ -1,7 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildPiArgv, extractLastMessage, PI_REVIEW_TOOLS } from '../src/runners/pi.js';
-import { buildClaudeArgv, extractResult, CLAUDE_REVIEW_TOOLS } from '../src/runners/claude.js';
 
 const inv = { argv0: 'node', prefix: ['/x/cli.js'] };
 
@@ -45,37 +44,4 @@ test('extractLastMessage: last assistant text blocks win', () => {
 test('extractLastMessage: no assistant text → null', () => {
   const jsonl = JSON.stringify({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: 'hi' }] } });
   assert.equal(extractLastMessage(jsonl), null);
-});
-
-const claudeInv = { argv0: 'C:/bin/claude.exe', prefix: [] };
-
-test('buildClaudeArgv: stream-json, mcp-off, read-only tools, schema', () => {
-  const argv = buildClaudeArgv(
-    { tools: CLAUDE_REVIEW_TOOLS, model: 'deepseek-v4.1-flash', settingsPath: 'C:/s/settings.json', schemaJson: '{"type":"object"}' },
-    claudeInv,
-  );
-  const s = argv.join(' ');
-  assert.equal(argv[0], 'C:/bin/claude.exe');
-  assert.ok(s.includes('-p'));
-  assert.ok(s.includes('--output-format stream-json'));
-  assert.ok(s.includes('--strict-mcp-config'));
-  assert.ok(s.includes('--dangerously-skip-permissions'));
-  assert.ok(s.includes('--tools Read,Grep,Glob,LS'));
-  assert.ok(s.includes('--model deepseek-v4.1-flash'));
-  assert.ok(s.includes('--settings C:/s/settings.json'));
-  assert.ok(s.includes('--json-schema'));
-  assert.equal(argv[argv.length - 1], '--');
-});
-
-test('extractResult: structured_output wins over result text', () => {
-  const log = [
-    JSON.stringify({ type: 'system', subtype: 'init' }),
-    JSON.stringify({ type: 'result', subtype: 'success', result: '{"verdict":"PASS"}', structured_output: { verdict: 'PASS' } }),
-  ].join('\n');
-  assert.equal(extractResult(log), '{"verdict":"PASS"}');
-});
-
-test('extractResult: plain result text; nothing → null', () => {
-  assert.equal(extractResult(JSON.stringify({ type: 'result', result: 'hello' })), 'hello');
-  assert.equal(extractResult('{"type":"system"}'), null);
 });

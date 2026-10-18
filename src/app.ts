@@ -8,9 +8,7 @@ import { GitHubTracker } from './tracker/github.js';
 import { GitWorkspace } from './workspace/git.js';
 import { AppLog } from './telemetry/logging.js';
 import { pidAlive, processStartedAt, runProc, which } from './proc.js';
-import { resolveCodexInvocation } from './runners/codex.js';
 import { resolvePiInvocation } from './runners/pi.js';
-import { resolveClaudeInvocation } from './runners/claude.js';
 import type { AppConfig } from './types.js';
 
 /**
@@ -182,66 +180,23 @@ export async function runDoctor(config: AppConfig | null, configError?: string):
       : { name: tool, status: 'FAIL', detail: `${p} exists but --version failed` });
   }
 
-  // The configured runner is probed through its resolved invocation (npm
-  // .cmd shims cannot be spawned without a shell on Windows — false FAIL).
-  const runner = config?.agent.provider ?? 'codex';
-  const inv = runner === 'pi' ? resolvePiInvocation()
-    : runner === 'claude' ? resolveClaudeInvocation()
-    : resolveCodexInvocation();
-  const codexArgv = (args: string[]) => [inv.argv0, ...inv.prefix, ...args];
-  const codexFound = inv.argv0 === runner ? false : true;
-  if (!codexFound) {
-    items.push({ name: runner, status: 'FAIL', detail: 'not on PATH' });
-    items.push({ name: `${runner}-invocation`, status: 'FAIL', detail: 'unresolved' });
-    if (runner === 'codex') items.push({ name: 'codex-auth', status: 'FAIL', detail: 'codex not on PATH' });
-  } else if (runner === 'pi') {
-    const v = await runProc({ argv: codexArgv(['--version']), timeoutMs: 20_000 });
+  // The pi runner is probed through its resolved invocation (npm .cmd shims
+  // cannot be spawned without a shell on Windows — false FAIL).
+  const inv = resolvePiInvocation();
+  const piArgv = (args: string[]) => [inv.argv0, ...inv.prefix, ...args];
+  if (inv.argv0 === 'pi') {
+    items.push({ name: 'pi', status: 'FAIL', detail: 'not on PATH' });
+    items.push({ name: 'pi-invocation', status: 'FAIL', detail: 'unresolved' });
+  } else {
+    const v = await runProc({ argv: piArgv(['--version']), timeoutMs: 20_000 });
     items.push(v.exitCode === 0
       ? { name: 'pi', status: 'PASS', detail: `${inv.argv0 === process.execPath ? 'node ' + inv.prefix[0] : inv.argv0} — ${v.stdoutTail.trim().split('\n')[0]}` }
       : { name: 'pi', status: 'FAIL', detail: v.stderrTail.trim().slice(0, 200) });
-    items.push({ name: 'pi-invocation', status: 'PASS', detail: codexArgv(['-p', '…']).join(' ') });
+    items.push({ name: 'pi-invocation', status: 'PASS', detail: piArgv(['-p', '…']).join(' ') });
     const piCfg = join(process.env.USERPROFILE ?? '', '.pi', 'agent', 'models.json');
     items.push(existsSync(piCfg)
-      ? { name: 'pi-models', status: 'PASS', detail: piCfg }
+      ? { name: 'pi-models', status: 'PASS', detail: `${piCfg}${config?.agent.review_model ? ` (review: ${config.agent.review_model})` : ''}` }
       : { name: 'pi-models', status: 'FAIL', detail: `${piCfg} missing — pi providers/models are file-configured` });
-  } else if (runner === 'claude') {
-    const v = await runProc({ argv: codexArgv(['--version']), timeoutMs: 20_000 });
-    items.push(v.exitCode === 0
-      ? { name: 'claude', status: 'PASS', detail: `${inv.argv0} — ${v.stdoutTail.trim().split('\n')[0]}` }
-      : { name: 'claude', status: 'FAIL', detail: v.stderrTail.trim().slice(0, 200) });
-    items.push({ name: 'claude-invocation', status: 'PASS', detail: codexArgv(['-p', '…']).join(' ') });
-    const ccCfg = join(process.env.USERPROFILE ?? '', '.claude', 'settings.json');
-    const ccConfigured = existsSync(ccCfg) || !!config?.agent.claude_env;
-    items.push(ccConfigured
-      ? { name: 'claude-settings', status: 'PASS', detail: config?.agent.claude_env ? 'agent.claude_env override' : ccCfg }
-      : { name: 'claude-settings', status: 'FAIL', detail: 'no ~/.claude/settings.json and no agent.claude_env' });
-  } else {
-    const v = await runProc({ argv: codexArgv(['--version']), timeoutMs: 20_000 });
-    items.push(v.exitCode === 0
-      ? { name: 'codex', status: 'PASS', detail: `${inv.argv0 === process.execPath ? 'node ' + inv.prefix[0] : inv.argv0} — ${v.stdoutTail.trim().split('\n')[0]}` }
-      : { name: 'codex', status: 'FAIL', detail: v.stderrTail.trim().slice(0, 200) });
-    items.push({ name: 'codex-invocation', status: 'PASS', detail: codexArgv(['exec', '…']).join(' ') });
-    const codexAuth = await runProc({ argv: codexArgv(['login', 'status']), timeoutMs: 20_000 });
-    items.push(codexAuth.exitCode === 0
-      ? { name: 'codex-auth', status: 'PASS', detail: codexAuth.stdoutTail.trim().slice(0, 120) }
-      : { name: 'codex-auth', status: 'FAIL', detail: codexAuth.stderrTail.trim().slice(0, 200) });
-  }
-
-  // Review may run on a different runner (review_provider). Probe it too so a
-  // broken review path is visible before a run burns a cycle on it.
-  const reviewRunner = config?.agent.review_provider;
-  if (reviewRunner && reviewRunner !== runner) {
-    const rInv = reviewRunner === 'pi' ? resolvePiInvocation()
-      : reviewRunner === 'claude' ? resolveClaudeInvocation()
-      : resolveCodexInvocation();
-    if (rInv.argv0 === reviewRunner) {
-      items.push({ name: `review-${reviewRunner}`, status: 'FAIL', detail: 'not on PATH' });
-    } else {
-      const v = await runProc({ argv: [rInv.argv0, ...rInv.prefix, '--version'], timeoutMs: 20_000 });
-      items.push(v.exitCode === 0
-        ? { name: `review-${reviewRunner}`, status: 'PASS', detail: `${config!.agent.review_model ?? 'default model'} — ${v.stdoutTail.trim().split('\n')[0]}` }
-        : { name: `review-${reviewRunner}`, status: 'FAIL', detail: v.stderrTail.trim().slice(0, 200) });
-    }
   }
 
   const ghAuth = await runProc({ argv: ['gh', 'auth', 'status'], timeoutMs: 20_000 });

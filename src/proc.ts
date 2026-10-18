@@ -114,7 +114,7 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
         /* already dead */
       }
       // Windows: child.kill only terminates the direct process. Kill the
-      // whole tree so grandchildren spawned by codex cannot linger.
+      // whole tree so grandchildren spawned by the agent cannot linger.
       if (process.platform === 'win32' && child.pid != null) taskkillTree(child.pid);
       // Escalate if still alive after grace period.
       killTimer = setTimeout(() => {
@@ -162,8 +162,8 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
  * Minimal environment passed to the agent child. An allowlist is the
  * boundary: ambient secrets (CI tokens, cloud creds, arbitrary *_KEY) must
  * never reach a process that executes model-chosen commands. Proxy vars are
- * allowed because codex may need them to reach the provider; codex auth is
- * file-based (~/.codex) and needs no env.
+ * allowed because the agent may need them to reach the provider; pi auth is
+ * file-based (~/.pi/agent/models.json) and needs no env.
  */
 const AGENT_ENV_ALLOW = [
   'PATH', 'PATHEXT', 'COMSPEC', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR',

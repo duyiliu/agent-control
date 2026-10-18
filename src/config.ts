@@ -74,33 +74,9 @@ export function loadConfig(path: string): AppConfig {
   }
 
   const agent = asObj(root['agent'] ?? {}, 'agent');
-  const provider = agent['provider'] ?? 'codex';
-  if (provider !== 'codex' && provider !== 'pi' && provider !== 'claude') {
-    fail('agent.provider: expected "codex", "pi" or "claude"');
-  }
-  const sandboxModes = ['read-only', 'workspace-write', 'danger-full-access'];
-  const sandbox = agent['sandbox'] ?? 'danger-full-access';
-  if (!sandboxModes.includes(sandbox as string)) {
-    fail('agent.sandbox must be read-only, workspace-write or danger-full-access');
-  }
-  const reviewSandbox = agent['review_sandbox'] ?? 'danger-full-access';
-  if (!sandboxModes.includes(reviewSandbox as string)) {
-    fail('agent.review_sandbox must be read-only, workspace-write or danger-full-access');
-  }
   const envDeny = agent['env_deny'] ?? [];
   if (!Array.isArray(envDeny) || envDeny.some((e) => typeof e !== 'string')) {
     fail('agent.env_deny must be a string array');
-  }
-  const reviewProvider = agent['review_provider'];
-  if (reviewProvider !== undefined && reviewProvider !== 'codex' && reviewProvider !== 'pi' && reviewProvider !== 'claude') {
-    fail('agent.review_provider: expected "codex", "pi" or "claude"');
-  }
-  const claudeEnv = agent['claude_env'];
-  if (claudeEnv !== undefined) {
-    const o = asObj(claudeEnv, 'agent.claude_env');
-    for (const [k, v] of Object.entries(o)) {
-      if (typeof v !== 'string') fail(`agent.claude_env.${k} must be a string`);
-    }
   }
 
   const approvals = asObj(root['approvals'] ?? {}, 'approvals');
@@ -118,14 +94,9 @@ export function loadConfig(path: string): AppConfig {
     },
     projects: projectsRaw.map(parseProject),
     agent: {
-      provider: provider as AppConfig['agent']['provider'],
       model: agent['model'] !== undefined ? asStr(agent['model'], 'agent.model') : undefined,
-      review_provider: reviewProvider as AppConfig['agent']['review_provider'],
       review_model: agent['review_model'] !== undefined ? asStr(agent['review_model'], 'agent.review_model') : undefined,
-      sandbox: sandbox as AppConfig['agent']['sandbox'],
-      review_sandbox: reviewSandbox as AppConfig['agent']['review_sandbox'],
       env_deny: envDeny as string[],
-      claude_env: claudeEnv as Record<string, string> | undefined,
     },
     approvals: {
       require_design_approval: asBool(approvals['require_design_approval'] ?? true, 'approvals.require_design_approval'),

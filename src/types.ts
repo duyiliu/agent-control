@@ -67,16 +67,10 @@ export interface AppConfig {
   };
   projects: ProjectConfig[];
   agent: {
-    provider: 'codex' | 'pi' | 'claude';
     model?: string;
-    /** Review phase override; falls back to provider/model when unset. */
-    review_provider?: 'codex' | 'pi' | 'claude';
+    /** Review phase model override; falls back to model when unset. */
     review_model?: string;
-    sandbox: SandboxMode;
-    review_sandbox: SandboxMode;
     env_deny: string[];
-    /** claude only: env map injected via --settings (outranks user settings.json). */
-    claude_env?: Record<string, string>;
   };
   approvals: {
     require_design_approval: boolean;
@@ -84,8 +78,6 @@ export interface AppConfig {
     allow_auto_deploy: boolean;
   };
 }
-
-export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 
 export interface IssueData {
   number: number;

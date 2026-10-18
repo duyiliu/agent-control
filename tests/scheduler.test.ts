@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Engine } from '../src/scheduler/engine.js';
 import { GitWorkspace } from '../src/workspace/git.js';
 import type { GitHubTracker } from '../src/tracker/github.js';
-import type { CodexCallResult } from '../src/runners/codex.js';
+import type { PiCallResult } from '../src/runners/pi.js';
 import type { ChecksSummary } from '../src/verify/checks.js';
 import type { AppConfig, ReviewResult } from '../src/types.js';
 import { makeConfig, makeFakeTracker, makeStore, nullLog, teardown } from './helpers.js';
@@ -29,7 +29,7 @@ function fakeWorkspace(calls?: string[]): GitWorkspace {
   } as unknown as GitWorkspace;
 }
 
-function okCoder(): CodexCallResult {
+function okCoder(): PiCallResult {
   return { exitCode: 0, signal: null, timedOut: false, aborted: false, durationMs: 1, stdoutTail: '', stderrTail: '', pid: 42 };
 }
 
@@ -71,7 +71,7 @@ function setup(): Env {
 }
 
 function makeEngine(env: Env, over: {
-  coder?: () => Promise<CodexCallResult>;
+  coder?: () => Promise<PiCallResult>;
   checks?: () => Promise<ChecksSummary>;
   review?: ReviewFn;
   workspace?: GitWorkspace;
@@ -121,7 +121,7 @@ test('AC1: happy path produces exactly one draft PR and awaits merge', async () 
   } finally { env.done(); }
 });
 
-test('AC2: no approval label → task cancelled, zero codex calls', async () => {
+test('AC2: no approval label → task cancelled, zero agent calls', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(2, { ...ISSUE, labels: [] });

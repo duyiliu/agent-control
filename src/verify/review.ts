@@ -1,9 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { pickRunner } from '../runners/dispatch.js';
-import { CLAUDE_REVIEW_TOOLS } from '../runners/claude.js';
-import { PI_REVIEW_TOOLS } from '../runners/pi.js';
-import { REVIEW_SCHEMA, buildReviewPrompt, type PromptContext } from '../scheduler/prompts.js';
+import { PI_REVIEW_TOOLS, runPi } from '../runners/pi.js';
+import { buildReviewPrompt, type PromptContext } from '../scheduler/prompts.js';
 import type { AppConfig, ReviewResult } from '../types.js';
 
 /** The review PROCESS failed (exit/timeout/spawn) — not a code verdict. */
@@ -18,9 +16,10 @@ export interface ReviewDeps {
 }
 
 /**
- * Independent read-only review session. The verdict must be produced as
- * structured JSON via --output-schema; an unparseable/absent verdict is
- * treated as a non-pass (BLOCK).
+ * Independent read-only review session on pi. The verdict is a prompt-level
+ * JSON contract (pi has no schema enforcement): an unparseable/absent verdict
+ * is treated as a non-pass (BLOCK). Confinement is the read-only tool
+ * allowlist — the reviewer gets no bash/edit/write.
  */
 export async function runReview(
   ctx: PromptContext,
@@ -29,33 +28,24 @@ export async function runReview(
   deps: ReviewDeps,
 ): Promise<{ result: ReviewResult; logPath: string }> {
   mkdirSync(deps.artifactsDir, { recursive: true });
-  const schemaPath = join(deps.artifactsDir, 'review-schema.json');
   const lastMsgPath = join(deps.artifactsDir, 'review-last-message.txt');
-  const logPath = join(deps.artifactsDir, 'review-codex.jsonl');
-  writeFileSync(schemaPath, JSON.stringify(REVIEW_SCHEMA), 'utf8');
+  const logPath = join(deps.artifactsDir, 'review-agent.jsonl');
 
-  // pi/claude confine the reviewer by tool allowlist (read-only); codex by sandbox.
-  // review_provider/review_model may select a different (ideally heterogeneous)
-  // runner+model for review than the coder used.
-  const agentConfig: AppConfig['agent'] = deps.agentConfig.review_provider
-    ? { ...deps.agentConfig, provider: deps.agentConfig.review_provider, model: deps.agentConfig.review_model }
-    : deps.agentConfig;
-  const runner = pickRunner(agentConfig);
-  const reviewTools =
-    agentConfig.provider === 'pi' ? PI_REVIEW_TOOLS
-    : agentConfig.provider === 'claude' ? CLAUDE_REVIEW_TOOLS
-    : undefined;
+  // review_model may select a different (ideally heterogeneous) model for
+  // review than the coder used — decorrelates coder/reviewer blind spots.
+  const agentConfig: AppConfig['agent'] = {
+    ...deps.agentConfig,
+    model: deps.agentConfig.review_model ?? deps.agentConfig.model,
+  };
   const callReview = () =>
-    runner(
+    runPi(
       {
         workdir: ctx.worktreePath,
         prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence),
-        sandbox: agentConfig.review_sandbox,
         timeoutMs: deps.timeoutMs,
         logPath,
-        schemaPath,
         lastMessagePath: lastMsgPath,
-        tools: reviewTools,
+        tools: PI_REVIEW_TOOLS,
         signal: deps.signal,
         onSpawn: deps.onSpawn,
       },
@@ -104,9 +94,9 @@ export async function runReview(
 }
 
 /**
- * Parse the verdict JSON from the reviewer's last message. codex's
- * --output-schema yields clean JSON; prompt-level runners may wrap it in
- * fences or prose, so strip those before failing as unparseable.
+ * Parse the verdict JSON from the reviewer's last message. The prompt asks
+ * for bare JSON, but the model may wrap it in fences or prose — strip those
+ * before failing as unparseable.
  */
 function parseVerdictJson(text: string): unknown {
   const stripped = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
