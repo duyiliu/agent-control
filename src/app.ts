@@ -227,6 +227,23 @@ export async function runDoctor(config: AppConfig | null, configError?: string):
       : { name: 'codex-auth', status: 'FAIL', detail: codexAuth.stderrTail.trim().slice(0, 200) });
   }
 
+  // Review may run on a different runner (review_provider). Probe it too so a
+  // broken review path is visible before a run burns a cycle on it.
+  const reviewRunner = config?.agent.review_provider;
+  if (reviewRunner && reviewRunner !== runner) {
+    const rInv = reviewRunner === 'pi' ? resolvePiInvocation()
+      : reviewRunner === 'claude' ? resolveClaudeInvocation()
+      : resolveCodexInvocation();
+    if (rInv.argv0 === reviewRunner) {
+      items.push({ name: `review-${reviewRunner}`, status: 'FAIL', detail: 'not on PATH' });
+    } else {
+      const v = await runProc({ argv: [rInv.argv0, ...rInv.prefix, '--version'], timeoutMs: 20_000 });
+      items.push(v.exitCode === 0
+        ? { name: `review-${reviewRunner}`, status: 'PASS', detail: `${config!.agent.review_model ?? 'default model'} — ${v.stdoutTail.trim().split('\n')[0]}` }
+        : { name: `review-${reviewRunner}`, status: 'FAIL', detail: v.stderrTail.trim().slice(0, 200) });
+    }
+  }
+
   const ghAuth = await runProc({ argv: ['gh', 'auth', 'status'], timeoutMs: 20_000 });
   items.push(ghAuth.exitCode === 0
     ? { name: 'gh-auth', status: 'PASS', detail: 'authenticated' }

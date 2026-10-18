@@ -35,17 +35,22 @@ export async function runReview(
   writeFileSync(schemaPath, JSON.stringify(REVIEW_SCHEMA), 'utf8');
 
   // pi/claude confine the reviewer by tool allowlist (read-only); codex by sandbox.
-  const runner = pickRunner(deps.agentConfig);
+  // review_provider/review_model may select a different (ideally heterogeneous)
+  // runner+model for review than the coder used.
+  const agentConfig: AppConfig['agent'] = deps.agentConfig.review_provider
+    ? { ...deps.agentConfig, provider: deps.agentConfig.review_provider, model: deps.agentConfig.review_model }
+    : deps.agentConfig;
+  const runner = pickRunner(agentConfig);
   const reviewTools =
-    deps.agentConfig.provider === 'pi' ? PI_REVIEW_TOOLS
-    : deps.agentConfig.provider === 'claude' ? CLAUDE_REVIEW_TOOLS
+    agentConfig.provider === 'pi' ? PI_REVIEW_TOOLS
+    : agentConfig.provider === 'claude' ? CLAUDE_REVIEW_TOOLS
     : undefined;
   const callReview = () =>
     runner(
       {
         workdir: ctx.worktreePath,
         prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence),
-        sandbox: deps.agentConfig.review_sandbox,
+        sandbox: agentConfig.review_sandbox,
         timeoutMs: deps.timeoutMs,
         logPath,
         schemaPath,
@@ -54,7 +59,7 @@ export async function runReview(
         signal: deps.signal,
         onSpawn: deps.onSpawn,
       },
-      deps.agentConfig,
+      agentConfig,
     );
 
   let proc = await callReview();

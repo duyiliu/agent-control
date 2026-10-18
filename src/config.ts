@@ -91,6 +91,10 @@ export function loadConfig(path: string): AppConfig {
   if (!Array.isArray(envDeny) || envDeny.some((e) => typeof e !== 'string')) {
     fail('agent.env_deny must be a string array');
   }
+  const reviewProvider = agent['review_provider'];
+  if (reviewProvider !== undefined && reviewProvider !== 'codex' && reviewProvider !== 'pi' && reviewProvider !== 'claude') {
+    fail('agent.review_provider: expected "codex", "pi" or "claude"');
+  }
   const claudeEnv = agent['claude_env'];
   if (claudeEnv !== undefined) {
     const o = asObj(claudeEnv, 'agent.claude_env');
@@ -116,6 +120,8 @@ export function loadConfig(path: string): AppConfig {
     agent: {
       provider: provider as AppConfig['agent']['provider'],
       model: agent['model'] !== undefined ? asStr(agent['model'], 'agent.model') : undefined,
+      review_provider: reviewProvider as AppConfig['agent']['review_provider'],
+      review_model: agent['review_model'] !== undefined ? asStr(agent['review_model'], 'agent.review_model') : undefined,
       sandbox: sandbox as AppConfig['agent']['sandbox'],
       review_sandbox: reviewSandbox as AppConfig['agent']['review_sandbox'],
       env_deny: envDeny as string[],

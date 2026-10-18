@@ -69,6 +69,9 @@ export interface AppConfig {
   agent: {
     provider: 'codex' | 'pi' | 'claude';
     model?: string;
+    /** Review phase override; falls back to provider/model when unset. */
+    review_provider?: 'codex' | 'pi' | 'claude';
+    review_model?: string;
     sandbox: SandboxMode;
     review_sandbox: SandboxMode;
     env_deny: string[];

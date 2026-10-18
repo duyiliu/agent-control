@@ -22,6 +22,9 @@ agent:
   model: new-api/deepseek-v4.1-flash  # pi: provider/model from ~/.pi/agent/models.json; claude/codex: --model value
   sandbox: danger-full-access          # codex only
   review_sandbox: danger-full-access   # codex only; pi/claude review is read-only via tools
+  # review_provider / review_model:  # optional — run the reviewer on a different runner+model
+  #   review_provider: claude        #   (cross-model review decorrelates coder/reviewer failures)
+  #   review_model: glm-5.3-flash
   # claude_env:                      # claude only: injected via --settings, outranks ~/.claude/settings.json
   #   ANTHROPIC_BASE_URL: http://127.0.0.1:15721
   #   ANTHROPIC_AUTH_TOKEN: PROXY_MANAGED
