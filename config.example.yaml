@@ -3,13 +3,13 @@ server:
   max_concurrent: 1
   retry_limit: 3
   max_task_minutes: 45
-  worktree_root: C:/Users/zhangqianfeng/git/agent-control-data/worktrees
-  database: C:/Users/zhangqianfeng/git/agent-control-data/agent-control.db
-  logs_dir: C:/Users/zhangqianfeng/git/agent-control-data/logs
+  worktree_root: C:/path/to/agent-control-data/worktrees
+  database: C:/path/to/agent-control-data/agent-control.db
+  logs_dir: C:/path/to/agent-control-data/logs
 
 projects:
-  - repo: duyiliu/agent-control-sandbox
-    local_repo: C:/Users/zhangqianfeng/git/agent-control-sandbox
+  - repo: your-org/your-sandbox-repo
+    local_repo: C:/path/to/your-sandbox-repo
     base_branch: main
     ready_label: agent-ready
     branch_prefix: agent/issue-
