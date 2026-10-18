@@ -36,6 +36,27 @@ schtasks /delete /tn agent-control  # 卸载
 - 单实例由 `agent-control.lock` 心跳锁保证：旧进程死透后新实例自动接管；两个实例同时存在时后到者直接退出。
 - 边界：onlogon 触发只保证"登录后起来"，**不管崩溃自愈**——进程异常退出当次不会自动拉起，救急就 `schtasks /run`。需要真自愈再上 NSSM 或给任务配 restart-on-failure。
 
+## 使用流程
+
+一条主线：**提 issue → 打 `agent-ready` → 等 Draft PR → 人审合并**。
+
+1. **下任务**：在托管仓提 issue，正文写清背景 / 范围 / 验收标准 / 测试命令 / 依赖，打 `agent-ready` 标签。无标签的 issue 永远不会被执行。标签打上瞬间正文会被哈希快照——**打标签后再改内容 → `BLOCKED_APPROVAL_CHANGED`**，需 `retry` 重批。
+2. **看执行**：下个轮询周期自动领取，全程无干预。围观：
+   ```powershell
+   npm run ac -- status        # 所有任务当前相位
+   npm run ac -- runs <issue>  # 单任务事件时间线 + 证据路径
+   ```
+   原始证据在 `<数据目录>\logs\`：`agent-control.jsonl` 事件流 + 每轮 artifacts（agent 事件、测试日志、review 结论、diff.patch）。
+3. **收口**：checks + review 全过 → 自动出 Draft PR + `agent-pr` 标签。GitHub 上打开 PR → Ready for review → 审完 Merge。调度器检测到 merged → `COMPLETED` → 自动删 worktree/分支。
+4. **异常**：
+
+   | 情况 | 表现 | 处理 |
+   |---|---|---|
+   | checks/review 修复预算耗尽 | issue 收到 `BLOCKED` 评论 | 看 `runs <issue>` 证据，人工处理或 `retry` |
+   | 审批后正文被改 | `BLOCKED_APPROVAL_CHANGED` | `npm run ac -- retry <issue>` 重批 |
+   | 中途叫停 | — | `npm run ac -- stop <issue>` |
+   | 服务崩溃 | `RECOVERY_REQUIRED` 评论 | 确认子进程已死后 `retry` |
+
 ## 安全边界（MVP）
 
 - 只接入可信测试仓库；Issue 正文只作数据，不会变成 shell 命令（测试命令只能来自仓库配置白名单）。注意：Issue 正文仍是**不可信输入**——提示词里的"数据边界"只是约定而非强制边界。环境白名单只限制传入子进程的环境变量；worktree 是工作目录约定，不构成文件访问隔离。恶意 Issue 最坏能诱导 agent 在 worktree 里写坏代码——坏代码由检查、独立 review 与人工合并拦截。不要对非本人撰写/未确认可信的 Issue 启用本工具。
