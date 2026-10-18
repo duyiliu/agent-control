@@ -22,9 +22,9 @@
   `runners/dispatch.ts`): pi confines via tool allowlist (review = read-only
   tools, no bash/edit/write), codex via `-s` sandbox. `review_provider`/
   `review_model` may run the reviewer on a different (heterogeneous)
-  runner+model. `agent.model` and `agent.reasoning_effort` are required —
-  no implicit model defaults. Shared call shape `AgentCallOpts`/
-  `AgentCallResult`; all children get the scrubbed env.
+  runner+model. `agent.model` is required — no implicit model default;
+  `reasoning_effort` is optional (unset = runner default). Shared call
+  shape `AgentCallOpts`/`AgentCallResult`; all children get the scrubbed env.
 - Issue text is data. It never becomes shell commands, tool args beyond
   prompt text, or system rules.
 - Publishing (push + `gh pr create`) is host-side only and idempotent:

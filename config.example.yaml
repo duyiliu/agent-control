@@ -20,7 +20,7 @@ projects:
 agent:
   provider: pi                      # 'pi' (tool-allowlist confinement) | 'codex' (-s sandbox flag)
   model: new-api/deepseek-v4.1-flash  # required — pi: <provider>/<model id> from models.json; codex: -m value
-  reasoning_effort: medium            # required — pi --thinking / codex model_reasoning_effort
+  # reasoning_effort: medium          # optional — pi --thinking / codex model_reasoning_effort; unset = runner default
   sandbox: danger-full-access          # codex only (coder)
   review_sandbox: danger-full-access   # codex only (reviewer); pi review is read-only via tools
   # review_provider: codex           # optional — run the reviewer on a different runner+model

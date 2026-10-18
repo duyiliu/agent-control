@@ -93,8 +93,8 @@ export function loadConfig(path: string): AppConfig {
   }
   const efforts = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
   const effort = agent['reasoning_effort'];
-  if (!efforts.includes(effort as string)) {
-    fail(`agent.reasoning_effort is required — expected one of ${efforts.join('/')}`);
+  if (effort !== undefined && !efforts.includes(effort as string)) {
+    fail(`agent.reasoning_effort: expected one of ${efforts.join('/')}`);
   }
   const reviewEffort = agent['review_reasoning_effort'];
   if (reviewEffort !== undefined && !efforts.includes(reviewEffort as string)) {

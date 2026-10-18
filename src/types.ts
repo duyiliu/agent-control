@@ -70,8 +70,8 @@ export interface AppConfig {
     provider: 'pi' | 'codex';
     /** pi: "<provider>/<model id>" (models.json); codex: `-m` model name. */
     model: string;
-    /** Explicit thinking level — pi `--thinking`, codex `model_reasoning_effort`. */
-    reasoning_effort: ReasoningEffort;
+    /** Optional thinking level — pi `--thinking`, codex `model_reasoning_effort`. */
+    reasoning_effort?: ReasoningEffort;
     /** Review phase overrides; fall back to provider/model/reasoning_effort. */
     review_provider?: 'pi' | 'codex';
     review_model?: string;
