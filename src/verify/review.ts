@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { PI_REVIEW_TOOLS, runPi } from '../runners/pi.js';
-import { buildReviewPrompt, type PromptContext } from '../scheduler/prompts.js';
+import { pickRunner } from '../runners/dispatch.js';
+import { PI_REVIEW_TOOLS } from '../runners/pi.js';
+import { REVIEW_SCHEMA, buildReviewPrompt, type PromptContext } from '../scheduler/prompts.js';
 import type { AppConfig, ReviewResult } from '../types.js';
 
 /** The review PROCESS failed (exit/timeout/spawn) — not a code verdict. */
@@ -16,10 +17,10 @@ export interface ReviewDeps {
 }
 
 /**
- * Independent read-only review session on pi. The verdict is a prompt-level
- * JSON contract (pi has no schema enforcement): an unparseable/absent verdict
- * is treated as a non-pass (BLOCK). Confinement is the read-only tool
- * allowlist — the reviewer gets no bash/edit/write.
+ * Independent read-only review session. pi confines the reviewer via the
+ * read-only tool allowlist (no bash/edit/write) with a prompt-level JSON
+ * contract; codex confines via `-s` sandbox and gets hard schema enforcement
+ * via --output-schema. An unparseable/absent verdict is a non-pass (BLOCK).
  */
 export async function runReview(
   ctx: PromptContext,
@@ -28,24 +29,30 @@ export async function runReview(
   deps: ReviewDeps,
 ): Promise<{ result: ReviewResult; logPath: string }> {
   mkdirSync(deps.artifactsDir, { recursive: true });
+  const schemaPath = join(deps.artifactsDir, 'review-schema.json');
   const lastMsgPath = join(deps.artifactsDir, 'review-last-message.txt');
   const logPath = join(deps.artifactsDir, 'review-agent.jsonl');
+  writeFileSync(schemaPath, JSON.stringify(REVIEW_SCHEMA), 'utf8');
 
-  // review_model may select a different (ideally heterogeneous) model for
-  // review than the coder used — decorrelates coder/reviewer blind spots.
+  // review_provider/review_model may select a different (ideally heterogeneous)
+  // runner+model for review than the coder used — decorrelates blind spots.
   const agentConfig: AppConfig['agent'] = {
     ...deps.agentConfig,
+    provider: deps.agentConfig.review_provider ?? deps.agentConfig.provider,
     model: deps.agentConfig.review_model ?? deps.agentConfig.model,
   };
+  const isPi = agentConfig.provider === 'pi';
   const callReview = () =>
-    runPi(
+    pickRunner(agentConfig)(
       {
         workdir: ctx.worktreePath,
         prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence),
+        sandbox: agentConfig.review_sandbox,
         timeoutMs: deps.timeoutMs,
         logPath,
+        schemaPath: isPi ? undefined : schemaPath,
         lastMessagePath: lastMsgPath,
-        tools: PI_REVIEW_TOOLS,
+        tools: isPi ? PI_REVIEW_TOOLS : undefined,
         signal: deps.signal,
         onSpawn: deps.onSpawn,
       },

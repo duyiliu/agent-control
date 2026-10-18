@@ -67,9 +67,14 @@ export interface AppConfig {
   };
   projects: ProjectConfig[];
   agent: {
+    provider: 'pi' | 'codex';
     model?: string;
-    /** Review phase model override; falls back to model when unset. */
+    /** Review phase overrides; fall back to provider/model when unset. */
+    review_provider?: 'pi' | 'codex';
     review_model?: string;
+    /** codex only: `-s` confinement for coder / reviewer. pi ignores these. */
+    sandbox: SandboxMode;
+    review_sandbox: SandboxMode;
     env_deny: string[];
   };
   approvals: {
@@ -78,6 +83,8 @@ export interface AppConfig {
     allow_auto_deploy: boolean;
   };
 }
+
+export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 
 export interface IssueData {
   number: number;

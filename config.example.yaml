@@ -18,8 +18,12 @@ projects:
         timeout_seconds: 300
 
 agent:
-  model: new-api/deepseek-v4.1-flash  # provider/model id from ~/.pi/agent/models.json
-  # review_model: new-api/GLM-5.3-Flash  # optional — reviewer on a different (heterogeneous) model
+  provider: pi                      # 'pi' (tool-allowlist confinement) | 'codex' (-s sandbox flag)
+  model: new-api/deepseek-v4.1-flash  # pi: <provider>/<model id> from ~/.pi/agent/models.json; codex: -m value
+  sandbox: danger-full-access          # codex only (coder)
+  review_sandbox: danger-full-access   # codex only (reviewer); pi review is read-only via tools
+  # review_provider: codex           # optional — run the reviewer on a different runner+model
+  # review_model: new-api/GLM-5.3-Flash  # (heterogeneous review decorrelates failures)
   env_deny:
     - GH_TOKEN
     - GITHUB_TOKEN

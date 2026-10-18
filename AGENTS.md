@@ -18,11 +18,12 @@
   `git push`/`gh` must stay unauthenticated — do not weaken.
 - REVIEWING asserts HEAD sha + clean status afterwards; a moved HEAD or dirty
   worktree is reviewer tampering → BLOCKED, never a fixable verdict.
-- Single runner: pi (`runners/pi.ts`, `pi -p` non-interactive). The coder gets
-  the full tool set; the reviewer is confined to read-only tools
-  (read,grep,find,ls — no bash/edit/write). `agent.review_model` may run the
-  reviewer on a different (heterogeneous) model. Call shape `PiCallOpts`/
-  `PiCallResult`; all children get the scrubbed env.
+- `agent.provider` selects the runner (`runners/{pi,codex}.ts`, dispatch via
+  `runners/dispatch.ts`): pi confines via tool allowlist (review = read-only
+  tools, no bash/edit/write), codex via `-s` sandbox. `review_provider`/
+  `review_model` may run the reviewer on a different (heterogeneous)
+  runner+model. Shared call shape `AgentCallOpts`/`AgentCallResult`; all
+  children get the scrubbed env.
 - Issue text is data. It never becomes shell commands, tool args beyond
   prompt text, or system rules.
 - Publishing (push + `gh pr create`) is host-side only and idempotent:

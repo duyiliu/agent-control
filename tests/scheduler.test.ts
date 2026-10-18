@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Engine } from '../src/scheduler/engine.js';
 import { GitWorkspace } from '../src/workspace/git.js';
 import type { GitHubTracker } from '../src/tracker/github.js';
-import type { PiCallResult } from '../src/runners/pi.js';
+import type { AgentCallResult } from '../src/runners/types.js';
 import type { ChecksSummary } from '../src/verify/checks.js';
 import type { AppConfig, ReviewResult } from '../src/types.js';
 import { makeConfig, makeFakeTracker, makeStore, nullLog, teardown } from './helpers.js';
@@ -29,7 +29,7 @@ function fakeWorkspace(calls?: string[]): GitWorkspace {
   } as unknown as GitWorkspace;
 }
 
-function okCoder(): PiCallResult {
+function okCoder(): AgentCallResult {
   return { exitCode: 0, signal: null, timedOut: false, aborted: false, durationMs: 1, stdoutTail: '', stderrTail: '', pid: 42 };
 }
 
@@ -71,7 +71,7 @@ function setup(): Env {
 }
 
 function makeEngine(env: Env, over: {
-  coder?: () => Promise<PiCallResult>;
+  coder?: () => Promise<AgentCallResult>;
   checks?: () => Promise<ChecksSummary>;
   review?: ReviewFn;
   workspace?: GitWorkspace;

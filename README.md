@@ -3,7 +3,7 @@
 个人 AI 研发调度中心 MVP：人在 GitHub Issue 上加 `agent-ready` 标签后，常驻调度器自动完成
 
 ```
-领取 → git worktree 隔离 → pi agent 实现 → 受信测试 → 独立只读 Review →
+领取 → git worktree 隔离 → agent 实现(pi|codex) → 受信测试 → 独立只读 Review →
 有界修复(≤3) → push + Draft PR → 等待人工合并
 ```
 
@@ -15,8 +15,8 @@
 |---|---|
 | Node ≥ 22.13 | 用了内置 `node:sqlite`，低于此版本起不来 |
 | git + GitHub CLI | `gh auth login` 完成认证——发布 PR、探测合并全靠它，跑在宿主侧 |
-| pi CLI | `npm i -g @earendil-works/pi-coding-agent` |
-| pi 模型配置 | `~/.pi/agent/models.json` 里配 provider/model（见下） |
+| agent runner 二选一 | **pi**：`npm i -g @earendil-works/pi-coding-agent` + `~/.pi/agent/models.json`（见下）；**codex**：`npm i -g @openai/codex` + `codex login` |
+| pi 模型配置 | 仅 `provider: pi` 时需要：`~/.pi/agent/models.json` 里配 provider/model（见下） |
 | 托管仓标签 | `agent-ready`、`agent-running`、`agent-blocked`、`agent-pr` 需预先存在——doctor **只验不建**：<br>`gh label create agent-ready -R <owner>/<repo>`（四个都建） |
 
 `~/.pi/agent/models.json` 最小形态（OpenAI 兼容网关示例）：
@@ -38,7 +38,7 @@
 }
 ```
 
-`agent-control.yaml` 里的 `agent.model` 以 `<provider名>/<模型id>` 引用（如 `new-api/deepseek-v4.1-flash`）；`review_model` 同理，可配不同家的模型做异构审查。
+`agent-control.yaml` 里的 `agent.model` 以 `<provider名>/<模型id>` 引用（如 `new-api/deepseek-v4.1-flash`）；`review_model` 同理。用 `provider: codex` 时这些字段变成 codex 的 `-m` 值，`sandbox`/`review_sandbox` 生效。
 
 ## 快速开始
 
@@ -91,7 +91,7 @@ schtasks /delete /tn agent-control  # 卸载
 ## 安全边界（MVP）
 
 - 只接入可信测试仓库；Issue 正文只作数据，不会变成 shell 命令（测试命令只能来自仓库配置白名单）。注意：Issue 正文仍是**不可信输入**——提示词里的"数据边界"只是约定而非强制边界。环境白名单只限制传入子进程的环境变量；worktree 是工作目录约定，不构成文件访问隔离。恶意 Issue 最坏能诱导 agent 在 worktree 里写坏代码——坏代码由检查、独立 review 与人工合并拦截。不要对非本人撰写/未确认可信的 Issue 启用本工具。
-- 编码/审查子进程的环境是**白名单**：只继承 PATH/用户目录/代理等最小集合，`GH_TOKEN` 及任何 `*_KEY`/`SECRET` 一律不传递（Windows 上 gh keyring 凭据仍对本机进程可见 —— 已记录的平台限制，所以只跑可信 Issue）。pi 没有沙箱模式：编码 agent 以当前用户级权限运行；reviewer 由**只读工具白名单**（read/grep/find/ls，无 bash/edit/write）约束，且 Review 后宿主校验 worktree 必须干净、HEAD 未动——被改动即 BLOCKED。**注意**：编码 agent 的无沙箱意味着 prompt 禁令只是约定而非强制边界——因此本工具只应处理你本人撰写并确认可信的 Issue。
+- 编码/审查子进程的环境是**白名单**：只继承 PATH/用户目录/代理等最小集合，`GH_TOKEN` 及任何 `*_KEY`/`SECRET` 一律不传递（Windows 上 gh keyring 凭据仍对本机进程可见 —— 已记录的平台限制，所以只跑可信 Issue）。运行隔离按 provider 分：pi 无沙箱、reviewer 靠**只读工具白名单**（read/grep/find/ls）；codex 用 `-s` 沙箱档位（Windows 上其沙箱会导致子进程 spawn 失败，故默认 `danger-full-access`）。无论哪种，Review 后宿主都校验 worktree 必须干净、HEAD 未动——被改动即 BLOCKED。**注意**：编码 agent 实际拥有当前用户级权限，prompt 禁令只是约定而非强制边界——因此本工具只应处理你本人撰写并确认可信的 Issue。
 - push / 建 PR 由宿主调度器执行，编码子进程无发布权限；所有 PR 均为 Draft，合并永远是人工操作。
 - 审批内容哈希快照（SHA-256）：批准后 Issue 被改动 → `BLOCKED_APPROVAL_CHANGED`，需人工 `retry` 重批。
 - 重启先对账：子进程可能存活 → `RECOVERY_REQUIRED`（绝不重复执行）；确认已死 → 按已存相位幂等续行。
@@ -104,7 +104,7 @@ schtasks /delete /tn agent-control  # 卸载
 
 - 宿主 Windows 原生（非 WSL2）；单实例用心跳锁文件而非 flock。
 - SQLite 用 `node:sqlite`（Node ≥22.13 内置）替代 better-sqlite3。
-- agent 运行面为 pi 单 runner（`pi -p` 非交互；模型经 `agent.model`/`review_model` 走 `~/.pi/agent/models.json` 配置），原设计的 codex runner 未落地。
+- agent 运行面支持 `provider: pi | codex`（`agent.provider` 选择，`review_provider` 可异构）；pi 经 `~/.pi/agent/models.json` 走任意 OpenAI 兼容网关。
 
 ## 开发
 

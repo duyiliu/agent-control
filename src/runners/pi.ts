@@ -1,29 +1,12 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { runProc, scrubEnvForAgent, which, type ProcResult } from '../proc.js';
+import { runProc, scrubEnvForAgent, which } from '../proc.js';
 import type { AppConfig } from '../types.js';
+import type { AgentCallOpts, AgentCallResult } from './types.js';
 
 export interface PiInvocation {
   argv0: string;
   prefix: string[];
-}
-
-export interface PiCallOpts {
-  workdir: string;
-  prompt: string;
-  timeoutMs: number;
-  logPath?: string;
-  lastMessagePath: string;
-  model?: string;
-  /** Tool allowlist — confinement primitive (pi has no sandbox flag). */
-  tools?: string[];
-  signal?: AbortSignal;
-  /** Called with the child PID and a pid:startMs identity token at spawn. */
-  onSpawn?: (pid: number | null, identity: string | null) => void;
-}
-
-export interface PiCallResult extends ProcResult {
-  pid: number | null;
 }
 
 /**
@@ -57,7 +40,7 @@ const PI_ALL_TOOLS = ['read', 'bash', 'powershell', 'edit', 'write', 'grep', 'fi
  * templates or context files into the run.
  */
 export function buildPiArgv(
-  opts: Pick<PiCallOpts, 'tools'> & { promptPath: string; model?: string },
+  opts: Pick<AgentCallOpts, 'tools'> & { promptPath: string; model?: string },
   inv: PiInvocation,
 ): string[] {
   return [
@@ -108,10 +91,10 @@ export function extractLastMessage(jsonl: string): string | null {
  * pi has no sandbox flag: confinement is the tool allowlist + scrubbed env.
  */
 export async function runPi(
-  opts: PiCallOpts,
+  opts: AgentCallOpts,
   config: AppConfig['agent'],
   invocation?: PiInvocation,
-): Promise<PiCallResult> {
+): Promise<AgentCallResult> {
   const inv = invocation ?? resolvePiInvocation();
   const promptPath = join(dirname(opts.lastMessagePath), `pi-prompt-${Date.now()}.txt`);
   writeFileSync(promptPath, opts.prompt, 'utf8');
