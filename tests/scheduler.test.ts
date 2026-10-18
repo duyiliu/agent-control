@@ -149,6 +149,22 @@ test('AC2: approval drift after snapshot → BLOCKED_APPROVAL_CHANGED', async ()
   } finally { env.done(); }
 });
 
+test('agent-running label → claimed elsewhere, stays DISCOVERED', async () => {
+  const env = setup();
+  try {
+    // Discovered before the claim; agent-running lands between polls.
+    env.tracker.issues.set(16, { ...ISSUE, labels: ['agent-ready', 'agent-running'] });
+    let coderCalls = 0;
+    const { store, engine } = makeEngine(env, { coder: async () => { coderCalls++; return okCoder(); } });
+    store.upsertDiscovered({ repo: 'me/sandbox', issue_number: 16, issue_title: 't', issue_url: 'u' });
+    await tickAndDrain(engine);
+    assert.equal(store.getTask('me/sandbox', 16)!.status, 'DISCOVERED');
+    assert.equal(coderCalls, 0);
+    assert.equal(env.tracker.prCreated, 0);
+    assert.ok(!env.tracker.labelsAdded.some(([n, l]) => n === 16 && l === 'agent-running'));
+  } finally { env.done(); }
+});
+
 test('AC4: checks fail → bounded fix rounds → BLOCKED at limit', async () => {
   const env = setup();
   try {
@@ -331,9 +347,8 @@ test('attention state posts an issue comment', async () => {
     const { store, engine } = makeEngine(env, { checks: async () => checksFail() });
     await tickAndDrain(engine);
     assert.equal(store.getTask('me/sandbox', 14)!.status, 'BLOCKED');
-    const c = env.tracker.comments.find(([n]) => n === 14);
-    assert.ok(c, 'comment posted');
-    assert.match(c![1], /BLOCKED/);
+    const c = env.tracker.comments.find(([n, body]) => n === 14 && /BLOCKED/.test(body));
+    assert.ok(c, 'attention comment posted');
   } finally { env.done(); }
 });
 

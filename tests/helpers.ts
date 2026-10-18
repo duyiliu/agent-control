@@ -103,7 +103,7 @@ export function makeFakeTracker(): FakeTracker & {
   return Object.assign(t, {
     async listReadyIssues(_repo: string, label: string) {
       return [...t.issues.entries()]
-        .filter(([, i]) => i.state === 'OPEN' && i.labels.includes(label))
+        .filter(([, i]) => i.state === 'OPEN' && i.labels.includes(label) && !i.labels.includes('agent-running'))
         .map(([number, i]) => ({ number, ...i }));
     },
     async getIssue(_repo: string, n: number) {
@@ -113,7 +113,8 @@ export function makeFakeTracker(): FakeTracker & {
     },
     async addLabel(_r: number | string, n: number, l: string) {
       t.labelsAdded.push([n, l]);
-      t.issues.get(n)?.labels.push(l);
+      const i = t.issues.get(n);
+      if (i) i.labels = [...i.labels, l];
     },
     async removeLabel(_r: number | string, n: number, l: string) {
       t.labelsRemoved.push([n, l]);

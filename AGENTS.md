@@ -25,6 +25,10 @@
   runner+model. `agent.model` is required — no implicit model default;
   `reasoning_effort` is optional (unset = runner default). Shared call
   shape `AgentCallOpts`/`AgentCallResult`; all children get the scrubbed env.
+- Cross-instance claiming is label-based: `agent-running` on an issue means
+  another scheduler owns it — `listReadyIssues` filters it and `tryDispatch`
+  skips it (stays DISCOVERED, reconciles via the existing-PR path). Not
+  atomic; a same-second double-claim is still possible.
 - Issue text is data. It never becomes shell commands, tool args beyond
   prompt text, or system rules.
 - Publishing (push + `gh pr create`) is host-side only and idempotent:

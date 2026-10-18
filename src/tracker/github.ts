@@ -69,7 +69,7 @@ export class GitHubTracker {
       state: 'OPEN',
       url: r.url,
       updatedAt: r.updatedAt,
-    }));
+    })).filter((r) => !r.labels.includes('agent-running'));
   }
 
   async getIssue(repo: string, issueNumber: number): Promise<IssueData | null> {

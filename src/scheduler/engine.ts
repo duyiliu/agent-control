@@ -1,4 +1,5 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { Store } from '../store/sqlite.js';
 import { RunLog, type AppLog } from '../telemetry/logging.js';
@@ -166,6 +167,12 @@ export class Engine {
       this.appLog.event('dispatch_skip', { task: task.id, why: 'ready label revoked' });
       return;
     }
+    // Another scheduler instance claimed it — stay DISCOVERED; the winner's
+    // PR reconciles this task via the existing-PR path below.
+    if (issue.labels.includes('agent-running')) {
+      this.appLog.event('dispatch_skip', { task: task.id, why: 'claimed by another instance' });
+      return;
+    }
 
     const hash = approvalHash(issue);
     if (task.approved_hash == null) {
@@ -199,6 +206,10 @@ export class Engine {
     const run = this.store.claimRun(task.id);
     this.store.updateRunFields(run.run_id, { branch });
     await this.labelQuietly(project.repo, issue.number, 'add', 'agent-running');
+    await this.tracker.addComment(project.repo, issue.number,
+      `agent-control: 已领取（\`${hostname()}\`）`).catch((err) => {
+      this.appLog.event('comment_error', { task: task.id, error: String(err) });
+    });
     this.appLog.event('run_claimed', { run: run.run_id, task: task.id, attempt: run.attempt });
     this.launch(run.run_id);
   }
