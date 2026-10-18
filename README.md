@@ -9,6 +9,37 @@
 
 设计来源：`LifeOS/work/agent-control-mvp-design.md`（借鉴 OpenAI Symphony 控制面）。
 
+## 前置依赖
+
+| 依赖 | 说明 |
+|---|---|
+| Node ≥ 22.13 | 用了内置 `node:sqlite`，低于此版本起不来 |
+| git + GitHub CLI | `gh auth login` 完成认证——发布 PR、探测合并全靠它，跑在宿主侧 |
+| pi CLI | `npm i -g @earendil-works/pi-coding-agent` |
+| pi 模型配置 | `~/.pi/agent/models.json` 里配 provider/model（见下） |
+| 托管仓标签 | `agent-ready`、`agent-running`、`agent-blocked`、`agent-pr` 需预先存在——doctor **只验不建**：<br>`gh label create agent-ready -R <owner>/<repo>`（四个都建） |
+
+`~/.pi/agent/models.json` 最小形态（OpenAI 兼容网关示例）：
+
+```json
+{
+  "providers": {
+    "new-api": {
+      "name": "new-api",
+      "baseUrl": "http://<网关地址>:3002/v1",
+      "api": "openai-completions",
+      "apiKey": "<key>",
+      "models": [
+        { "id": "deepseek-v4.1-flash", "contextWindow": 1000000, "maxTokens": 8192 },
+        { "id": "GLM-5.3-Flash", "contextWindow": 1000000, "maxTokens": 8192 }
+      ]
+    }
+  }
+}
+```
+
+`agent-control.yaml` 里的 `agent.model` 以 `<provider名>/<模型id>` 引用（如 `new-api/deepseek-v4.1-flash`）；`review_model` 同理，可配不同家的模型做异构审查。
+
 ## 快速开始
 
 ```powershell
