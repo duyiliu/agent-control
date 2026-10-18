@@ -18,6 +18,7 @@ function fakeWorkspace(calls?: string[]): GitWorkspace {
   return {
     ensureWorktree: async (i: { worktreePath: string }) => ({ path: i.worktreePath, created: true }),
     isDirty: async () => false,
+    head: async () => 'head-sha',
     commitAll: async () => false,
     aheadCount: async () => 1,
     diffVsBase: async () => 'diff',
@@ -202,6 +203,24 @@ test('AC5b: HUMAN_REVIEW_REQUIRED → BLOCKED, no PR', async () => {
     const { store, engine } = makeEngine(env, { review: reviewHuman });
     await tickAndDrain(engine);
     assert.equal(store.getTask('me/sandbox', 7)!.status, 'BLOCKED');
+    assert.equal(env.tracker.prCreated, 0);
+  } finally { env.done(); }
+});
+
+test('review tamper: HEAD moved during review → BLOCKED, no PR', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(15, { ...ISSUE });
+    let headCalls = 0;
+    const ws = {
+      ...fakeWorkspace(),
+      head: async () => (headCalls++ === 0 ? 'sha-a' : 'sha-b'),
+    } as unknown as GitWorkspace;
+    const { store, engine } = makeEngine(env, { workspace: ws });
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 15)!;
+    assert.equal(task.status, 'BLOCKED');
+    assert.match(store.runsForTask(task.id)[0]!.reason ?? '', /HEAD moved/);
     assert.equal(env.tracker.prCreated, 0);
   } finally { env.done(); }
 });

@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { runCodex } from '../runners/codex.js';
+import { pickRunner } from '../runners/dispatch.js';
+import { CLAUDE_REVIEW_TOOLS } from '../runners/claude.js';
+import { PI_REVIEW_TOOLS } from '../runners/pi.js';
 import { REVIEW_SCHEMA, buildReviewPrompt, type PromptContext } from '../scheduler/prompts.js';
 import type { AppConfig, ReviewResult } from '../types.js';
 
@@ -32,8 +34,14 @@ export async function runReview(
   const logPath = join(deps.artifactsDir, 'review-codex.jsonl');
   writeFileSync(schemaPath, JSON.stringify(REVIEW_SCHEMA), 'utf8');
 
+  // pi/claude confine the reviewer by tool allowlist (read-only); codex by sandbox.
+  const runner = pickRunner(deps.agentConfig);
+  const reviewTools =
+    deps.agentConfig.provider === 'pi' ? PI_REVIEW_TOOLS
+    : deps.agentConfig.provider === 'claude' ? CLAUDE_REVIEW_TOOLS
+    : undefined;
   const callReview = () =>
-    runCodex(
+    runner(
       {
         workdir: ctx.worktreePath,
         prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence),
@@ -42,6 +50,7 @@ export async function runReview(
         logPath,
         schemaPath,
         lastMessagePath: lastMsgPath,
+        tools: reviewTools,
         signal: deps.signal,
         onSpawn: deps.onSpawn,
       },
@@ -68,7 +77,7 @@ export async function runReview(
     return { result: { verdict: 'BLOCK', summary: 'review produced no structured output', findings: [] }, logPath };
   }
   try {
-    const parsed = JSON.parse(readFileSync(lastMsgPath, 'utf8')) as {
+    const parsed = parseVerdictJson(readFileSync(lastMsgPath, 'utf8')) as {
       verdict?: string;
       summary?: string;
       findings?: string[];
@@ -87,4 +96,20 @@ export async function runReview(
   } catch {
     return { result: { verdict: 'BLOCK', summary: 'review output was not valid JSON', findings: [] }, logPath };
   }
+}
+
+/**
+ * Parse the verdict JSON from the reviewer's last message. codex's
+ * --output-schema yields clean JSON; prompt-level runners may wrap it in
+ * fences or prose, so strip those before failing as unparseable.
+ */
+function parseVerdictJson(text: string): unknown {
+  const stripped = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  try {
+    return JSON.parse(stripped);
+  } catch { /* fall through to object extraction */ }
+  const start = stripped.indexOf('{');
+  const end = stripped.lastIndexOf('}');
+  if (start >= 0 && end > start) return JSON.parse(stripped.slice(start, end + 1));
+  return JSON.parse(stripped); // throws with the original-shaped error
 }

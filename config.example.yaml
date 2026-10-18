@@ -18,10 +18,13 @@ projects:
         timeout_seconds: 300
 
 agent:
-  provider: codex
-  sandbox: danger-full-access
-  review_sandbox: danger-full-access
-  # model: gpt-5-codex   # optional override
+  provider: pi                    # 'pi' | 'claude' (tool-allowlist confinement) | 'codex' (sandbox flag)
+  model: new-api/deepseek-v4.1-flash  # pi: provider/model from ~/.pi/agent/models.json; claude/codex: --model value
+  sandbox: danger-full-access          # codex only
+  review_sandbox: danger-full-access   # codex only; pi/claude review is read-only via tools
+  # claude_env:                      # claude only: injected via --settings, outranks ~/.claude/settings.json
+  #   ANTHROPIC_BASE_URL: http://127.0.0.1:15721
+  #   ANTHROPIC_AUTH_TOKEN: PROXY_MANAGED
   env_deny:
     - GH_TOKEN
     - GITHUB_TOKEN

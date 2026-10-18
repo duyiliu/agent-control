@@ -75,7 +75,9 @@ export function loadConfig(path: string): AppConfig {
 
   const agent = asObj(root['agent'] ?? {}, 'agent');
   const provider = agent['provider'] ?? 'codex';
-  if (provider !== 'codex') fail('agent.provider: only "codex" is supported in MVP');
+  if (provider !== 'codex' && provider !== 'pi' && provider !== 'claude') {
+    fail('agent.provider: expected "codex", "pi" or "claude"');
+  }
   const sandboxModes = ['read-only', 'workspace-write', 'danger-full-access'];
   const sandbox = agent['sandbox'] ?? 'danger-full-access';
   if (!sandboxModes.includes(sandbox as string)) {
@@ -88,6 +90,13 @@ export function loadConfig(path: string): AppConfig {
   const envDeny = agent['env_deny'] ?? [];
   if (!Array.isArray(envDeny) || envDeny.some((e) => typeof e !== 'string')) {
     fail('agent.env_deny must be a string array');
+  }
+  const claudeEnv = agent['claude_env'];
+  if (claudeEnv !== undefined) {
+    const o = asObj(claudeEnv, 'agent.claude_env');
+    for (const [k, v] of Object.entries(o)) {
+      if (typeof v !== 'string') fail(`agent.claude_env.${k} must be a string`);
+    }
   }
 
   const approvals = asObj(root['approvals'] ?? {}, 'approvals');
@@ -105,11 +114,12 @@ export function loadConfig(path: string): AppConfig {
     },
     projects: projectsRaw.map(parseProject),
     agent: {
-      provider: 'codex',
+      provider: provider as AppConfig['agent']['provider'],
       model: agent['model'] !== undefined ? asStr(agent['model'], 'agent.model') : undefined,
       sandbox: sandbox as AppConfig['agent']['sandbox'],
       review_sandbox: reviewSandbox as AppConfig['agent']['review_sandbox'],
       env_deny: envDeny as string[],
+      claude_env: claudeEnv as Record<string, string> | undefined,
     },
     approvals: {
       require_design_approval: asBool(approvals['require_design_approval'] ?? true, 'approvals.require_design_approval'),

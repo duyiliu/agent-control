@@ -9,6 +9,8 @@ import { GitWorkspace } from './workspace/git.js';
 import { AppLog } from './telemetry/logging.js';
 import { pidAlive, processStartedAt, runProc, which } from './proc.js';
 import { resolveCodexInvocation } from './runners/codex.js';
+import { resolvePiInvocation } from './runners/pi.js';
+import { resolveClaudeInvocation } from './runners/claude.js';
 import type { AppConfig } from './types.js';
 
 /**
@@ -180,15 +182,39 @@ export async function runDoctor(config: AppConfig | null, configError?: string):
       : { name: tool, status: 'FAIL', detail: `${p} exists but --version failed` });
   }
 
-  // codex is probed through its resolved invocation (npm .cmd shims cannot be
-  // spawned without a shell on Windows — that would be a false FAIL).
-  const inv = resolveCodexInvocation();
+  // The configured runner is probed through its resolved invocation (npm
+  // .cmd shims cannot be spawned without a shell on Windows — false FAIL).
+  const runner = config?.agent.provider ?? 'codex';
+  const inv = runner === 'pi' ? resolvePiInvocation()
+    : runner === 'claude' ? resolveClaudeInvocation()
+    : resolveCodexInvocation();
   const codexArgv = (args: string[]) => [inv.argv0, ...inv.prefix, ...args];
-  const codexFound = inv.argv0 === 'codex' ? false : true;
+  const codexFound = inv.argv0 === runner ? false : true;
   if (!codexFound) {
-    items.push({ name: 'codex', status: 'FAIL', detail: 'not on PATH' });
-    items.push({ name: 'codex-invocation', status: 'FAIL', detail: 'unresolved' });
-    items.push({ name: 'codex-auth', status: 'FAIL', detail: 'codex not on PATH' });
+    items.push({ name: runner, status: 'FAIL', detail: 'not on PATH' });
+    items.push({ name: `${runner}-invocation`, status: 'FAIL', detail: 'unresolved' });
+    if (runner === 'codex') items.push({ name: 'codex-auth', status: 'FAIL', detail: 'codex not on PATH' });
+  } else if (runner === 'pi') {
+    const v = await runProc({ argv: codexArgv(['--version']), timeoutMs: 20_000 });
+    items.push(v.exitCode === 0
+      ? { name: 'pi', status: 'PASS', detail: `${inv.argv0 === process.execPath ? 'node ' + inv.prefix[0] : inv.argv0} — ${v.stdoutTail.trim().split('\n')[0]}` }
+      : { name: 'pi', status: 'FAIL', detail: v.stderrTail.trim().slice(0, 200) });
+    items.push({ name: 'pi-invocation', status: 'PASS', detail: codexArgv(['-p', '…']).join(' ') });
+    const piCfg = join(process.env.USERPROFILE ?? '', '.pi', 'agent', 'models.json');
+    items.push(existsSync(piCfg)
+      ? { name: 'pi-models', status: 'PASS', detail: piCfg }
+      : { name: 'pi-models', status: 'FAIL', detail: `${piCfg} missing — pi providers/models are file-configured` });
+  } else if (runner === 'claude') {
+    const v = await runProc({ argv: codexArgv(['--version']), timeoutMs: 20_000 });
+    items.push(v.exitCode === 0
+      ? { name: 'claude', status: 'PASS', detail: `${inv.argv0} — ${v.stdoutTail.trim().split('\n')[0]}` }
+      : { name: 'claude', status: 'FAIL', detail: v.stderrTail.trim().slice(0, 200) });
+    items.push({ name: 'claude-invocation', status: 'PASS', detail: codexArgv(['-p', '…']).join(' ') });
+    const ccCfg = join(process.env.USERPROFILE ?? '', '.claude', 'settings.json');
+    const ccConfigured = existsSync(ccCfg) || !!config?.agent.claude_env;
+    items.push(ccConfigured
+      ? { name: 'claude-settings', status: 'PASS', detail: config?.agent.claude_env ? 'agent.claude_env override' : ccCfg }
+      : { name: 'claude-settings', status: 'FAIL', detail: 'no ~/.claude/settings.json and no agent.claude_env' });
   } else {
     const v = await runProc({ argv: codexArgv(['--version']), timeoutMs: 20_000 });
     items.push(v.exitCode === 0

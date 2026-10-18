@@ -136,6 +136,9 @@ export function buildReviewPrompt(ctx: PromptContext, testEvidence: string, diff
     '- BLOCK：存在确定性缺陷、未满足验收、测试造假迹象、或改动范围越界。',
     '- HUMAN_REVIEW_REQUIRED：涉及高风险变更（权限、密钥、数据删除、契约变更）或你无法确定。',
     '- 若无法形成结构化结论，必须输出 HUMAN_REVIEW_REQUIRED。',
+    '',
+    '# 输出格式（硬性要求）',
+    '只输出一个 JSON 对象 {"verdict":"PASS|BLOCK|HUMAN_REVIEW_REQUIRED","summary":"...","findings":["..."]}；不要输出 JSON 之外的任何内容，不要用代码块包裹。',
   ].join('\n');
 }
 

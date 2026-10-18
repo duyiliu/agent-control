@@ -40,6 +40,8 @@ export interface CodexCallOpts {
   schemaPath?: string;
   lastMessagePath: string;
   model?: string;
+  /** Tool allowlist — pi runner only; codex confines via `sandbox` instead. */
+  tools?: string[];
   signal?: AbortSignal;
   /** Called with the child PID and a pid:startMs identity token at spawn. */
   onSpawn?: (pid: number | null, identity: string | null) => void;

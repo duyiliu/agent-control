@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { pidAlive, runProc, scrubEnvForAgent, which } from '../src/proc.js';
 import { parseWorktreeList } from '../src/workspace/git.js';
 import { approvalHash } from '../src/tracker/github.js';
@@ -61,6 +63,14 @@ test('scrubEnvForAgent: allowlist only — ambient secrets never pass', () => {
   for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'SECRET_KEY', 'AWS_SECRET_ACCESS_KEY', 'CUSTOM']) {
     assert.equal(out[k], undefined, k);
   }
+  // Credential jail: on-disk gh/git auth must be dead in the child.
+  assert.equal(out.GH_CONFIG_DIR, join(tmpdir(), 'agent-control-gh-jail'));
+  assert.equal(out.GIT_CONFIG_COUNT, '1');
+  assert.equal(out.GIT_CONFIG_KEY_0, 'credential.helper');
+  assert.equal(out.GIT_CONFIG_VALUE_0, '');
+  assert.equal(out.GIT_TERMINAL_PROMPT, '0');
+  assert.equal(out.GCM_INTERACTIVE, 'never');
+  assert.equal(out.GIT_SSH_COMMAND, 'exit 1');
 });
 
 test('which finds node on this machine', () => {

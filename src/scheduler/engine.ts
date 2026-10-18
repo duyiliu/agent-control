@@ -4,7 +4,8 @@ import type { Store } from '../store/sqlite.js';
 import { RunLog, type AppLog } from '../telemetry/logging.js';
 import { approvalHash, GitHubTracker } from '../tracker/github.js';
 import { GitWorkspace } from '../workspace/git.js';
-import { runCodex, type CodexCallOpts, type CodexCallResult } from '../runners/codex.js';
+import type { CodexCallOpts, CodexCallResult } from '../runners/codex.js';
+import { pickRunner } from '../runners/dispatch.js';
 import { runChecks, type ChecksSummary } from '../verify/checks.js';
 import { runReview } from '../verify/review.js';
 import { publishDraftPr, PublishError } from '../publish/pr.js';
@@ -40,7 +41,7 @@ export class Engine {
   private runChecksFn: NonNullable<EngineDeps['runChecksFn']>;
 
   constructor(private deps: EngineDeps) {
-    this.runCoderFn = deps.runCoderFn ?? ((o, cfg) => runCodex(o, cfg));
+    this.runCoderFn = deps.runCoderFn ?? ((o, cfg) => pickRunner(cfg)(o, cfg));
     this.runReviewFn = deps.runReviewFn ?? runReview;
     this.runChecksFn = deps.runChecksFn ?? runChecks;
   }
@@ -327,6 +328,9 @@ export class Engine {
             } catch (err) {
               diffEvidence = `(host could not produce diff: ${String(err).slice(0, 300)})`;
             }
+            // Record HEAD pre-review: `status --porcelain` alone cannot see
+            // commits/resets/ref moves by the unsandboxed reviewer.
+            const headBefore = await this.workspace.head(worktreePath).catch(() => null);
             let reviewOutcome: Awaited<ReturnType<typeof runReview>>;
             try {
               reviewOutcome = await this.runReviewFn(
@@ -353,9 +357,14 @@ export class Engine {
               exit_code: null, artifact_path: logPath, verdict: result.verdict,
             });
             // Guardrail (sandbox-free review): the reviewer must not modify
-            // the worktree. Anything dirty at this point is tampering.
-            if (await this.workspace.isDirty(worktreePath)) {
-              this.finish(run, task, 'BLOCKED', 'worktree modified during review; refusing to continue');
+            // the worktree or its history. Dirty status OR a moved HEAD is
+            // tampering — unprovable state is treated as moved.
+            const headAfter = await this.workspace.head(worktreePath).catch(() => null);
+            const headMoved = headBefore === null || headAfter === null || headAfter !== headBefore;
+            if (headMoved || (await this.workspace.isDirty(worktreePath))) {
+              this.finish(run, task, 'BLOCKED', headMoved
+                ? 'branch HEAD moved during review; refusing to continue'
+                : 'worktree modified during review; refusing to continue');
               return;
             }
             if (result.verdict === 'PASS') {

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createWriteStream, existsSync, mkdirSync, type WriteStream } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 
 const TAIL_LIMIT = 64 * 1024;
@@ -180,9 +181,23 @@ const AGENT_ENV_ALLOW = [
   'CODEX_HOME', 'CODEX_CI',
 ];
 
+/** Shared empty dir used as GH_CONFIG_DIR — gh then finds no authenticated host. */
+let ghJail: string | null = null;
+function ghJailDir(): string {
+  if (!ghJail) {
+    ghJail = join(tmpdir(), 'agent-control-gh-jail');
+    try { mkdirSync(ghJail, { recursive: true }); } catch { /* missing dir works too */ }
+  }
+  return ghJail;
+}
+
 /**
  * Build the agent environment: allowlist only, minus `extraDeny`. Never
- * inherits GitHub tokens or other ambient secrets.
+ * inherits GitHub tokens or other ambient secrets. Beyond env vars, on-disk
+ * credentials are cut off too: gh points at an empty config dir, git's
+ * credential helper is cleared, ssh is dead-ended, and auth lookups cannot
+ * prompt — so `git push`/`gh` fail unauthenticated instead of merely being
+ * prohibited by prompt text.
  */
 export function scrubEnvForAgent(
   env: NodeJS.ProcessEnv,
@@ -197,6 +212,13 @@ export function scrubEnvForAgent(
     if (!allow.has(key) || deny.has(key)) continue;
     out[k] = v;
   }
+  out.GH_CONFIG_DIR = ghJailDir();
+  out.GIT_CONFIG_COUNT = '1';
+  out.GIT_CONFIG_KEY_0 = 'credential.helper';
+  out.GIT_CONFIG_VALUE_0 = '';
+  out.GIT_TERMINAL_PROMPT = '0';
+  out.GCM_INTERACTIVE = 'never';
+  out.GIT_SSH_COMMAND = 'exit 1';
   return out;
 }
 

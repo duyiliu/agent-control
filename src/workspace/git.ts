@@ -69,6 +69,12 @@ export class GitWorkspace {
     return res.stdoutTail.trim().length > 0;
   }
 
+  /** HEAD sha — a moved ref is tampering `status --porcelain` cannot see. */
+  async head(worktreePath: string): Promise<string> {
+    const res = await this.git(['rev-parse', 'HEAD'], worktreePath);
+    return res.stdoutTail.trim();
+  }
+
   /** Host-side fallback: commit leftover agent changes verbatim. */
   async commitAll(worktreePath: string, message: string): Promise<boolean> {
     if (!(await this.isDirty(worktreePath))) return false;

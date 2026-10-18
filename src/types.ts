@@ -67,11 +67,13 @@ export interface AppConfig {
   };
   projects: ProjectConfig[];
   agent: {
-    provider: 'codex';
+    provider: 'codex' | 'pi' | 'claude';
     model?: string;
     sandbox: SandboxMode;
     review_sandbox: SandboxMode;
     env_deny: string[];
+    /** claude only: env map injected via --settings (outranks user settings.json). */
+    claude_env?: Record<string, string>;
   };
   approvals: {
     require_design_approval: boolean;
