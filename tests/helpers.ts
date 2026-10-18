@@ -39,6 +39,8 @@ export function makeConfig(dir: string, overrides?: Partial<AppConfig>): AppConf
     ],
     agent: {
       provider: 'pi',
+      model: 'test/model',
+      reasoning_effort: 'medium',
       sandbox: 'danger-full-access',
       review_sandbox: 'danger-full-access',
       env_deny: [],

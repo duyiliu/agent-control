@@ -40,7 +40,7 @@ const PI_ALL_TOOLS = ['read', 'bash', 'powershell', 'edit', 'write', 'grep', 'fi
  * templates or context files into the run.
  */
 export function buildPiArgv(
-  opts: Pick<AgentCallOpts, 'tools'> & { promptPath: string; model?: string },
+  opts: Pick<AgentCallOpts, 'tools'> & { promptPath: string; model?: string; thinking?: string },
   inv: PiInvocation,
 ): string[] {
   return [
@@ -56,6 +56,7 @@ export function buildPiArgv(
     '--no-approve',
     '--tools', (opts.tools ?? PI_ALL_TOOLS).join(','),
     ...(opts.model ? ['--model', opts.model] : []),
+    ...(opts.thinking ? ['--thinking', opts.thinking] : []),
     '--',
     `@${opts.promptPath}`,
   ];
@@ -100,7 +101,7 @@ export async function runPi(
   writeFileSync(promptPath, opts.prompt, 'utf8');
 
   const argv = buildPiArgv(
-    { tools: opts.tools, promptPath, model: opts.model ?? config.model },
+    { tools: opts.tools, promptPath, model: opts.model ?? config.model, thinking: config.reasoning_effort },
     inv,
   );
   const env = scrubEnvForAgent(process.env, config.env_deny);

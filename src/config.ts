@@ -91,6 +91,15 @@ export function loadConfig(path: string): AppConfig {
   if (reviewProvider !== undefined && reviewProvider !== 'pi' && reviewProvider !== 'codex') {
     fail('agent.review_provider: expected "pi" or "codex"');
   }
+  const efforts = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+  const effort = agent['reasoning_effort'];
+  if (!efforts.includes(effort as string)) {
+    fail(`agent.reasoning_effort is required — expected one of ${efforts.join('/')}`);
+  }
+  const reviewEffort = agent['review_reasoning_effort'];
+  if (reviewEffort !== undefined && !efforts.includes(reviewEffort as string)) {
+    fail(`agent.review_reasoning_effort: expected one of ${efforts.join('/')}`);
+  }
   const envDeny = agent['env_deny'] ?? [];
   if (!Array.isArray(envDeny) || envDeny.some((e) => typeof e !== 'string')) {
     fail('agent.env_deny must be a string array');
@@ -112,9 +121,11 @@ export function loadConfig(path: string): AppConfig {
     projects: projectsRaw.map(parseProject),
     agent: {
       provider: provider as AppConfig['agent']['provider'],
-      model: agent['model'] !== undefined ? asStr(agent['model'], 'agent.model') : undefined,
+      model: asStr(agent['model'], 'agent.model'),
+      reasoning_effort: effort as AppConfig['agent']['reasoning_effort'],
       review_provider: reviewProvider as AppConfig['agent']['review_provider'],
       review_model: agent['review_model'] !== undefined ? asStr(agent['review_model'], 'agent.review_model') : undefined,
+      review_reasoning_effort: reviewEffort as AppConfig['agent']['review_reasoning_effort'],
       sandbox: sandbox as AppConfig['agent']['sandbox'],
       review_sandbox: reviewSandbox as AppConfig['agent']['review_sandbox'],
       env_deny: envDeny as string[],

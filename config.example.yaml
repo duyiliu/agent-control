@@ -19,11 +19,13 @@ projects:
 
 agent:
   provider: pi                      # 'pi' (tool-allowlist confinement) | 'codex' (-s sandbox flag)
-  model: new-api/deepseek-v4.1-flash  # pi: <provider>/<model id> from ~/.pi/agent/models.json; codex: -m value
+  model: new-api/deepseek-v4.1-flash  # required — pi: <provider>/<model id> from models.json; codex: -m value
+  reasoning_effort: medium            # required — pi --thinking / codex model_reasoning_effort
   sandbox: danger-full-access          # codex only (coder)
   review_sandbox: danger-full-access   # codex only (reviewer); pi review is read-only via tools
   # review_provider: codex           # optional — run the reviewer on a different runner+model
   # review_model: new-api/GLM-5.3-Flash  # (heterogeneous review decorrelates failures)
+  # review_reasoning_effort: low     # optional — e.g. cheaper/faster review
   env_deny:
     - GH_TOKEN
     - GITHUB_TOKEN

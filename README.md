@@ -38,7 +38,7 @@
 }
 ```
 
-`agent-control.yaml` 里的 `agent.model` 以 `<provider名>/<模型id>` 引用（如 `new-api/deepseek-v4.1-flash`）；`review_model` 同理。用 `provider: codex` 时这些字段变成 codex 的 `-m` 值，`sandbox`/`review_sandbox` 生效。
+`agent-control.yaml` 里的 `agent.model` 以 `<provider名>/<模型id>` 引用（如 `new-api/deepseek-v4.1-flash`）；`agent.reasoning_effort` 是显式思考级别（off→max），映射到 pi `--thinking` / codex `model_reasoning_effort`。**`model` 与 `reasoning_effort` 均为必填——配置缺失直接拒绝启动**，不留隐式默认。用 `provider: codex` 时 `model` 变成 codex 的 `-m` 值，`sandbox`/`review_sandbox` 生效；reviewer 可用 `review_provider`/`review_model`/`review_reasoning_effort` 独立覆盖。
 
 ## 快速开始
 

@@ -55,6 +55,7 @@ export async function runCodex(
     '-o', opts.lastMessagePath,
     ...(opts.schemaPath ? ['--output-schema', opts.schemaPath] : []),
     ...(opts.model ?? config.model ? ['-m', (opts.model ?? config.model)!] : []),
+    '-c', `model_reasoning_effort="${config.reasoning_effort}"`,
     '-',
   ];
   const env = scrubEnvForAgent(process.env, config.env_deny);

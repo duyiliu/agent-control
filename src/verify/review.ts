@@ -40,6 +40,7 @@ export async function runReview(
     ...deps.agentConfig,
     provider: deps.agentConfig.review_provider ?? deps.agentConfig.provider,
     model: deps.agentConfig.review_model ?? deps.agentConfig.model,
+    reasoning_effort: deps.agentConfig.review_reasoning_effort ?? deps.agentConfig.reasoning_effort,
   };
   const isPi = agentConfig.provider === 'pi';
   const callReview = () =>
