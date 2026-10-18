@@ -14,7 +14,7 @@ import type { Store } from '../src/store/sqlite.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function fakeWorkspace(): GitWorkspace {
+function fakeWorkspace(calls?: string[]): GitWorkspace {
   return {
     ensureWorktree: async (i: { worktreePath: string }) => ({ path: i.worktreePath, created: true }),
     isDirty: async () => false,
@@ -22,6 +22,9 @@ function fakeWorkspace(): GitWorkspace {
     aheadCount: async () => 1,
     diffVsBase: async () => 'diff',
     push: async () => {},
+    removeWorktree: async (_repo: string, p: string) => { calls?.push(`rm-wt:${p}`); },
+    deleteLocalBranch: async (_repo: string, b: string) => { calls?.push(`del-local:${b}`); },
+    deleteRemoteBranch: async (_repo: string, b: string) => { calls?.push(`del-remote:${b}`); },
   } as unknown as GitWorkspace;
 }
 
@@ -265,16 +268,53 @@ test('dependency not complete → stays DISCOVERED', async () => {
   } finally { env.done(); }
 });
 
-test('mergeReconcile: merged PR → COMPLETED', async () => {
+test('mergeReconcile: merged PR → COMPLETED + worktree/branch cleanup', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(12, { ...ISSUE });
-    const { store, engine } = makeEngine(env);
+    const calls: string[] = [];
+    const { store, engine } = makeEngine(env, { workspace: fakeWorkspace(calls) });
     const { task } = store.upsertDiscovered({ repo: 'me/sandbox', issue_number: 12, issue_title: 't', issue_url: 'u' });
-    store.setTaskStatus(task.id, 'AWAITING_MERGE', { pr_url: 'https://x/pull/77' });
+    store.setTaskStatus(task.id, 'AWAITING_MERGE', { pr_url: 'https://x/pull/77', branch: 'agent/issue-12' });
     env.tracker.prStates.set(77, 'MERGED');
     await engine.tick();
     assert.equal(store.getTask('me/sandbox', 12)!.status, 'COMPLETED');
+    assert.ok(calls.some((c) => c.startsWith('rm-wt:')), `worktree cleanup ran: ${calls}`);
+    assert.ok(calls.includes('del-local:agent/issue-12'), `local branch deleted: ${calls}`);
+    assert.ok(calls.includes('del-remote:agent/issue-12'), `remote branch deleted: ${calls}`);
+  } finally { env.done(); }
+});
+
+test('mergeReconcile: cleanup failure never un-completes a task', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(13, { ...ISSUE });
+    const ws = {
+      ...fakeWorkspace(),
+      removeWorktree: async () => { throw new Error('wt locked'); },
+      deleteLocalBranch: async () => { throw new Error('branch busy'); },
+      deleteRemoteBranch: async () => { throw new Error('network'); },
+    } as unknown as GitWorkspace;
+    const { store, engine } = makeEngine(env, { workspace: ws });
+    const { task } = store.upsertDiscovered({ repo: 'me/sandbox', issue_number: 13, issue_title: 't', issue_url: 'u' });
+    store.setTaskStatus(task.id, 'AWAITING_MERGE', { pr_url: 'https://x/pull/78', branch: 'agent/issue-13' });
+    env.tracker.prStates.set(78, 'MERGED');
+    await engine.tick();
+    assert.equal(store.getTask('me/sandbox', 13)!.status, 'COMPLETED');
+    assert.match(store.getMeta('last_error') ?? '', /cleanup_error/);
+  } finally { env.done(); }
+});
+
+test('attention state posts an issue comment', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(14, { ...ISSUE });
+    const { store, engine } = makeEngine(env, { checks: async () => checksFail() });
+    await tickAndDrain(engine);
+    assert.equal(store.getTask('me/sandbox', 14)!.status, 'BLOCKED');
+    const c = env.tracker.comments.find(([n]) => n === 14);
+    assert.ok(c, 'comment posted');
+    assert.match(c![1], /BLOCKED/);
   } finally { env.done(); }
 });
 

@@ -9,8 +9,22 @@ test('migrations are idempotent and schema_version recorded', () => {
     s1.close();
     const s2 = makeStore(dir); // reopen same db
     const v = s2.db.prepare('SELECT MAX(version) v FROM schema_version').get() as { v: number };
-    assert.equal(v.v, 2);
+    assert.equal(v.v, 3);
     s2.close();
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('meta kv round-trips and overwrites', () => {
+  const dir = tmpDir();
+  try {
+    const s = makeStore(dir);
+    assert.equal(s.getMeta('last_error'), null);
+    s.setMeta('last_error', 'a');
+    s.setMeta('last_error', 'b');
+    assert.equal(s.getMeta('last_error'), 'b');
+    s.close();
   } finally {
     cleanup(dir);
   }

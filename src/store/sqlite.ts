@@ -10,7 +10,7 @@ import type {
 } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -122,6 +122,15 @@ export class Store {
         this.db
           .prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)')
           .run(2, now());
+      });
+    }
+    if (current < 3) {
+      // v3: kv meta store (last internal error surfaced via `status`).
+      this.tx(() => {
+        this.db.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+        this.db
+          .prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)')
+          .run(3, now());
       });
     }
   }
@@ -383,5 +392,18 @@ export class Store {
     return this.db
       .prepare('SELECT * FROM check_results WHERE run_id = ? ORDER BY id')
       .all(runId) as unknown as CheckResultRow[];
+  }
+
+  // ---------- meta ----------
+
+  setMeta(key: string, value: string) {
+    this.db
+      .prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .run(key, value);
+  }
+
+  getMeta(key: string): string | null {
+    const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined;
+    return row?.value ?? null;
   }
 }

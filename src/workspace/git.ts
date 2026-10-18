@@ -103,6 +103,21 @@ export class GitWorkspace {
     await this.git(['push', '-u', 'origin', branch], worktreePath, 180_000);
   }
 
+  /** Remove a worktree after its PR merged. Forced: merged work is upstream. */
+  async removeWorktree(repoDir: string, worktreePath: string): Promise<void> {
+    await this.git(['worktree', 'remove', '--force', worktreePath], repoDir);
+  }
+
+  /** Delete the agent branch ref left in the main repo after worktree removal. */
+  async deleteLocalBranch(repoDir: string, branch: string): Promise<void> {
+    await this.git(['branch', '-D', branch], repoDir);
+  }
+
+  /** Delete the merged remote agent branch. */
+  async deleteRemoteBranch(repoDir: string, branch: string): Promise<void> {
+    await this.git(['push', 'origin', '--delete', branch], repoDir, 120_000);
+  }
+
   /** Parse `git worktree list --porcelain` output. */
   // exported for tests
   static parseWorktreeList = parseWorktreeList;

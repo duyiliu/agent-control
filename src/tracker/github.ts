@@ -139,6 +139,11 @@ export class GitHubTracker {
     await this.gh(['pr', 'close', String(prNumber), '-R', repo]);
   }
 
+  /** Post a comment on an issue (used to surface attention states on GitHub). */
+  async addComment(repo: string, issueNumber: number, body: string): Promise<void> {
+    await this.gh(['issue', 'comment', String(issueNumber), '-R', repo, '--body', body]);
+  }
+
   async ensureLabels(repo: string, labels: string[]): Promise<{ ok: boolean; missing: string[] }> {
     const rows = await this.ghJson<{ name: string }[]>([
       'label', 'list', '-R', repo, '--json', 'name', '--limit', '200',

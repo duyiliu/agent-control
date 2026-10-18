@@ -29,6 +29,9 @@ const TERMINAL_FOR_TASK: Phase[] = [
   'AWAITING_MERGE', 'COMPLETED', 'BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'CANCELED', 'RECOVERY_REQUIRED',
 ];
 
+/** Task states a human must look at — surfaced as a GitHub issue comment. */
+const ATTENTION_PHASES: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED'];
+
 export class Engine {
   private controllers = new Map<string, AbortController>();
   private inFlight = new Set<string>(); // run_ids currently executing in this process
@@ -77,14 +80,16 @@ export class Engine {
           ? await this.tracker.getPrState(project.repo, prNum)
           : await this.tracker.findPrForBranch(project.repo, task.branch ?? '').then((p) => p?.state ?? 'OPEN');
         if (state === 'MERGED') {
-          this.store.setTaskStatus(task.id, 'COMPLETED');
+          this.setTaskStatus(task.id, 'COMPLETED');
           this.appLog.event('task_completed', { task: task.id, repo: task.repo, issue: task.issue_number });
+          await this.cleanupMerged(project, task);
         } else if (state === 'CLOSED') {
-          this.store.setTaskStatus(task.id, 'BLOCKED');
+          this.setTaskStatus(task.id, 'BLOCKED');
           this.appLog.event('task_blocked_pr_closed', { task: task.id });
         }
       } catch (err) {
         this.appLog.event('reconcile_error', { task: task.id, error: String(err) });
+        this.recordError('reconcile_error', err);
       }
     }
   }
@@ -97,6 +102,7 @@ export class Engine {
         issues = await this.tracker.listReadyIssues(project.repo, project.ready_label);
       } catch (err) {
         this.appLog.event('discover_error', { repo: project.repo, error: String(err) });
+        this.recordError('discover_error', err);
         continue;
       }
       for (const issue of issues) {
@@ -114,7 +120,7 @@ export class Engine {
         if (task.status === 'DISCOVERED' && task.approved_hash) {
           const h = approvalHash(issue);
           if (h !== task.approved_hash) {
-            this.store.setTaskStatus(task.id, 'BLOCKED_APPROVAL_CHANGED');
+            this.setTaskStatus(task.id, 'BLOCKED_APPROVAL_CHANGED');
             this.appLog.event('approval_drift', { task: task.id });
             await this.labelQuietly(project.repo, issue.number, 'add', 'agent-blocked');
           }
@@ -141,6 +147,7 @@ export class Engine {
         await this.tryDispatch(task, project);
       } catch (err) {
         this.appLog.event('dispatch_error', { task: task.id, error: String(err) });
+        this.recordError('dispatch_error', err);
       }
     }
   }
@@ -149,12 +156,12 @@ export class Engine {
   private async tryDispatch(task: TaskRow, project: ProjectConfig) {
     const issue = await this.tracker.getIssue(project.repo, task.issue_number);
     if (!issue || issue.state !== 'OPEN') {
-      this.store.setTaskStatus(task.id, 'CANCELED');
+      this.setTaskStatus(task.id, 'CANCELED');
       this.appLog.event('dispatch_skip', { task: task.id, why: 'issue closed or missing' });
       return;
     }
     if (!issue.labels.includes(project.ready_label)) {
-      this.store.setTaskStatus(task.id, 'CANCELED');
+      this.setTaskStatus(task.id, 'CANCELED');
       this.appLog.event('dispatch_skip', { task: task.id, why: 'ready label revoked' });
       return;
     }
@@ -163,7 +170,7 @@ export class Engine {
     if (task.approved_hash == null) {
       this.store.setApprovedHash(task.id, hash);
     } else if (task.approved_hash !== hash) {
-      this.store.setTaskStatus(task.id, 'BLOCKED_APPROVAL_CHANGED');
+      this.setTaskStatus(task.id, 'BLOCKED_APPROVAL_CHANGED');
       await this.labelQuietly(project.repo, issue.number, 'add', 'agent-blocked');
       return;
     }
@@ -182,7 +189,7 @@ export class Engine {
     const branch = `${project.branch_prefix}${task.issue_number}`;
     const existingPr = await this.tracker.findPrForBranch(project.repo, branch);
     if (existingPr) {
-      this.store.setTaskStatus(task.id, 'AWAITING_MERGE', { branch, pr_url: existingPr.url });
+      this.setTaskStatus(task.id, 'AWAITING_MERGE', { branch, pr_url: existingPr.url });
       await this.labelQuietly(project.repo, issue.number, 'add', 'agent-pr');
       this.appLog.event('dispatch_skip', { task: task.id, why: `PR already exists: ${existingPr.url}` });
       return;
@@ -208,12 +215,13 @@ export class Engine {
     void this.runTask(runId, ctl.signal)
       .catch((err) => {
         this.appLog.event('run_crashed', { run: runId, error: String(err) });
+        this.recordError('run_crashed', err);
         try {
           const run = this.store.getRun(runId);
           if (run && RUN_ACTIVE_PHASES.includes(run.phase)) {
             this.store.endRun(runId, 'FAILED', `engine crash: ${String(err).slice(0, 500)}`);
             const task = this.store.getTaskById(run.task_id);
-            if (task && task.status === 'RUNNING') this.store.setTaskStatus(task.id, 'FAILED');
+            if (task && task.status === 'RUNNING') this.setTaskStatus(task.id, 'FAILED');
           }
         } catch (e2) {
           this.appLog.event('run_crashed_cleanup_failed', { run: runId, error: String(e2) });
@@ -580,7 +588,7 @@ export class Engine {
     if (!TERMINAL_FOR_TASK.includes(finalPhase)) throw new Error(`finish() requires terminal phase, got ${finalPhase}`);
     try {
       this.store.endRun(run.run_id, finalPhase, reason);
-      this.store.setTaskStatus(task.id, finalPhase, { pr_url: taskFields?.pr_url });
+      this.setTaskStatus(task.id, finalPhase, { pr_url: taskFields?.pr_url });
       if (finalPhase === 'BLOCKED' || finalPhase === 'BLOCKED_APPROVAL_CHANGED') {
         const project = this.projectFor(task.repo);
         if (project) void this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-blocked');
@@ -591,7 +599,78 @@ export class Engine {
       }
     } catch (err) {
       this.appLog.event('finish_error', { run: run.run_id, error: String(err) });
+      this.recordError('finish_error', err);
     }
+  }
+
+  /** Task transition + GitHub-side notification for attention states. */
+  private setTaskStatus(
+    taskId: number,
+    status: Phase,
+    fields?: { approved_hash?: string | null; branch?: string | null; pr_url?: string | null },
+  ) {
+    this.store.setTaskStatus(taskId, status, fields);
+    if (ATTENTION_PHASES.includes(status)) {
+      const task = this.store.getTaskById(taskId);
+      if (task) void this.notifyTaskAttention(task, status);
+    }
+  }
+
+  /**
+   * Post an issue comment when a task needs a human. Best-effort: a
+   * comment failure is logged, never thrown into the state machine.
+   */
+  async notifyTaskAttention(task: TaskRow, status: Phase, detail?: string): Promise<void> {
+    try {
+      const runs = this.store.runsForTask(task.id);
+      const last = runs[runs.length - 1];
+      const reason = detail ?? last?.reason;
+      const body = [
+        `agent-control: 任务进入 **${status}**，需要人工处理。`,
+        reason ? `\n原因：${reason}` : '',
+        last ? `\nrun：\`${last.run_id}\`（attempt ${last.attempt}）` : '',
+        `\n排查：\`npm run ac -- runs ${task.issue_number}\`；处理后用 \`npm run ac -- retry ${task.issue_number}\` 重新排队。`,
+      ].join('');
+      await this.tracker.addComment(task.repo, task.issue_number, body);
+    } catch (err) {
+      this.appLog.event('comment_error', { task: task.id, error: String(err) });
+      this.recordError('comment_error', err);
+    }
+  }
+
+  /**
+   * After merge, reclaim the worktree and both branch refs. Every step is
+   * independent and best-effort — a cleanup failure never un-completes.
+   */
+  private async cleanupMerged(project: ProjectConfig, task: TaskRow) {
+    const last = this.store.runsForTask(task.id).at(-1);
+    const worktree = last?.workspace ?? this.worktreePathFor(project, task);
+    const done: string[] = [];
+    const step = async (name: string, fn: () => Promise<unknown>) => {
+      try {
+        await fn();
+        done.push(name);
+      } catch (err) {
+        this.appLog.event('cleanup_error', { task: task.id, step: name, error: String(err) });
+        this.recordError('cleanup_error', err);
+      }
+    };
+    await step('worktree', () => this.workspace.removeWorktree(project.local_repo, worktree));
+    const branch = task.branch;
+    if (branch && branch.startsWith(project.branch_prefix)) {
+      await step('local-branch', () => this.workspace.deleteLocalBranch(project.local_repo, branch));
+      await step('remote-branch', () => this.workspace.deleteRemoteBranch(project.local_repo, branch));
+    }
+    this.appLog.event('cleanup_done', { task: task.id, steps: done });
+  }
+
+  /** Record the latest internal error for `ac status` to surface. */
+  private recordError(kind: string, err: unknown) {
+    try {
+      this.store.setMeta('last_error', JSON.stringify({
+        at: new Date().toISOString(), kind, error: String(err).slice(0, 400),
+      }));
+    } catch { /* db closed during shutdown */ }
   }
 
   private setReturnPhase(runId: string, phase: Phase | null) {
@@ -623,6 +702,7 @@ export class Engine {
       else await this.tracker.removeLabel(repo, issue, label);
     } catch (err) {
       this.appLog.event('label_error', { repo, issue, op, label, error: String(err) });
+      this.recordError('label_error', err);
     }
   }
 }

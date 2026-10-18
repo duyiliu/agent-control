@@ -93,6 +93,15 @@ async function main() {
           const dur = last ? `attempt=${last.attempt} phase=${last.phase}` : 'no runs';
           console.log(`#${t.issue_number}\t${t.status}\t${t.repo}\t${dur}\t${t.pr_url ?? ''}\t${t.issue_title}`);
         }
+        const lastErr = store.getMeta('last_error');
+        if (lastErr) {
+          try {
+            const e = JSON.parse(lastErr) as { at: string; kind: string; error: string };
+            console.log(`\nlast internal error: ${e.at} ${e.kind}: ${e.error}`);
+          } catch {
+            console.log(`\nlast internal error: ${lastErr}`);
+          }
+        }
       } finally {
         store.close();
       }

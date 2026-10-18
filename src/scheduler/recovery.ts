@@ -50,7 +50,7 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
 
     const childMightLive = await childAliveCheck(run, alive, startedAt);
     if (childMightLive) {
-      markRecoveryRequired(store, task, run, 'child process still alive; refusing duplicate');
+      markRecoveryRequired(deps, task, run, 'child process still alive; refusing duplicate');
       report.recoveryRequired.push({ run_id: run.run_id, why: 'child alive' });
       continue;
     }
@@ -66,12 +66,12 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
         .then((pids) => pids?.filter((p) => p !== process.pid) ?? null)
         .catch(() => null);
       if (strays === null) {
-        markRecoveryRequired(store, task, run, 'cannot verify no orphaned processes on worktree');
+        markRecoveryRequired(deps, task, run, 'cannot verify no orphaned processes on worktree');
         report.recoveryRequired.push({ run_id: run.run_id, why: 'orphan scan failed' });
         continue;
       }
       if (strays.length > 0) {
-        markRecoveryRequired(store, task, run, `orphaned process(es) on worktree: ${strays.join(', ')}`);
+        markRecoveryRequired(deps, task, run, `orphaned process(es) on worktree: ${strays.join(', ')}`);
         report.recoveryRequired.push({ run_id: run.run_id, why: 'orphans alive' });
         continue;
       }
@@ -100,10 +100,13 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
             const phase: Phase = labelled ? 'BLOCKED_APPROVAL_CHANGED' : 'CANCELED';
             store.endRun(run.run_id, phase, 'approval revoked before recovery finalize; PR closed');
             store.setTaskStatus(task.id, phase, { pr_url: existing.url });
+            if (phase === 'BLOCKED_APPROVAL_CHANGED') {
+              void deps.engine.notifyTaskAttention(task, phase, 'approval revoked before recovery finalize; PR closed');
+            }
           }
           report.finalized.push(run.run_id);
         } else if (run.resume_count >= MAX_RESUMES) {
-          markRecoveryRequired(store, task, run, 'publish resume budget exhausted');
+          markRecoveryRequired(deps, task, run, 'publish resume budget exhausted');
           report.recoveryRequired.push({ run_id: run.run_id, why: 'resume budget' });
         } else {
           resume(store, run, 'PUBLISHING_PR');
@@ -116,7 +119,7 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
       case 'VERIFYING':
       case 'REVIEWING': {
         if (run.resume_count >= MAX_RESUMES || !run.workspace || !existsSync(run.workspace)) {
-          markRecoveryRequired(store, task, run, 'resume budget exhausted or workspace missing');
+          markRecoveryRequired(deps, task, run, 'resume budget exhausted or workspace missing');
           report.recoveryRequired.push({ run_id: run.run_id, why: 'budget/workspace' });
         } else {
           resume(store, run, run.phase);
@@ -131,11 +134,11 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
       case 'PREPARING':
       case 'CLAIMED': {
         if (run.resume_count >= MAX_RESUMES) {
-          markRecoveryRequired(store, task, run, 'resume budget exhausted');
+          markRecoveryRequired(deps, task, run, 'resume budget exhausted');
           report.recoveryRequired.push({ run_id: run.run_id, why: 'resume budget' });
         } else if (run.phase === 'FIXING' || run.phase === 'RUNNING') {
           if (!run.workspace || !existsSync(run.workspace)) {
-            markRecoveryRequired(store, task, run, 'workspace missing; cannot continue safely');
+            markRecoveryRequired(deps, task, run, 'workspace missing; cannot continue safely');
             report.recoveryRequired.push({ run_id: run.run_id, why: 'workspace missing' });
           } else {
             resume(store, run, run.phase);
@@ -151,7 +154,7 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
       }
 
       default: {
-        markRecoveryRequired(store, task, run, `unexpected active phase ${run.phase}`);
+        markRecoveryRequired(deps, task, run, `unexpected active phase ${run.phase}`);
         report.recoveryRequired.push({ run_id: run.run_id, why: 'unexpected phase' });
       }
     }
@@ -196,7 +199,8 @@ function resume(store: Store, run: RunRow, phase: Phase) {
   });
 }
 
-function markRecoveryRequired(store: Store, task: TaskRow, run: RunRow, why: string) {
-  store.endRun(run.run_id, 'RECOVERY_REQUIRED', why);
-  store.setTaskStatus(task.id, 'RECOVERY_REQUIRED');
+function markRecoveryRequired(deps: RecoveryDeps, task: TaskRow, run: RunRow, why: string) {
+  deps.store.endRun(run.run_id, 'RECOVERY_REQUIRED', why);
+  deps.store.setTaskStatus(task.id, 'RECOVERY_REQUIRED');
+  void deps.engine.notifyTaskAttention(task, 'RECOVERY_REQUIRED', why);
 }

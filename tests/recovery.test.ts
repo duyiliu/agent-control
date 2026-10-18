@@ -23,7 +23,10 @@ function setup() {
     fakeEngine: null as unknown as Engine,
     done: () => teardown(dir, stores),
   };
-  env.fakeEngine = { resumeRun: (id: string) => env.resumed.push(id) } as unknown as Engine;
+  env.fakeEngine = {
+    resumeRun: (id: string) => env.resumed.push(id),
+    notifyTaskAttention: async () => {},
+  } as unknown as Engine;
   return env;
 }
 

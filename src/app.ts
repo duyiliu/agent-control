@@ -132,7 +132,14 @@ export async function startService(app: App): Promise<void> {
 
   const tickMs = config.server.poll_interval_seconds * 1000;
   const tick = () =>
-    engine.tick().catch((err) => appLog.event('tick_error', { error: String(err) }));
+    engine.tick().catch((err) => {
+      appLog.event('tick_error', { error: String(err) });
+      try {
+        store.setMeta('last_error', JSON.stringify({
+          at: new Date().toISOString(), kind: 'tick_error', error: String(err).slice(0, 400),
+        }));
+      } catch { /* db closed */ }
+    });
   await tick();
   const timer = setInterval(tick, tickMs);
 

@@ -76,6 +76,7 @@ export interface FakeTracker {
   prStates: Map<number, 'OPEN' | 'CLOSED' | 'MERGED'>;
   labelsAdded: [number, string][];
   labelsRemoved: [number, string][];
+  comments: [number, string][];
   prCreated: number;
 }
 
@@ -87,6 +88,7 @@ export function makeFakeTracker(): FakeTracker & {
   findPrForBranch: (repo: string, b: string) => Promise<any>;
   getPrState: (repo: string, n: number) => Promise<any>;
   createDraftPr: (repo: string, o: any) => Promise<any>;
+  addComment: (repo: string, n: number, body: string) => Promise<void>;
 } {
   const t: FakeTracker = {
     issues: new Map(),
@@ -94,6 +96,7 @@ export function makeFakeTracker(): FakeTracker & {
     prStates: new Map(),
     labelsAdded: [],
     labelsRemoved: [],
+    comments: [],
     prCreated: 0,
   };
   return Object.assign(t, {
@@ -127,6 +130,9 @@ export function makeFakeTracker(): FakeTracker & {
       const pr = { number: 100 + t.prCreated, url: `https://github.com/x/y/pull/${100 + t.prCreated}`, state: 'OPEN', isDraft: true };
       t.prs.set(o.head, pr);
       return pr;
+    },
+    async addComment(_repo: string, n: number, body: string) {
+      t.comments.push([n, body]);
     },
   });
 }
