@@ -53,11 +53,9 @@ export function buildPiArgv(
     '--no-skills',
     '--no-prompt-templates',
     '--no-context-files',
-    '--no-approve',
     '--tools', (opts.tools ?? PI_ALL_TOOLS).join(','),
     ...(opts.model ? ['--model', opts.model] : []),
     ...(opts.thinking ? ['--thinking', opts.thinking] : []),
-    '--',
     `@${opts.promptPath}`,
   ];
 }
