@@ -15,7 +15,7 @@
 |---|---|
 | Node ≥ 22.13 | 用了内置 `node:sqlite`，低于此版本起不来 |
 | git + GitHub CLI | `gh auth login` 完成认证——发布 PR、探测合并全靠它，跑在宿主侧 |
-| agent runner 二选一 | **pi**：`npm i -g @earendil-works/pi-coding-agent` + `~/.pi/agent/models.json`（见下）；**codex**：`npm i -g @openai/codex` + `codex login` |
+| agent runner 二选一 | **pi**：`npm i -g @earendil-works/pi-coding-agent` + `~/.pi/agent/models.json`（见下）；**codex**：`npm i -g @openai/codex` + `codex login`。装完跑 `pi --version` / `codex --version` 确认在 PATH 上——npm 全局前缀不在 PATH 时 shim 会装到别处 |
 | pi 模型配置 | 仅 `provider: pi` 时需要：`~/.pi/agent/models.json` 里配 provider/model（见下） |
 | 托管仓标签 | `agent-ready`、`agent-running`、`agent-blocked`、`agent-pr` 需预先存在——doctor **只验不建**：<br>`gh label create agent-ready -R <owner>/<repo>`（四个都建） |
 
