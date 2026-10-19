@@ -52,6 +52,28 @@ npm run ac -- start                           # 启动常驻调度
 
 其他命令：`status`（任务一览）、`runs <issue>`（时间线+证据）、`stop <issue>`（一个轮询周期内安全取消）、`retry <issue>`（人工重批后重排队）。
 
+## Web 管理界面
+
+`start` 起的调度器内嵌一个 **Linear 风格看板**（`ui/` 独立前端项目：Vite + React + Tailwind，构建产物由调度器的 node:http 静态服务）：
+
+```
+http://127.0.0.1:8788     # 端口以 agent-control.yaml 的 server.ui.port 为准（默认 8787）
+```
+
+- **五列看板**：Queued → In Progress（7 个活跃相位聚合，卡片显示具体阶段）→ Awaiting Merge → Done → Needs Attention（BLOCKED/FAILED/RECOVERY/CANCELED）。卡片带 repo#issue、相位徽章、实时运行时长、PR 链接；5 秒自动刷新。
+- **详情抽屉**：点卡片右侧滑出——相位时间线（`run_events`）、checks 结果（`check_results`）、修复轮次；artifact（测试日志、review 结论、diff.patch、`run-*.jsonl`）点击弹窗查看，`.jsonl` 逐行解析成事件流——服务端强制路径必须落在 `logs_dir` 内，穿越访问返回 403。
+- **操作**：Stop（= `stop`，一个轮询周期内安全取消）/ Retry（= `retry`，以当前 Issue 正文重新审批入队），均有确认弹窗。
+- 顶栏健康条：pid / uptime / in-flight / last_error 警示。
+
+开发与构建：
+
+```powershell
+npm run ui:dev     # Vite dev server（/api 代理到 8788），改前端热更新
+npm run ui:build   # tsc + vite build → ui/dist（调度器服务的静态产物）
+```
+
+改前端后需 `ui:build` 并重启调度器生效。UI 启动失败（如端口被占）只记警告，调度不受影响；`stop`/`retry` 与 CLI 走同一 Store 写路径，两者可混用。
+
 ## 常驻服务（Windows 计划任务）
 
 前台验证通过后注册计划任务，登录即自启：
@@ -91,10 +113,15 @@ schtasks /delete /tn agent-control  # 卸载
 ## 安全边界（MVP）
 
 - 只接入可信测试仓库；Issue 正文只作数据，不会变成 shell 命令（测试命令只能来自仓库配置白名单）。注意：Issue 正文仍是**不可信输入**——提示词里的"数据边界"只是约定而非强制边界。环境白名单只限制传入子进程的环境变量；worktree 是工作目录约定，不构成文件访问隔离。恶意 Issue 最坏能诱导 agent 在 worktree 里写坏代码——坏代码由检查、独立 review 与人工合并拦截。不要对非本人撰写/未确认可信的 Issue 启用本工具。
-- 编码/审查子进程的环境是**白名单**：只继承 PATH/用户目录/代理等最小集合，`GH_TOKEN` 及任何 `*_KEY`/`SECRET` 一律不传递（Windows 上 gh keyring 凭据仍对本机进程可见 —— 已记录的平台限制，所以只跑可信 Issue）。运行隔离按 provider 分：pi 无沙箱、reviewer 靠**只读工具白名单**（read/grep/find/ls）；codex 用 `-s` 沙箱档位（Windows 上其沙箱会导致子进程 spawn 失败，故默认 `danger-full-access`）。无论哪种，Review 后宿主都校验 worktree 必须干净、HEAD 未动——被改动即 BLOCKED。**注意**：编码 agent 实际拥有当前用户级权限，prompt 禁令只是约定而非强制边界——因此本工具只应处理你本人撰写并确认可信的 Issue。
+- 编码/审查子进程的环境是**白名单**：只继承 PATH/用户目录/代理等最小集合，`GH_TOKEN` 及任何 `*_KEY`/`SECRET` 一律不传递。磁盘凭据也被切断（2026-10-19 实测验证）：`GH_CONFIG_DIR` 指向空 jail 目录 → 子进程 `gh` 报未登录（exit 1）；`credential.helper` 清空 + 终端提示禁用 → `git` 取凭据失败（exit 128）；SSH 被 `GIT_SSH_COMMAND` 死结。**残余敞口**：gh 凭据实为 Windows 凭据管理器（keyring）条目（如 `gh:github.com:<user>`），同用户进程可枚举并调用 CredRead API 读取——绕过常规 gh/git 路径需要诱导 agent 主动编写 keyring 读取代码，属平台限制（已实证）。运行隔离按 provider 分：pi 无沙箱、reviewer 靠**只读工具白名单**（read/grep/find/ls）；codex 用 `-s` 沙箱档位（Windows 上其沙箱会导致子进程 spawn 失败，故默认 `danger-full-access`）。无论哪种，Review 后宿主都校验 worktree 必须干净、HEAD 未动——被改动即 BLOCKED。**注意**：编码 agent 实际拥有当前用户级权限（含文件系统完整读写），prompt 禁令只是约定而非强制边界——因此本工具只应处理你本人撰写并确认可信的 Issue。加固此残余敞口的轻量方向见"设计取舍"：低权限专用账户 + ACL。
 - push / 建 PR 由宿主调度器执行，编码子进程无发布权限；所有 PR 均为 Draft，合并永远是人工操作。
 - 审批内容哈希快照（SHA-256）：批准后 Issue 被改动 → `BLOCKED_APPROVAL_CHANGED`，需人工 `retry` 重批。
 - 重启先对账：子进程可能存活 → `RECOVERY_REQUIRED`（绝不重复执行）；确认已死 → 按已存相位幂等续行。
+
+## 设计取舍（隔离路线）
+
+- **容器隔离为备选**（2026-10-19 决定）：设计基线与实现草案存在（分支 `container-isolation` / draft PR #1），但在"只跑本人 Issue + 人工合并"的纪律下成本收益不成立——远程 Docker host（199）无公网出口、依赖需 vendor、跨机时延与资源占用高。保留为**未来接入非本人撰写任务源时的开关**。
+- **轻量加固方向**（未实施）：专用低权限 Windows 账户跑 agent 子进程——DPAPI 按用户隔离可封住上述 keyring 敞口，ACL 限制文件系统；纯系统原生机制、零运行时开销。可叠加按账户的出站防火墙规则防数据外传。
 
 ## 状态机
 
