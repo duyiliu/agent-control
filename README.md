@@ -96,6 +96,17 @@ schtasks /delete /tn agent-control  # 卸载
 - 审批内容哈希快照（SHA-256）：批准后 Issue 被改动 → `BLOCKED_APPROVAL_CHANGED`，需人工 `retry` 重批。
 - 重启先对账：子进程可能存活 → `RECOVERY_REQUIRED`（绝不重复执行）；确认已死 → 按已存相位幂等续行。
 
+## 容器隔离（isolation: docker）
+
+对单个项目开启 `isolation: docker` 后，coder / reviewer / checks 全部在远端 Docker daemon 的容器里执行，形成第四层隔离边界：
+
+- **同步协议**：宿主与 daemon（可为远程 Linux 主机，`agent.container.host`）之间用 named volume + tar 往返同步 worktree 快照（排除 `.git` / `.venv` / `node_modules` / `target` / `__pycache__`）；下行时按容器内文件清单对账删除。`ac-cache` 卷持久化 uv/npm 缓存，其余卷每个会话用毕即删。
+- **git 权威仍在宿主**：容器内 worktree 无 `.git`（agent 的 prompt 换为无 git 变体，直接改文件）；改动落回宿主后由调度器统一提交。publish（push + PR）永远在宿主，GitHub 凭据任何形式不进容器。
+- **模型认证**：pi `models.json` / codex `auth.json` 以白名单文件进容器（entrypoint 移入 home），API key 永不进 env。容器模式 pi 工具白名单自动剔除 `powershell`（Linux 镜像无 pwsh）。
+- **镜像**：`bash docker/fetch-vendor.sh`（有 GitHub 出口的机器，可用 `PROXY=` 走代理）→ `docker build -t agent-control-dev:latest docker/`。node22 + python3.11 + uv + git + pi。
+- **验证**：`npm run ac -- doctor` 探测 daemon 连通与镜像存在；`AC_SMOKE_HOST=tcp://<daemon>:2375 npx tsx tests/integration/container.smoke.ts` 跑真实容器会话冒烟。
+- 已知放宽：容器走默认 bridge 网络（需可达模型 API），agent 理论上可探测 daemon 所在内网——与宿主机直跑相比边界已大幅收紧，v1 接受。
+
 ## 状态机
 
 `DISCOVERED → CLAIMED → PREPARING → RUNNING → VERIFYING ↔ FIXING → REVIEWING ↔ FIXING → PUBLISHING_PR → AWAITING_MERGE → COMPLETED`；任意运行相位可落入 `BLOCKED / FAILED / CANCELED / RECOVERY_REQUIRED`。所有迁移写入 `run_events`，测试与 Review 证据写入 `check_results`。

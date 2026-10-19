@@ -86,8 +86,8 @@ projects:
 ```
 
 - `agent.isolation` 缺省 `none`；`projects[].isolation` 缺省继承全局。config 解析校验：isolation=docker 时 `agent.container.image` 必填非空。
-- 容器内路径映射（内部契约）：worktree→`/work`，artifacts 卷→`/ac`。pi prompt 经 `docker cp` 进 `/ac`，argv 用 `@/ac/prompt.txt`；pi lastMessage 从 stdout JSONL 宿主侧提取（不变）；codex prompt 走 stdin（不变），`-o /ac/last.txt` 会话后 `docker cp` 回宿主。
-- 认证契约：pi `models.json` / codex `auth.json` 由宿主 `docker cp` 进 `/ac`，镜像 entrypoint 启动前拷至容器内 home。API key 只经 auth 文件进容器，**永不进 env**；GitHub 凭据任何形式都不进容器（与 publish 宿主专属不变量互为印证）。
+- 容器内路径映射（内部契约）：worktree→`/work`，artifacts 卷→`/ac`。文件进出卷统一用「辅助容器 + stdin/stdout cat」（`pushFile`/`pullArtifact`，无 `docker cp` 依赖——cp 需要目标容器处于存在状态，与会话容器生命周期不符）：pi prompt 推 `/ac/prompts/…`，argv 用 `@/ac/prompt.txt`；pi lastMessage 从 stdout JSONL 宿主侧提取（不变）；codex prompt 走 stdin（不变），`-o /ac/last.txt` 会话后拉回宿主。
+- 认证契约：auth 白名单文件经同样机制进 `/ac`（pi：`~/.pi/agent` 常规文件；codex：`auth.json`+`config.toml`），镜像 entrypoint 启动前拷至容器内 home。API key 只经 auth 文件进容器，**永不进 env**；GitHub 凭据任何形式都不进容器（与 publish 宿主专属不变量互为印证；smoke 实测容器内 `GH_TOKEN_COUNT=0`）。
 
 ### 2.4 其他关键设计
 
@@ -95,11 +95,14 @@ projects:
   - 容器模式 coder/reviewer prompt 变体：「本环境无 git，当前文件即最新状态，直接修改文件」（替换 `git add -A && git commit` 要求与 status/log 恢复语义；上行快照即现状）；
   - coder 会话结束宿主必调 `commitLeftovers`（宿主 git 权威固化改动）；
   - diff/HEAD 断言/publish 全在宿主。
-- **B. 镜像**：`docker/Dockerfile` = node:22-bookworm + git + gh + pwsh（保持 pi 工具集完整）+ python3.12 + uv + `npm -g @earendil-works/pi-coding-agent` + entrypoint（auth bootstrap 后 `exec "$@"`）。构建：`docker build` 经 CLI 传 context 至远程 host。
-- **C. proc.ts**：`runProc` 增加 `stdinFilePath`（createReadStream → child.stdin），不破坏现有调用。kill 链不变（杀 docker.exe + 树）。
-- **D. recovery 适配**：现有进程扫描（`findProcessesReferencing(worktree)`）在容器模式下盲区——`docker.exe` 命令行不含 worktree 路径，且容器可独立于 docker.exe 存活。增加 `findContainerStrays(runId)`：`docker ps -a --filter name=ac-run-<runid>`（running 状态即视为孤儿）；进程扫描照旧作为宿主侧兜底。两者任一非空 → `RECOVERY_REQUIRED`（语义不变：绝不双进程/双容器操作同一 worktree）。残留卷按 runid 前缀在 reconcile 时清理。
-- **E. doctor**：isolation=docker 时检测 `docker version`（验证 DOCKER_HOST 连通）、`docker image inspect <image>`、并提示 checks argv 需容器内可执行。
+  - 实测确认：镜像（node:22-bookworm）自带 git 二进制，但 worktree 无 `.git`，`git status` 在 /work 下按 "not a git repository" 失败——语义目标达成，无需裁剪镜像。
+- **B. 镜像**：`docker/Dockerfile` = node:22-bookworm + git + python3.11 + uv + `npm -g @earendil-works/pi-coding-agent` + entrypoint（auth bootstrap 后 `exec "$@"`）。**不装 PowerShell**：pi 的 powershell 工具在容器模式由白名单隐藏（`filterToolsForContainer` 把 `powershell` 从 `--tools` 剔除），模型看不到该工具，不为其安装 70MB 运行时。内部构建机（如 199）无 GitHub/微软源出口、registry 镜像限流，uv 的 GitHub release tarball 由具备出口的主机预下载到 `docker/vendor/`（gitignored，`docker/fetch-vendor.sh`）随 build context 传入；npm 走 npmmirror。
+- **C. proc.ts**：`runProc` 增加 `stdinFilePath`（文件流式 stdin，tar 上行）与 `stdoutFilePath`（stdout 独占写文件，tar 下行），不破坏现有调用。kill 链不变（杀 docker.exe + 树）。
+- **D. recovery 适配**：现有进程扫描（`findProcessesReferencing(worktree)`）在容器模式下盲区——`docker.exe` 命令行不含 worktree 路径，且容器可独立于 docker.exe 存活。增加 `findContainerStrays(runId)`：`docker ps -a --filter name=^ac-run-<runid>`（仅 Up 状态视为孤儿）；进程扫描照旧作为宿主侧兜底。两者任一非空 → `RECOVERY_REQUIRED`（语义不变：绝不双进程/双容器操作同一 worktree）。
+- **E. doctor**：isolation=docker 时检测 `docker version`（验证 daemon 连通，走 `container.host`）、`docker image inspect <image>`，并提示 checks argv 需容器内可执行。
 - **F. 超时**：syncUp/syncDown 各自独立超时（默认 120s，可配），不计入 `max_task_minutes` 的 agent 超时；容器执行超时沿用现有 `timeoutMs`。
+- **G. 卷删除竞态（实测发现）**：`--rm` 容器退出后 daemon 异步解除卷引用，紧跟的 `volume rm` 可能撞 "in use"。teardown 对卷删除做短重试（750ms × 4）。
+- **H. 认证 staging 白名单（实测发现）**：runner home 目录含运行时 socket/log（如 codex 的 `daemon-updater.sock`，Windows bsdtar 无法打包）。auth staging 只推白名单文件：pi 为 `~/.pi/agent` 下常规文件（排除 `*.sock|log|pid`），codex 为 `auth.json` + `config.toml`。
 
 ## 3. 边界与风险
 

@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync, type WriteStream } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync, mkdirSync, type WriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 
@@ -10,8 +10,12 @@ export interface RunProcOpts {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   stdinData?: string;
+  /** Stream this file into child stdin (for piping tar archives etc.); ignored when stdinData is set. */
+  stdinFilePath?: string;
   timeoutMs: number;
   logPath?: string;
+  /** Write raw stdout exclusively to this file (binary-safe, e.g. tar pulls). Stderr still goes to tails/log. */
+  stdoutFilePath?: string;
   signal?: AbortSignal;
   /** Called synchronously right after a successful spawn. */
   onSpawn?: (pid: number | null) => void;
@@ -84,6 +88,12 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
     }
     opts.onSpawn?.(child.pid ?? null);
 
+    let stdoutFile: WriteStream | null = null;
+    if (opts.stdoutFilePath) {
+      mkdirSync(dirname(opts.stdoutFilePath), { recursive: true });
+      stdoutFile = createWriteStream(opts.stdoutFilePath);
+    }
+
     let timedOut = false;
     let aborted = false;
     let settled = false;
@@ -95,6 +105,7 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
       if (timer) clearTimeout(timer);
       opts.signal?.removeEventListener('abort', onAbort);
       if (killTimer) clearTimeout(killTimer);
+      stdoutFile?.end();
       log?.end();
       resolve({
         exitCode,
@@ -140,6 +151,7 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
 
     child.stdout!.on('data', (c: Buffer) => {
       stdout.push(c);
+      if (stdoutFile) stdoutFile.write(c);
       if (log && opts.streamStdoutToLog !== false) log.write(c);
     });
     child.stderr!.on('data', (c: Buffer) => {
@@ -153,8 +165,18 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
 
     if (opts.stdinData !== undefined) {
       child.stdin!.write(opts.stdinData);
+      child.stdin!.end();
+    } else if (opts.stdinFilePath !== undefined) {
+      const src = createReadStream(opts.stdinFilePath);
+      src.on('error', (err) => {
+        stderr.push(Buffer.from(`\nstdin read error: ${String(err)}\n`));
+        child.stdin!.destroy();
+      });
+      src.on('close', () => child.stdin!.end());
+      src.pipe(child.stdin!);
+    } else {
+      child.stdin!.end();
     }
-    child.stdin!.end();
   });
 }
 

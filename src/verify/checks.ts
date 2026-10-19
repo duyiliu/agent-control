@@ -1,5 +1,6 @@
 import type { CheckSpec } from '../types.js';
 import { runProc, scrubEnvForAgent } from '../proc.js';
+import type { ContainerSession } from '../runners/container.js';
 
 export interface CheckOutcome {
   spec: CheckSpec;
@@ -28,18 +29,25 @@ export async function runChecks(
   workdir: string,
   logPathFor: (idx: number) => string,
   exec: typeof runProc = runProc,
+  /** When set, checks run inside the container session (cwd=/work). */
+  session?: ContainerSession,
 ): Promise<ChecksSummary> {
   const outcomes: CheckOutcome[] = [];
   for (let i = 0; i < checks.length; i++) {
     const spec = checks[i]!;
     const logPath = logPathFor(i);
-    const res = await exec({
-      argv: spec.argv,
-      cwd: workdir,
-      env: scrubEnvForAgent(process.env),
-      timeoutMs: (spec.timeout_seconds ?? 600) * 1000,
-      logPath,
-    });
+    const res = session
+      ? await session.run(spec.argv, {
+          timeoutMs: (spec.timeout_seconds ?? 600) * 1000,
+          logPath,
+        })
+      : await exec({
+          argv: spec.argv,
+          cwd: workdir,
+          env: scrubEnvForAgent(process.env),
+          timeoutMs: (spec.timeout_seconds ?? 600) * 1000,
+          logPath,
+        });
     outcomes.push({
       spec,
       command: spec.argv.join(' '),

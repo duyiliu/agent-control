@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { findProcessesReferencing, pidAlive, processStartedAt } from '../proc.js';
+import { findContainerStrays, resolveIsolation } from '../runners/container.js';
 import type { Store } from '../store/sqlite.js';
 import type { AppLog } from '../telemetry/logging.js';
 import type { Phase, RunRow, TaskRow } from '../types.js';
@@ -17,6 +18,8 @@ export interface RecoveryDeps {
   processStartedAt?: (pid: number) => Promise<number | null>;
   /** Scan for live processes referencing a path (orphan detection). */
   findProcs?: (needle: string) => Promise<number[] | null>;
+  /** Scan for live containers belonging to a run (container-isolated runs). */
+  findContainers?: (runId: string) => Promise<string[] | null>;
 }
 
 export interface RecoveryReport {
@@ -58,7 +61,9 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
     // Orphan scan: the recorded child is gone, but a killed host may have left
     // grandchildren behind. Refuse to resume a phase that could have spawned
     // subprocesses while anything still references the worktree — and also
-    // refuse when we cannot prove the worktree is clean.
+    // refuse when we cannot prove the worktree is clean. Container-isolated
+    // runs get the same treatment for containers: a docker.exe death does not
+    // imply the detached container died.
     const childPhases = ['RUNNING', 'FIXING', 'VERIFYING', 'REVIEWING', 'PUBLISHING_PR'];
     if (childPhases.includes(run.phase) && run.workspace && existsSync(run.workspace)) {
       const scan = deps.findProcs ?? findProcessesReferencing;
@@ -74,6 +79,25 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
         markRecoveryRequired(deps, task, run, `orphaned process(es) on worktree: ${strays.join(', ')}`);
         report.recoveryRequired.push({ run_id: run.run_id, why: 'orphans alive' });
         continue;
+      }
+
+      const project = deps.config.projects.find((p) => p.repo === task.repo);
+      if (project && resolveIsolation(project, deps.config.agent) === 'docker') {
+        const scanContainers =
+          deps.findContainers ??
+          ((runId: string) =>
+            findContainerStrays(runId, { host: deps.config.agent.container?.host }));
+        const containers = await scanContainers(run.run_id).catch(() => null);
+        if (containers === null) {
+          markRecoveryRequired(deps, task, run, 'cannot verify no orphaned containers on worktree');
+          report.recoveryRequired.push({ run_id: run.run_id, why: 'container scan failed' });
+          continue;
+        }
+        if (containers.length > 0) {
+          markRecoveryRequired(deps, task, run, `orphaned container(s) on worktree: ${containers.join(', ')}`);
+          report.recoveryRequired.push({ run_id: run.run_id, why: 'containers alive' });
+          continue;
+        }
       }
     }
 

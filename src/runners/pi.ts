@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { runProc, scrubEnvForAgent, which } from '../proc.js';
 import type { AppConfig } from '../types.js';
+import type { ContainerSession } from './container.js';
 import type { AgentCallOpts, AgentCallResult } from './types.js';
 
 export interface PiInvocation {
@@ -33,6 +34,14 @@ export function resolvePiInvocation(envPath = process.env.PATH ?? ''): PiInvocat
 /** Reviewer runs read-only at the TOOL level — no shell, no write tools. */
 export const PI_REVIEW_TOOLS = ['read', 'grep', 'find', 'ls'];
 const PI_ALL_TOOLS = ['read', 'bash', 'powershell', 'edit', 'write', 'grep', 'find', 'ls'];
+
+/** The container image is Linux and ships no pwsh: hide the tool entirely. */
+const PI_CONTAINER_UNAVAILABLE = ['powershell'];
+
+export function filterToolsForContainer(tools?: string[]): string[] {
+  const list = tools ?? PI_ALL_TOOLS;
+  return list.filter((t) => !PI_CONTAINER_UNAVAILABLE.includes(t));
+}
 
 /**
  * argv for one non-interactive `pi -p` call. Ambient project/user config is
@@ -93,12 +102,16 @@ export function extractLastMessage(jsonl: string): string | null {
  * (argv would hit Windows limits); the JSONL event stream lands in logPath;
  * the last assistant message is written to lastMessagePath post-hoc.
  * pi has no sandbox flag: confinement is the tool allowlist + scrubbed env.
+ * With `opts.session`, pi runs inside the container: pi resolves to the
+ * image's global install, the prompt is staged into /ac, and the identity
+ * token is the docker CLI's host PID.
  */
 export async function runPi(
   opts: AgentCallOpts,
   config: AppConfig['agent'],
   invocation?: PiInvocation,
 ): Promise<AgentCallResult> {
+  if (opts.session) return runPiInSession(opts, config, opts.session);
   const inv = invocation ?? resolvePiInvocation();
   const promptPath = join(dirname(opts.lastMessagePath), `pi-prompt-${Date.now()}.txt`);
   writeFileSync(promptPath, opts.prompt, 'utf8');
@@ -121,6 +134,48 @@ export async function runPi(
     logPath: opts.logPath,
     signal: opts.signal,
     onSpawn: (pid) => {
+      capturedPid = pid;
+      opts.onSpawn?.(pid, pid != null ? `${pid}:${startedAt}` : null);
+    },
+  });
+
+  const logText = opts.logPath && existsSync(opts.logPath)
+    ? readFileSync(opts.logPath, 'utf8')
+    : res.stdoutTail;
+  const last = extractLastMessage(logText);
+  if (last !== null) writeFileSync(opts.lastMessagePath, last, 'utf8');
+  return { ...res, pid: capturedPid };
+}
+
+async function runPiInSession(
+  opts: AgentCallOpts,
+  config: AppConfig['agent'],
+  session: ContainerSession,
+): Promise<AgentCallResult> {
+  const promptName = `pi-prompt-${Date.now()}.txt`;
+  const promptPath = join(session.artifactsDir, promptName);
+  writeFileSync(promptPath, opts.prompt, 'utf8');
+  const containerPromptPath = `/ac/prompts/${promptName}`;
+  await session.pushFile(`prompts/${promptName}`, promptPath);
+
+  const argv = buildPiArgv(
+    {
+      tools: filterToolsForContainer(opts.tools),
+      promptPath: containerPromptPath,
+      model: opts.model ?? config.model,
+      thinking: config.reasoning_effort,
+    },
+    { argv0: 'pi', prefix: [] },
+  );
+
+  let capturedPid: number | null = null;
+  const startedAt = Date.now();
+  const res = await session.run(argv, {
+    timeoutMs: opts.timeoutMs,
+    logPath: opts.logPath,
+    signal: opts.signal,
+    onSpawn: (pid) => {
+      // The docker CLI is the host-side anchor: alive => attached container runs.
       capturedPid = pid;
       opts.onSpawn?.(pid, pid != null ? `${pid}:${startedAt}` : null);
     },

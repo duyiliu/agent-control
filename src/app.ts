@@ -238,6 +238,43 @@ export async function runDoctor(config: AppConfig | null, configError?: string):
   }
   items.push({ name: 'config', status: 'PASS', detail: `${config.projects.length} project(s)` });
 
+  // Container isolation needs a reachable daemon and the configured image on
+  // the daemon side; both are daemon-side facts, so probe through docker CLI.
+  const needsDocker = config.agent.isolation === 'docker'
+    || config.projects.some((p) => p.isolation === 'docker');
+  if (needsDocker) {
+    const dockerBin = which('docker') ?? 'docker';
+    const dockerEnv = config.agent.container?.host
+      ? { ...process.env, DOCKER_HOST: config.agent.container.host }
+      : process.env;
+    const dockerVersion = await runProc({
+      argv: [dockerBin, 'version', '--format', '{{.Server.Version}} {{.Server.Os}}'],
+      env: dockerEnv,
+      timeoutMs: 20_000,
+    });
+    items.push(dockerVersion.exitCode === 0
+      ? { name: 'docker', status: 'PASS', detail: `${config.agent.container?.host ?? 'default context'} — ${dockerVersion.stdoutTail.trim()}` }
+      : { name: 'docker', status: 'FAIL', detail: dockerVersion.stderrTail.trim().slice(0, 200) });
+    if (dockerVersion.exitCode === 0 && config.agent.container?.image) {
+      const img = await runProc({
+        argv: [dockerBin, 'image', 'inspect', config.agent.container.image, '--format', '{{.Id}}'],
+        env: dockerEnv,
+        timeoutMs: 20_000,
+      });
+      items.push(img.exitCode === 0
+        ? { name: 'docker-image', status: 'PASS', detail: config.agent.container.image }
+        : { name: 'docker-image', status: 'FAIL', detail: `${config.agent.container.image} missing on daemon — build docker/Dockerfile first` });
+    }
+    const containerized = config.projects.filter((p) => (p.isolation ?? config.agent.isolation) === 'docker');
+    if (containerized.length > 0) {
+      items.push({
+        name: 'container-checks',
+        status: 'UNVERIFIED',
+        detail: `checks.argv runs INSIDE the container for: ${containerized.map((p) => p.repo).join(', ')} — argv must exist in the image`,
+      });
+    }
+  }
+
   const tracker = new GitHubTracker();
   for (const p of config.projects) {
     const ok = existsSync(join(p.local_repo, '.git'));

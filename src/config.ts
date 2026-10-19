@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import YAML from 'yaml';
-import type { AppConfig, CheckSpec, ProjectConfig } from './types.js';
+import type { AppConfig, CheckSpec, ContainerConfig, ProjectConfig } from './types.js';
 
 export class ConfigError extends Error {}
 
@@ -42,12 +42,35 @@ function parseCheck(v: unknown, name: string): CheckSpec {
   return spec;
 }
 
+const ISOLATION_MODES = ['none', 'docker'];
+
+function parseIsolation(v: unknown, name: string): 'none' | 'docker' {
+  if (v === undefined) fail(`${name}: expected "none" or "docker"`);
+  if (!ISOLATION_MODES.includes(v as string)) fail(`${name}: expected one of ${ISOLATION_MODES.join('/')}`);
+  return v as 'none' | 'docker';
+}
+
+function parseContainer(v: unknown, name: string): ContainerConfig {
+  const o = asObj(v, name);
+  const extraArgs = o['extra_args'] ?? [];
+  if (!Array.isArray(extraArgs) || extraArgs.some((a) => typeof a !== 'string')) {
+    fail(`${name}.extra_args must be a string array`);
+  }
+  const cfg: ContainerConfig = {
+    image: asStr(o['image'], `${name}.image`),
+    extra_args: extraArgs as string[],
+  };
+  if (o['host'] !== undefined) cfg.host = asStr(o['host'], `${name}.host`);
+  if (o['network'] !== undefined) cfg.network = asStr(o['network'], `${name}.network`);
+  return cfg;
+}
+
 function parseProject(v: unknown, idx: number): ProjectConfig {
   const name = `projects[${idx}]`;
   const o = asObj(v, name);
   const checksRaw = o['checks'] ?? [];
   if (!Array.isArray(checksRaw)) fail(`${name}.checks must be an array`);
-  return {
+  const p: ProjectConfig = {
     repo: asStr(o['repo'], `${name}.repo`),
     local_repo: resolve(asStr(o['local_repo'], `${name}.local_repo`)),
     base_branch: asStr(o['base_branch'] ?? 'main', `${name}.base_branch`),
@@ -55,6 +78,8 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
     branch_prefix: asStr(o['branch_prefix'] ?? 'agent/issue-', `${name}.branch_prefix`),
     checks: checksRaw.map((c, i) => parseCheck(c, `${name}.checks[${i}]`)),
   };
+  if (o['isolation'] !== undefined) p.isolation = parseIsolation(o['isolation'], `${name}.isolation`);
+  return p;
 }
 
 export function loadConfig(path: string): AppConfig {
@@ -105,6 +130,14 @@ export function loadConfig(path: string): AppConfig {
     fail('agent.env_deny must be a string array');
   }
 
+  const isolation = agent['isolation'] === undefined ? 'none' : parseIsolation(agent['isolation'], 'agent.isolation');
+  const container = agent['container'] !== undefined ? parseContainer(agent['container'], 'agent.container') : undefined;
+  const projects = projectsRaw.map(parseProject);
+  const needsDocker = isolation === 'docker' || projects.some((p) => p.isolation === 'docker');
+  if (needsDocker && (!container || !container.image)) {
+    fail('agent.container.image is required when any project (or the global default) uses isolation: docker');
+  }
+
   const approvals = asObj(root['approvals'] ?? {}, 'approvals');
 
   return {
@@ -118,7 +151,7 @@ export function loadConfig(path: string): AppConfig {
       logs_dir: logsDir,
       cancel_poll_seconds: asNum(server['cancel_poll_seconds'] ?? 5, 'server.cancel_poll_seconds', 1),
     },
-    projects: projectsRaw.map(parseProject),
+    projects,
     agent: {
       provider: provider as AppConfig['agent']['provider'],
       model: asStr(agent['model'], 'agent.model'),
@@ -129,6 +162,8 @@ export function loadConfig(path: string): AppConfig {
       sandbox: sandbox as AppConfig['agent']['sandbox'],
       review_sandbox: reviewSandbox as AppConfig['agent']['review_sandbox'],
       env_deny: envDeny as string[],
+      isolation,
+      container,
     },
     approvals: {
       require_design_approval: asBool(approvals['require_design_approval'] ?? true, 'approvals.require_design_approval'),
