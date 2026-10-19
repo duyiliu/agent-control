@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { runProc, scrubEnvForAgent, which } from '../proc.js';
 import type { AppConfig } from '../types.js';
+import type { ContainerSession } from './container.js';
 import type { AgentCallOpts, AgentCallResult } from './types.js';
 
 export interface CodexInvocation {
@@ -36,12 +37,15 @@ export function resolveCodexInvocation(envPath = process.env.PATH ?? ''): CodexI
  * One isolated `codex exec` invocation. The prompt is piped through stdin
  * (`exec -`) so it never hits command-line limits or shell quoting.
  * Output events land in logPath as JSONL (--json).
+ * With `opts.session`, codex runs inside the container: cwd maps to /work,
+ * `-o` lands in /ac and is pulled back host-side after the run.
  */
 export async function runCodex(
   opts: AgentCallOpts,
   config: AppConfig['agent'],
   invocation?: CodexInvocation,
 ): Promise<AgentCallResult> {
+  if (opts.session) return runCodexInSession(opts, config, opts.session);
   const inv = invocation ?? resolveCodexInvocation();
   const argv = [
     inv.argv0,
@@ -75,5 +79,46 @@ export async function runCodex(
       opts.onSpawn?.(pid, pid != null ? `${pid}:${startedAt}` : null);
     },
   });
+  return { ...res, pid: capturedPid };
+}
+
+async function runCodexInSession(
+  opts: AgentCallOpts,
+  config: AppConfig['agent'],
+  session: ContainerSession,
+): Promise<AgentCallResult> {
+  const lastName = `codex-last-${Date.now()}.txt`;
+  const schemaName = opts.schemaPath ? `codex-schema-${Date.now()}.json` : null;
+  if (schemaName) {
+    await session.pushFile(schemaName, opts.schemaPath!);
+  }
+  const argv = [
+    'codex',
+    'exec',
+    '--json',
+    '--ephemeral',
+    '--color', 'never',
+    '-s', opts.sandbox ?? 'danger-full-access',
+    '-C', '/work',
+    '-o', `/ac/${lastName}`,
+    ...(schemaName ? ['--output-schema', `/ac/${schemaName}`] : []),
+    ...(opts.model ?? config.model ? ['-m', (opts.model ?? config.model)!] : []),
+    ...(config.reasoning_effort ? ['-c', `model_reasoning_effort="${config.reasoning_effort}"`] : []),
+    '-',
+  ];
+
+  let capturedPid: number | null = null;
+  const startedAt = Date.now();
+  const res = await session.run(argv, {
+    stdinData: opts.prompt,
+    timeoutMs: opts.timeoutMs,
+    logPath: opts.logPath,
+    signal: opts.signal,
+    onSpawn: (pid) => {
+      capturedPid = pid;
+      opts.onSpawn?.(pid, pid != null ? `${pid}:${startedAt}` : null);
+    },
+  });
+  await session.pullArtifact(lastName, opts.lastMessagePath);
   return { ...res, pid: capturedPid };
 }

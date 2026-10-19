@@ -22,6 +22,8 @@ export interface PromptContext {
   workflowPath: string;
   /** Repo-local convention docs live in the worktree (trusted by config). */
   worktreePath: string;
+  /** True when the agent runs in a container: no git, current files are the latest state. */
+  containerized?: boolean;
 }
 
 function trustedDocs(ctx: PromptContext): string {
@@ -41,9 +43,12 @@ function trustedDocs(ctx: PromptContext): string {
  * is done by the host scheduler, never by the agent.
  */
 export function buildCoderPrompt(ctx: PromptContext, continuation = false): string {
+  const containerized = ctx.containerized === true;
   return [
     '# 角色',
-    '你是 agent-control 调度器启动的一次性编码执行器。当前工作目录是任务的隔离 git worktree。',
+    containerized
+      ? '你是 agent-control 调度器启动的一次性编码执行器。当前工作目录是任务工作区在容器中的快照（环境隔离，无 git）。'
+      : '你是 agent-control 调度器启动的一次性编码执行器。当前工作目录是任务的隔离 git worktree。',
     '',
     trustedDocs(ctx),
     '',
@@ -54,24 +59,33 @@ export function buildCoderPrompt(ctx: PromptContext, continuation = false): stri
     '</issue>',
     '',
     '# 输出契约（必须遵守）',
-    `- 所有改动只发生在当前 worktree；目标分支：${ctx.branch}；基于 ${ctx.project.base_branch}。`,
-    '- 完成修改后必须 `git add -A && git commit`（一条或多条常规提交均可），保持工作区干净。',
-    '- 禁止：git push、创建/合并 PR、修改 GitHub 标签或 Issue、读取凭据文件、访问 worktree 之外的路径、安装全局软件。',
+    `- 所有改动只发生在当前工作区；目标分支：${ctx.branch}；基于 ${ctx.project.base_branch}。`,
+    containerized
+      ? '- 本环境没有 git：不要运行任何 git 命令，直接修改/新建/删除文件即可；调度器会在宿主侧统一提交你的改动。'
+      : '- 完成修改后必须 `git add -A && git commit`（一条或多条常规提交均可），保持工作区干净。',
+    '- 禁止：git push、创建/合并 PR、修改 GitHub 标签或 Issue、读取凭据文件、访问工作区之外的路径、安装全局软件。',
     '- 不要修改测试来"通过"检查；按 Issue 验收标准实现。',
     ...(continuation
-      ? [
-          '',
-          '# 续行说明',
-          '此 worktree 可能已包含上次中断留下的部分改动。先 `git status` / `git log` 查看现状，在现有基础上继续完成任务，不要回退已有正确改动。',
-        ]
+      ? (containerized
+          ? [
+              '',
+              '# 续行说明',
+              '当前工作区文件已是最新状态（包含此前未完成的改动）。先通读相关文件了解现状，在现有基础上继续完成任务，不要回退已有正确改动。',
+            ]
+          : [
+              '',
+              '# 续行说明',
+              '此 worktree 可能已包含上次中断留下的部分改动。先 `git status` / `git log` 查看现状，在现有基础上继续完成任务，不要回退已有正确改动。',
+            ])
       : []),
     '',
     '# 完成标准',
-    'Issue 中的验收标准全部满足，且改动已提交。',
+    containerized ? 'Issue 中的验收标准全部满足（改动由调度器宿主侧提交）。' : 'Issue 中的验收标准全部满足，且改动已提交。',
   ].join('\n');
 }
 
 export function buildFixPrompt(ctx: PromptContext, evidence: string): string {
+  const containerized = ctx.containerized === true;
   return [
     '# 角色',
     '你是 agent-control 调度器启动的修复执行器。上一轮实现未通过质量闸门，需做最小修复。',
@@ -90,7 +104,9 @@ export function buildFixPrompt(ctx: PromptContext, evidence: string): string {
     '</failure-evidence>',
     '',
     '# 输出契约',
-    '- 只做让失败证据通过的最小修改；完成并 `git add -A && git commit`。',
+    containerized
+      ? '- 只做让失败证据通过的最小修改；本环境没有 git，直接修改文件即可，调度器会在宿主侧提交。'
+      : '- 只做让失败证据通过的最小修改；完成并 `git add -A && git commit`。',
     '- 禁止 git push / PR / 标签操作；禁止为通过而删除或弱化测试断言。',
   ].join('\n');
 }

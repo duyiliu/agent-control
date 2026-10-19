@@ -35,8 +35,20 @@
   always check `findPrForBranch` before creating.
 - Recovery must never start a second process for a run whose child may still
   be alive (`RECOVERY_REQUIRED` instead).
+- Container isolation (`isolation: docker`, `runners/container.ts`): the host
+  worktree stays the single source of truth — `.git` is never uploaded, the
+  container only ever mutates the volume copy, and changes become real only
+  via syncDown + host-side `commitLeftovers`. Runner auth reaches the
+  container as whitelisted files (pi: `~/.pi/agent` regular files; codex:
+  `auth.json`+`config.toml`) moved into home by the image entrypoint — model
+  keys travel by file, never env; GitHub credentials never enter at all.
+  Session volumes/containers are run-scoped and always torn down
+  (`ac-wt-*/ac-ac-*` removed; only `ac-cache` persists). Container-isolated
+  recovery adds `findContainerStrays` — a dead docker.exe does not imply a
+  dead container.
 
 ## Commands
 
-- `npm run ac -- doctor` — env/config check
+- `npm run ac -- doctor` — env/config check (also probes docker/image when any project uses `isolation: docker`)
 - `npm test` / `npm run typecheck`
+- `AC_SMOKE_HOST=tcp://<daemon>:2375 npx tsx tests/integration/container.smoke.ts` — real-daemon container smoke (needs the image from `docker/Dockerfile`)

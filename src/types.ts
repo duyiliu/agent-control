@@ -45,6 +45,18 @@ export interface CheckSpec {
   timeout_seconds?: number;
 }
 
+/** Execution isolation layer — orthogonal to provider. */
+export type IsolationMode = 'none' | 'docker';
+
+export interface ContainerConfig {
+  image: string;
+  /** Docker daemon endpoint, passed as DOCKER_HOST (e.g. tcp://host:2375). Unset = docker CLI default context. */
+  host?: string;
+  /** docker run --network; unset = daemon default (bridge). */
+  network?: string;
+  extra_args: string[];
+}
+
 export interface ProjectConfig {
   repo: string;
   local_repo: string;
@@ -52,6 +64,8 @@ export interface ProjectConfig {
   ready_label: string;
   branch_prefix: string;
   checks: CheckSpec[];
+  /** Unset = inherit agent.isolation. */
+  isolation?: IsolationMode;
 }
 
 export interface AppConfig {
@@ -80,6 +94,10 @@ export interface AppConfig {
     sandbox: SandboxMode;
     review_sandbox: SandboxMode;
     env_deny: string[];
+    /** Global default isolation; projects may override per-project. */
+    isolation: IsolationMode;
+    /** Required (with image) when any effective isolation is docker. */
+    container?: ContainerConfig;
   };
   approvals: {
     require_design_approval: boolean;

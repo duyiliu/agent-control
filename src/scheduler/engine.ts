@@ -6,6 +6,7 @@ import { RunLog, type AppLog } from '../telemetry/logging.js';
 import { approvalHash, GitHubTracker } from '../tracker/github.js';
 import { GitWorkspace } from '../workspace/git.js';
 import { pickRunner } from '../runners/dispatch.js';
+import { ContainerSession, resolveIsolation } from '../runners/container.js';
 import type { AgentCallOpts, AgentCallResult } from '../runners/types.js';
 import { runChecks, type ChecksSummary } from '../verify/checks.js';
 import { runReview } from '../verify/review.js';
@@ -343,7 +344,9 @@ export class Engine {
             // commits/resets/ref moves by the unsandboxed reviewer.
             const headBefore = await this.workspace.head(worktreePath).catch(() => null);
             let reviewOutcome: Awaited<ReturnType<typeof runReview>>;
+            let reviewSession: ContainerSession | undefined;
             try {
+              reviewSession = await this.openSessionIfDocker(run, project, worktreePath, log);
               reviewOutcome = await this.runReviewFn(
               ctx,
               this.testEvidenceFor(run),
@@ -352,6 +355,7 @@ export class Engine {
                 agentConfig: this.config.agent,
                 timeoutMs: this.config.server.max_task_minutes * 60_000,
                 artifactsDir: this.artifactsDirFor(run),
+                  session: reviewSession,
                   signal,
                   onSpawn: (pid, identity) => store.updateRunFields(runId, { pid, process_identity: identity }),
                 },
@@ -361,6 +365,8 @@ export class Engine {
               // not a verdict — fail the run without burning fix budget.
               this.finish(run, task, 'FAILED', `review infra: ${String(err).slice(0, 400)}`);
               return;
+            } finally {
+              await reviewSession?.close({ syncBack: false }).catch(() => {});
             }
             const { result, logPath } = reviewOutcome;
             store.addCheck({
@@ -490,6 +496,7 @@ export class Engine {
       branch: run.branch ?? `${project.branch_prefix}${task.issue_number}`,
       workflowPath: join(this.deps.installDir, 'WORKFLOW.md'),
       worktreePath: run.workspace ?? this.worktreePathFor(project, task),
+      containerized: resolveIsolation(project, this.config.agent) === 'docker',
     };
   }
 
@@ -503,39 +510,100 @@ export class Engine {
   ): Promise<AgentCallResult> {
     const artifactsDir = this.artifactsDirFor(run);
     mkdirSync(artifactsDir, { recursive: true });
-    const res = await this.runCoderFn(
-      {
-        workdir: extra.workdir,
-        prompt,
-        sandbox: this.config.agent.sandbox,
-        timeoutMs: this.config.server.max_task_minutes * 60_000,
-        logPath: join(artifactsDir, `agent-${Date.now()}.jsonl`),
-        lastMessagePath: join(artifactsDir, `coder-last-${Date.now()}.txt`),
-        signal,
-        onSpawn: (pid, identity) => this.store.updateRunFields(run.run_id, { pid, process_identity: identity }),
-      },
-      this.config.agent,
+    const project = this.projectFor((this.store.getTaskById(run.task_id))!.repo);
+    return this.withContainerSession(run, project, extra.workdir, log, { syncBack: true }, (session) =>
+      this.runCoderFn(
+        {
+          workdir: extra.workdir,
+          prompt,
+          sandbox: this.config.agent.sandbox,
+          timeoutMs: this.config.server.max_task_minutes * 60_000,
+          logPath: join(artifactsDir, `agent-${Date.now()}.jsonl`),
+          lastMessagePath: join(artifactsDir, `coder-last-${Date.now()}.txt`),
+          session,
+          signal,
+          onSpawn: (pid, identity) => this.store.updateRunFields(run.run_id, { pid, process_identity: identity }),
+        },
+        this.config.agent,
+      ).then((res) => {
+        log.event('coder_call', { run: run.run_id, exit: res.exitCode, timedOut: res.timedOut, ms: res.durationMs });
+        return res;
+      }),
     );
-    log.event('coder_call', { run: run.run_id, exit: res.exitCode, timedOut: res.timedOut, ms: res.durationMs });
-    return res;
   }
 
   private async callChecks(run: RunRow, log: RunLog, worktreePath: string): Promise<ChecksSummary> {
     const project = this.projectFor((this.store.getTaskById(run.task_id))!.repo)!;
-    const summary = await this.runChecksFn(
-      project.checks,
-      worktreePath,
-      (i) => join(this.artifactsDirFor(run), `check-${i}-${Date.now()}.log`),
-    );
-    summary.outcomes.forEach((o) => {
-      this.store.addCheck({
-        run_id: run.run_id, kind: 'check', command: o.command,
-        exit_code: o.exitCode, artifact_path: o.logPath,
-        verdict: o.exitCode === 0 ? 'PASS' : 'FAIL',
+    return this.withContainerSession(run, project, worktreePath, log, { syncBack: false }, (session) =>
+      this.runChecksFn(
+        project.checks,
+        worktreePath,
+        (i) => join(this.artifactsDirFor(run), `check-${i}-${Date.now()}.log`),
+        undefined,
+        session,
+      ),
+    ).then((summary) => {
+      summary.outcomes.forEach((o) => {
+        this.store.addCheck({
+          run_id: run.run_id, kind: 'check', command: o.command,
+          exit_code: o.exitCode, artifact_path: o.logPath,
+          verdict: o.exitCode === 0 ? 'PASS' : 'FAIL',
+        });
       });
+      log.event('checks', { run: run.run_id, ok: summary.ok, count: summary.outcomes.length });
+      return summary;
     });
-    log.event('checks', { run: run.run_id, ok: summary.ok, count: summary.outcomes.length });
-    return summary;
+  }
+
+  /**
+   * Open a container session when the project runs isolated; syncBack only
+   * for coder phases (container mutations must land on the host worktree
+   * before the existing commitLeftovers step commits them). Read-only phases
+   * (checks/review) skip the download round-trip.
+   */
+  private async withContainerSession<T>(
+    run: RunRow,
+    project: ProjectConfig | undefined,
+    worktreePath: string,
+    log: RunLog,
+    opts: { syncBack: boolean },
+    fn: (session: ContainerSession | undefined) => Promise<T>,
+  ): Promise<T> {
+    if (resolveIsolation(project, this.config.agent) !== 'docker') return fn(undefined);
+    const session = await ContainerSession.open({
+      runId: run.run_id,
+      worktreePath,
+      artifactsDir: this.artifactsDirFor(run),
+      agent: this.config.agent,
+    });
+    log.event('container_session_open', { run: run.run_id, image: this.config.agent.container?.image });
+    try {
+      const out = await fn(session);
+      await session.close({ syncBack: opts.syncBack });
+      log.event('container_session_close', { run: run.run_id, synced: opts.syncBack });
+      return out;
+    } catch (err) {
+      await session.dispose().catch(() => {});
+      throw err;
+    }
+  }
+
+  /** Session opener for call sites that manage close() themselves (REVIEWING). */
+  private async openSessionIfDocker(
+    run: RunRow,
+    project: ProjectConfig,
+    worktreePath: string,
+    log: RunLog,
+  ): Promise<ContainerSession | undefined> {
+    if (resolveIsolation(project, this.config.agent) !== 'docker') return undefined;
+    const session = await ContainerSession.open({
+      runId: run.run_id,
+      worktreePath,
+      artifactsDir: this.artifactsDirFor(run),
+      agent: this.config.agent,
+    });
+    log.event('container_session_open', { run: run.run_id, image: this.config.agent.container?.image });
+    return session;
   }
 
   private testEvidenceFor(run: RunRow): string {

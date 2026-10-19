@@ -43,6 +43,7 @@ export function makeConfig(dir: string, overrides?: Partial<AppConfig>): AppConf
       sandbox: 'danger-full-access',
       review_sandbox: 'danger-full-access',
       env_deny: [],
+      isolation: 'none',
     },
     approvals: {
       require_design_approval: true,

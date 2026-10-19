@@ -16,6 +16,14 @@ projects:
     checks:
       - argv: [node, --test]
         timeout_seconds: 300
+  # isolation: docker runs this project's coder/reviewer/checks inside the
+  # container image below (volume+tar sync to the daemon; host git/publish
+  # untouched). checks.argv must then exist INSIDE the image.
+  # - repo: your-org/python-service
+  #   local_repo: D:/path/to/python-service
+  #   isolation: docker
+  #   checks:
+  #     - argv: [uv, run, pytest]
 
 agent:
   provider: pi                      # 'pi' (tool-allowlist confinement) | 'codex' (-s sandbox flag)
@@ -26,6 +34,12 @@ agent:
   # review_provider: codex           # optional — run the reviewer on a different runner+model
   # review_model: new-api/GLM-5.3-Flash  # (heterogeneous review decorrelates failures)
   # review_reasoning_effort: low     # optional — e.g. cheaper/faster review
+  # isolation: none                  # global default; projects[].isolation overrides per-project
+  # container:                       # required (with image) when any isolation=docker
+  #   image: agent-control-dev:latest  # build via docker/Dockerfile
+  #   host: tcp://192.168.1.199:2375   # optional DOCKER_HOST for the docker CLI
+  #   network: bridge                  # optional docker run --network
+  #   extra_args: []                   # appended to every docker run
   env_deny:
     - GH_TOKEN
     - GITHUB_TOKEN

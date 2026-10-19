@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pickRunner } from '../runners/dispatch.js';
 import { PI_REVIEW_TOOLS } from '../runners/pi.js';
+import type { ContainerSession } from '../runners/container.js';
 import { REVIEW_SCHEMA, buildReviewPrompt, type PromptContext } from '../scheduler/prompts.js';
 import type { AppConfig, ReviewResult } from '../types.js';
 
@@ -12,6 +13,8 @@ export interface ReviewDeps {
   agentConfig: AppConfig['agent'];
   timeoutMs: number;
   artifactsDir: string;
+  /** When set, the reviewer runs inside this read-only container session. */
+  session?: ContainerSession;
   signal?: AbortSignal;
   onSpawn?: (pid: number | null, identity: string | null) => void;
 }
@@ -54,6 +57,7 @@ export async function runReview(
         schemaPath: isPi ? undefined : schemaPath,
         lastMessagePath: lastMsgPath,
         tools: isPi ? PI_REVIEW_TOOLS : undefined,
+        session: deps.session,
         signal: deps.signal,
         onSpawn: deps.onSpawn,
       },
