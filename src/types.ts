@@ -64,6 +64,7 @@ export interface AppConfig {
     database: string;
     logs_dir: string;
     cancel_poll_seconds: number;
+    ui: UiConfig;
   };
   projects: ProjectConfig[];
   agent: {
@@ -89,6 +90,13 @@ export interface AppConfig {
 }
 
 export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
+
+/** Embedded web UI. Loopback-only by default — it can stop/retry tasks. */
+export interface UiConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+}
 
 /** Union across runners — pi accepts all; codex maps to model_reasoning_effort. */
 export type ReasoningEffort = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';

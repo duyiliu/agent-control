@@ -26,6 +26,7 @@ export function makeConfig(dir: string, overrides?: Partial<AppConfig>): AppConf
       database: join(dir, 'ac.db'),
       logs_dir: join(dir, 'logs'),
       cancel_poll_seconds: 5,
+      ui: { enabled: false, host: '127.0.0.1', port: 8787 },
     },
     projects: [
       {

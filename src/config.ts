@@ -68,6 +68,9 @@ export function loadConfig(path: string): AppConfig {
     ? resolve(asStr(server['logs_dir'], 'server.logs_dir'))
     : resolve(dirname2(database), 'logs');
 
+  const uiRaw = asObj(server['ui'] ?? {}, 'server.ui');
+  const uiHost = asStr(uiRaw['host'] ?? '127.0.0.1', 'server.ui.host');
+
   const projectsRaw = root['projects'];
   if (!Array.isArray(projectsRaw) || projectsRaw.length === 0) {
     fail('projects must be a non-empty array');
@@ -117,6 +120,11 @@ export function loadConfig(path: string): AppConfig {
       database,
       logs_dir: logsDir,
       cancel_poll_seconds: asNum(server['cancel_poll_seconds'] ?? 5, 'server.cancel_poll_seconds', 1),
+      ui: {
+        enabled: asBool(uiRaw['enabled'] ?? true, 'server.ui.enabled'),
+        host: uiHost,
+        port: asNum(uiRaw['port'] ?? 8787, 'server.ui.port', 1),
+      },
     },
     projects: projectsRaw.map(parseProject),
     agent: {

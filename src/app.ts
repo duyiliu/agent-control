@@ -10,6 +10,7 @@ import { AppLog } from './telemetry/logging.js';
 import { pidAlive, processStartedAt, runProc, which } from './proc.js';
 import { resolvePiInvocation } from './runners/pi.js';
 import { resolveCodexInvocation } from './runners/codex.js';
+import { startUiServer, type UiServer } from './ui/server.js';
 import type { AppConfig } from './types.js';
 
 /**
@@ -102,6 +103,7 @@ export interface App {
   store: Store;
   engine: Engine;
   lock: InstanceLock;
+  tracker: GitHubTracker;
 }
 
 export function createApp(config: AppConfig): App {
@@ -115,17 +117,35 @@ export function createApp(config: AppConfig): App {
     store, config, tracker, workspace, appLog, installDir,
   });
   const lock = new InstanceLock(config.server.database);
-  return { config, store, engine, lock };
+  return { config, store, engine, lock, tracker };
 }
 
 export async function startService(app: App): Promise<void> {
-  const { config, store, engine, lock } = app;
+  const { config, store, engine, lock, tracker } = app;
   await lock.acquire();
   const appLog = new AppLog(config.server.logs_dir);
   appLog.event('service_start', { pid: process.pid });
 
+  // UI failure (e.g. port taken) must never take the scheduler down.
+  let ui: UiServer | null = null;
+  if (config.server.ui.enabled) {
+    try {
+      ui = await startUiServer({
+        deps: { store, config, tracker, activeCount: () => engine.activeCount() },
+        host: config.server.ui.host,
+        port: config.server.ui.port,
+        appLog,
+      });
+      console.log(`web ui: ${ui.url}`);
+      appLog.event('ui_start', { url: ui.url });
+    } catch (err) {
+      const msg = String(err instanceof Error ? err.message : err);
+      console.warn(`web ui failed to start (scheduler continues): ${msg}`);
+      appLog.event('ui_start_failed', { error: msg.slice(0, 300) });
+    }
+  }
+
   // Reconcile BEFORE any dispatch.
-  const tracker = new GitHubTracker();
   const report = await reconcile({
     store, config, tracker, appLog, engine,
   });
@@ -149,6 +169,7 @@ export async function startService(app: App): Promise<void> {
     if (stopping) return;
     stopping = true;
     appLog.event('service_stop', { sig });
+    ui?.close();
     clearInterval(timer);
     for (const run of store.activeRuns()) engine.abortRun(run.run_id, 'service shutdown');
     // Give in-flight runs a moment to land in CANCELED.

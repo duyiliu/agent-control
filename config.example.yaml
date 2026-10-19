@@ -6,6 +6,10 @@ server:
   worktree_root: C:/path/to/agent-control-data/worktrees
   database: C:/path/to/agent-control-data/agent-control.db
   logs_dir: C:/path/to/agent-control-data/logs
+  ui:                              # embedded web dashboard (loopback only)
+    enabled: true
+    host: 127.0.0.1
+    port: 8787
 
 projects:
   - repo: your-org/your-sandbox-repo

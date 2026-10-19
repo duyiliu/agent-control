@@ -4,10 +4,10 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { loadConfig } from './config.js';
 import { createApp, runDoctor, startService } from './app.js';
-import { GitHubTracker, approvalHash } from './tracker/github.js';
+import { GitHubTracker } from './tracker/github.js';
+import { retryTask, stopTask } from './ops.js';
 import { Store } from './store/sqlite.js';
-import type { AppConfig, Phase } from './types.js';
-import { RUN_ACTIVE_PHASES } from './types.js';
+import type { AppConfig } from './types.js';
 
 const USAGE = `agent-control — personal AI dev-task scheduler
 
@@ -142,22 +142,10 @@ async function main() {
       try {
         const task = store.getTask(repo, issueNumber);
         if (!task) die(`no task for ${repo}#${issueNumber}`);
-        const retryable: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'RECOVERY_REQUIRED', 'CANCELED', 'FAILED'];
-        if (!retryable.includes(task.status)) die(`task status ${task.status} is not retryable`);
-        if (store.activeRunForTask(task.id)) die('an active run still exists; stop it first');
 
-        // Re-validate approval against the CURRENT issue content — a human
-        // retry means "the current issue text is what I approve".
-        const project = config.projects.find((p) => p.repo === repo);
-        if (!project) die(`project ${repo} not in config`);
         const tracker = new GitHubTracker();
-        const issue = await tracker.getIssue(repo, issueNumber);
-        if (!issue || issue.state !== 'OPEN') die('issue is closed or missing');
-        if (!issue.labels.includes(project.ready_label)) die(`issue lacks ${project.ready_label} label`);
-
-        store.setTaskStatus(task.id, 'DISCOVERED', { approved_hash: approvalHash(issue) });
-        await tracker.removeLabel(repo, issueNumber, 'agent-blocked').catch(() => {});
-        console.log(`task ${repo}#${issueNumber} re-queued (hash ${approvalHash(issue).slice(0, 12)})`);
+        const message = await retryTask(store, config, tracker, task);
+        console.log(message);
       } finally {
         store.close();
       }
@@ -173,16 +161,7 @@ async function main() {
       try {
         const task = store.getTask(repo, issueNumber);
         if (!task) die(`no task for ${repo}#${issueNumber}`);
-        const run = store.activeRunForTask(task.id);
-        if (run) {
-          store.requestCancel(run.run_id);
-          console.log(`cancel requested for run ${run.run_id}; the scheduler aborts it within one poll cycle`);
-        } else if ((RUN_ACTIVE_PHASES as readonly Phase[]).includes(task.status)) {
-          store.setTaskStatus(task.id, 'CANCELED');
-          console.log(`task ${repo}#${issueNumber} cancelled`);
-        } else {
-          console.log(`task ${repo}#${issueNumber} has no active run (status=${task.status})`);
-        }
+        console.log(stopTask(store, task));
       } finally {
         store.close();
       }
