@@ -18,6 +18,7 @@ export interface ReviewDeps {
   artifactsDir: string;
   signal?: AbortSignal;
   onSpawn?: (pid: number | null, identity: string | null) => void;
+  headSha?: string;
 }
 
 type ReviewRunner = (opts: AgentCallOpts, config: AppConfig['agent']) => Promise<AgentCallResult>;
@@ -57,7 +58,7 @@ export async function runReview(
     }
     const proc = await runner({
       workdir: ctx.worktreePath,
-      prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence),
+      prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence, deps.headSha),
       sandbox: agentConfig.review_sandbox,
       timeoutMs: deps.timeoutMs,
       logPath,

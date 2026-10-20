@@ -112,7 +112,7 @@ test('AC1: happy path produces exactly one draft PR and awaits merge', async () 
     assert.ok(env.tracker.labelsAdded.some(([n, l]) => n === 1 && l === 'agent-running'));
     assert.ok(env.tracker.labelsAdded.some(([n, l]) => n === 1 && l === 'agent-pr'));
     const run = store.runsForTask(task.id)[0]!;
-    const phases = store.eventsForRun(run.run_id).map((e) => e.to_phase);
+    const phases = store.eventsForRun(run.run_id).filter((e) => e.from_phase !== e.to_phase).map((e) => e.to_phase);
     assert.deepEqual(phases, ['CLAIMED', 'PREPARING', 'RUNNING', 'VERIFYING', 'REVIEWING', 'PUBLISHING_PR', 'AWAITING_MERGE']);
 
     await tickAndDrain(engine);
@@ -212,7 +212,8 @@ test('AC5: review BLOCK → fix → re-review → PASS', async () => {
     assert.equal(task.status, 'AWAITING_MERGE');
     assert.equal(reviews, 2);
     assert.equal(checks, 2, 'review-driven fixes must rerun checks');
-    const phases = store.eventsForRun(store.runsForTask(task.id)[0]!.run_id).map((e) => e.to_phase);
+    const phases = store.eventsForRun(store.runsForTask(task.id)[0]!.run_id)
+      .filter((e) => e.from_phase !== e.to_phase).map((e) => e.to_phase);
     assert.deepEqual(phases.slice(4), ['REVIEWING', 'FIXING', 'VERIFYING', 'REVIEWING', 'PUBLISHING_PR', 'AWAITING_MERGE']);
   } finally { env.done(); }
 });
@@ -561,6 +562,46 @@ test('workspace publishes the reviewed SHA rather than a moving branch ref', asy
   });
   await ws.push('.', 'agent/issue-1', 'reviewed-sha');
   assert.deepEqual(calls[0], ['git', 'push', 'origin', 'reviewed-sha:refs/heads/agent/issue-1']);
+});
+
+test('checks and review events bind their evidence to the published SHA', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(30, { ...ISSUE });
+    let prBody = ''; let reviewEvidence = '';
+    const create = env.tracker.createDraftPr.bind(env.tracker);
+    env.tracker.createDraftPr = async (repo, opts) => { prBody = opts.body; return create(repo, opts); };
+    const { store, engine } = makeEngine(env, {
+      review: async (_ctx, evidence) => {
+        reviewEvidence = evidence;
+        return { result: { verdict: 'PASS', summary: 'ok', findings: [] }, logPath: 'review.jsonl' };
+      },
+    });
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 30)!;
+    const events = store.eventsForRun(store.runsForTask(task.id)[0]!.run_id);
+    const details = events.flatMap((event) => event.detail_json ? [JSON.parse(event.detail_json) as Record<string, unknown>] : []);
+    assert.ok(details.some((detail) => detail.kind === 'checks_completed' && detail.head_sha === 'head-sha' && detail.ok === true));
+    assert.ok(details.some((detail) => detail.kind === 'review_completed' && detail.head_sha === 'head-sha' && detail.verdict === 'PASS'));
+    assert.ok(details.some((detail) => detail.kind === 'pr_published' && detail.head_sha === 'head-sha'));
+    assert.match(reviewEvidence, /提交 SHA: head-sha/);
+    assert.match(prBody, /提交：`head-sha`/);
+    assert.match(prBody, /exit 0/);
+  } finally { env.done(); }
+});
+
+test('failed checks record the checked SHA on the transition into fixing', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(31, { ...ISSUE });
+    const { store, engine } = makeEngine(env, { checks: async () => checksFail() });
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 31)!;
+    const events = store.eventsForRun(store.runsForTask(task.id)[0]!.run_id);
+    const detail = events.find((event) => event.to_phase === 'FIXING')!.detail_json!;
+    assert.equal((JSON.parse(detail) as { head_sha?: string }).head_sha, 'head-sha');
+    assert.ok(events.some((event) => event.to_phase === 'VERIFYING' && JSON.parse(event.detail_json ?? '{}').kind === 'checks_completed'));
+  } finally { env.done(); }
 });
 
 test('workspace ensureWorktree creates and reuses (real git)', async () => {

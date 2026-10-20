@@ -82,8 +82,9 @@ test('review: retry preserves read-only confinement and heterogeneous model conf
   const env = setup();
   try {
     await runReview(env.ctx, 'pass', 'diff', {
-      ...env.deps, agentConfig: { ...env.config.agent, review_provider: 'codex', review_model: 'test/reviewer', review_sandbox: 'read-only' },
+      ...env.deps, headSha: 'verified-sha', agentConfig: { ...env.config.agent, review_provider: 'codex', review_model: 'test/reviewer', review_sandbox: 'read-only' },
     }, async (opts, config) => {
+      assert.match(opts.prompt, /本轮待审查提交 SHA：verified-sha/);
       assert.equal(config.provider, 'codex');
       assert.equal(config.model, 'test/reviewer');
       assert.equal(opts.sandbox, 'read-only');
@@ -126,7 +127,8 @@ test('review: cancellation does not retry the reviewer', async () => {
 test('review prompt: concrete blocking findings, suggestions do not block', () => {
   const env = setup();
   try {
-    const prompt = buildReviewPrompt(env.ctx, 'pass', 'diff');
+    const prompt = buildReviewPrompt(env.ctx, 'pass', 'diff', 'abc123');
+    assert.match(prompt, /本轮待审查提交 SHA：abc123/);
     assert.match(prompt, /触发条件/);
     assert.match(prompt, /风格.*不.*阻塞/);
     assert.match(prompt, /验证方式/);

@@ -113,6 +113,7 @@ schtasks /delete /tn agent-control  # 卸载
 ### 质量闸门与人工接管
 
 - 任意代码修复后均重新执行 checks，再进入独立只读 Review；测试、Review 和发布前都会检查工作区与 HEAD，发布不再兜底提交新改动。
+- 每次检查开始/完成、Review 开始/完成、进入修复和发布 PR 时，`run_events.detail_json` 记录关联提交 SHA；Review 提示与测试证据、PR 正文也带该 SHA，便于追溯被验证、审查和发布的代码版本。
 - 每次 Review（包括一次失败重试）使用独立证据文件。缺失或无效 JSON 只重试 reviewer 一次，仍失败则 `FAILED`，不会让 coder 为格式或工具故障消耗修复次数。
 - Review 仅对有证据的正确性、验收或越界问题返回 `BLOCK`，每条 finding 应包含位置、触发条件、影响和验证方式；风格偏好及可选重构不阻塞。无具体 finding、高风险或证据不完整时停止并等待人工处理。
 - checks 的命令启动失败、超时或异常终止记为基础设施错误，不自动修改业务代码。Windows 上 `npm`/`npx` 使用 Node 入口启动，未知 `.cmd`/`.bat` 需显式配置可执行入口，不启用通用 shell。

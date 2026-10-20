@@ -328,20 +328,32 @@ export class Engine {
             const gate = await this.gateApproval(project, task);
             if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed before checks'); return; }
             const headBeforeChecks = await this.workspace.head(worktreePath);
+            store.transition(runId, phase, phase, {
+              kind: 'checks_started', head_sha: headBeforeChecks,
+              commands: project.checks.map((check) => check.argv.join(' ')),
+            });
             const summary = await this.callChecks(run, log, worktreePath, signal);
+            const headAfterChecks = await this.workspace.head(worktreePath).catch(() => null);
+            const checksWorktreeClean = !(await this.workspace.isDirty(worktreePath));
+            store.transition(runId, phase, phase, {
+              kind: 'checks_completed', head_sha: headBeforeChecks, head_sha_after: headAfterChecks,
+              worktree_clean: checksWorktreeClean, ok: summary.ok, aborted: summary.aborted,
+              infra_error: summary.infraError,
+              outcomes: summary.outcomes.map((outcome) => ({ command: outcome.command, exit_code: outcome.exitCode, timed_out: outcome.timedOut })),
+            });
             if (aborted() || summary.aborted) { this.finish(run, task, 'CANCELED', 'cancelled during checks'); return; }
+            if (headAfterChecks !== headBeforeChecks || !checksWorktreeClean) {
+              this.finish(run, task, 'BLOCKED', 'code changed during checks; verification does not match the worktree');
+              return;
+            }
             if (summary.infraError) { this.finish(run, task, 'FAILED', `checks infra: ${summary.infraError}`); return; }
             if (summary.ok) {
-              if (await this.workspace.head(worktreePath) !== headBeforeChecks || await this.workspace.isDirty(worktreePath)) {
-                this.finish(run, task, 'BLOCKED', 'code changed during checks; verification does not match the worktree');
-                return;
-              }
               verifiedHead = headBeforeChecks;
-              store.transition(runId, phase, (phase = 'REVIEWING'));
+              store.transition(runId, phase, (phase = 'REVIEWING'), { head_sha: verifiedHead });
             } else {
               lastFailureEvidence = summary.failureEvidence;
               if (this.canFix(run)) {
-                store.transition(runId, phase, (phase = 'FIXING'), { return_to: 'VERIFYING' });
+                store.transition(runId, phase, (phase = 'FIXING'), { return_to: 'VERIFYING', head_sha: headBeforeChecks });
                 this.setReturnPhase(runId, 'VERIFYING');
               } else {
                 this.finish(run, task, 'BLOCKED', 'checks failed; fix budget exhausted');
@@ -374,13 +386,14 @@ export class Engine {
               this.finish(run, task, 'BLOCKED', 'code changed since checks; refusing review on stale verification');
               return;
             }
+            store.transition(runId, phase, phase, { kind: 'review_started', head_sha: headBefore });
             let reviewOutcome: Awaited<ReturnType<typeof runReview>> | undefined;
             let reviewError: unknown;
             try {
-              reviewOutcome = await this.runReviewFn(ctx, this.testEvidenceFor(run), diffEvidence, {
+              reviewOutcome = await this.runReviewFn(ctx, this.testEvidenceFor(run, verifiedHead), diffEvidence, {
                 agentConfig: this.config.agent,
                 timeoutMs: this.config.server.max_task_minutes * 60_000,
-                artifactsDir: this.artifactsDirFor(run), signal,
+                artifactsDir: this.artifactsDirFor(run), signal, headSha: verifiedHead,
                 onSpawn: (pid, identity) => store.updateRunFields(runId, { pid, process_identity: identity }),
               });
             } catch (err) { reviewError = err; }
@@ -397,21 +410,25 @@ export class Engine {
             if (!reviewOutcome) {
               store.addCheck({ run_id: runId, kind: 'review', command: 'agent (review)', exit_code: null,
                 artifact_path: reviewError instanceof ReviewInfraError ? reviewError.logPath : undefined, verdict: 'ERROR' });
+              store.transition(runId, phase, phase, { kind: 'review_completed', head_sha: headBefore,
+                head_sha_after: headAfter, verdict: 'ERROR', error: String(reviewError) });
               this.finish(run, task, 'FAILED', `review infra: ${String(reviewError).slice(0, 400)}`);
               return;
             }
             const { result, logPath } = reviewOutcome;
             store.addCheck({ run_id: runId, kind: 'review', command: 'agent (review)', exit_code: null,
               artifact_path: logPath, verdict: result.verdict });
+            store.transition(runId, phase, phase, { kind: 'review_completed', head_sha: headBefore,
+              head_sha_after: headAfter, verdict: result.verdict, summary: result.summary, artifact_path: logPath });
             if (result.verdict === 'PASS') {
               reviewedHead = headAfter;
-              store.transition(runId, phase, (phase = 'PUBLISHING_PR'), { reviewed_head: reviewedHead });
+              store.transition(runId, phase, (phase = 'PUBLISHING_PR'), { head_sha: reviewedHead });
             } else if (result.verdict === 'HUMAN_REVIEW_REQUIRED' || !result.findings.some((finding) => finding.trim())) {
               this.finish(run, task, 'BLOCKED', `review requires human: ${result.summary}; no automatic repair without concrete findings`);
               return;
             } else if (this.canFix(run)) {
               lastFailureEvidence = `Review BLOCK: ${result.summary}\n${result.findings.join('\n')}`;
-              store.transition(runId, phase, (phase = 'FIXING'), { return_to: 'VERIFYING', verdict: result });
+              store.transition(runId, phase, (phase = 'FIXING'), { return_to: 'VERIFYING', head_sha: headAfter, verdict: result });
               this.setReturnPhase(runId, 'VERIFYING');
             } else {
               this.finish(run, task, 'BLOCKED', `review blocked, fix budget exhausted: ${result.summary}`);
@@ -451,7 +468,7 @@ export class Engine {
             const gate = await this.gateApproval(project, task);
             if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed before publish'); return; }
             const issue = (await this.tracker.getIssue(project.repo, task.issue_number))!;
-            const prBody = this.buildPrBody(run, task, issue);
+            const prBody = this.buildPrBody(run, task, issue, reviewedHead);
             try {
               const pr = await publishDraftPr({
                 project, worktreePath, branch: run.branch ?? `${project.branch_prefix}${task.issue_number}`,
@@ -468,6 +485,7 @@ export class Engine {
                 this.finish(run, task, postGate, 'approval revoked just after PR create; PR closed');
                 return;
               }
+              store.transition(runId, phase, phase, { kind: 'pr_published', head_sha: reviewedHead, pr_url: pr.url });
               this.finish(run, task, 'AWAITING_MERGE', undefined, { pr_url: pr.url });
               await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-pr');
               await this.labelQuietly(project.repo, task.issue_number, 'remove', 'agent-running');
@@ -573,11 +591,12 @@ export class Engine {
     return summary;
   }
 
-  private testEvidenceFor(run: RunRow): string {
+  private testEvidenceFor(run: RunRow, headSha?: string | null): string {
     const checks = this.store.checksForRun(run.run_id).filter((c) => c.kind === 'check');
     const latest = [...new Map(checks.map((c) => [c.command, c])).values()];
-    if (checks.length === 0) return '(no checks recorded)';
-    return latest
+    const prefix = headSha ? `提交 SHA: ${headSha}\n` : '';
+    if (checks.length === 0) return `${prefix}(no checks recorded)`;
+    return prefix + latest
       .map((c) => `命令: ${c.command}\n结果: ${c.verdict} (exit ${c.exit_code ?? 'n/a'})\n日志: ${c.artifact_path ?? '-'}`)
       .join('\n\n');
   }
@@ -602,11 +621,17 @@ export class Engine {
     return 'ok';
   }
 
-  private buildPrBody(run: RunRow, task: TaskRow, issue: IssueData): string {
+  private buildPrBody(run: RunRow, task: TaskRow, issue: IssueData, headSha: string): string {
     const checks = this.store.checksForRun(run.run_id);
-    const checksMd = checks.length
-      ? checks.map((c) => `- \`${c.command}\` → **${c.verdict}**${c.exit_code != null ? ` (exit ${c.exit_code})` : ''}`).join('\n')
-      : '- (无配置检查)';
+    const checkEvents = this.store.eventsForRun(run.run_id)
+      .filter((event) => event.to_phase === 'VERIFYING' && event.detail_json)
+      .map((event) => JSON.parse(event.detail_json!) as { kind?: string; head_sha?: string; outcomes?: { command: string; exit_code: number | null }[] })
+      .filter((detail): detail is { kind: string; head_sha: string; outcomes: { command: string; exit_code: number | null }[] } =>
+        detail.kind === 'checks_completed' && detail.head_sha === headSha && Array.isArray(detail.outcomes))
+      .at(-1);
+    const checksMd = checkEvents
+      ? checkEvents.outcomes.map((outcome) => `- \`${outcome.command}\` → **${outcome.exit_code === 0 ? 'PASS' : 'FAIL'}**${outcome.exit_code !== null ? ` (exit ${outcome.exit_code})` : ''}`).join('\n') || '- (无配置检查)'
+      : '- 最新提交的检查证据缺失';
     const review = checks.filter((c) => c.kind === 'review').at(-1);
     return [
       `> 本 PR 由 agent-control 自动创建（Draft）。人工审查合并前不会合入主干。`,
@@ -617,6 +642,7 @@ export class Engine {
       `## 验收与证据`,
       `- 需求来源：${issue.url}`,
       `- 运行 ID：\`${run.run_id}\`（attempt ${run.attempt}）`,
+      `- 提交：\`${headSha}\``,
       `- Review 结论：${review ? review.verdict : '未执行'}`,
       ``,
       `## 测试命令与结果`,

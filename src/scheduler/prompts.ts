@@ -111,13 +111,14 @@ export const REVIEW_SCHEMA = {
 
 export const MAX_REVIEW_DIFF_CHARS = 60_000;
 
-export function buildReviewPrompt(ctx: PromptContext, testEvidence: string, diffEvidence: string): string {
+export function buildReviewPrompt(ctx: PromptContext, testEvidence: string, diffEvidence: string, headSha?: string): string {
   return [
     '# 角色',
     '你是 agent-control 调度器启动的独立只读审查器。不要修改任何文件。',
     '',
     '# 审查对象',
     `当前目录是隔离 worktree。分支 ${ctx.branch} 相对 ${ctx.project.base_branch} 的全部改动已由宿主生成，见下方 <diff> 块，它是待审查改动的权威证据。`,
+    `本轮待审查提交 SHA：${headSha ?? '(未提供)'}。只可依据该 SHA 对应的 <diff> 和测试证据作出结论。`,
     '不要依赖 git 子命令（本环境中它们可能失败）。如需核实上下文，直接读取 worktree 中的文件。',
     '',
     '# 待审查改动（宿主生成，可信）',
