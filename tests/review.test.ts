@@ -53,6 +53,45 @@ test('review: malformed output retries reviewer once, then accepts valid output'
   } finally { cleanup(env.dir); }
 });
 
+test('review: narration around the verdict JSON breaks protocol, goes to human review', async () => {
+  const env = setup();
+  try {
+    let calls = 0;
+    const out = await runReview(env.ctx, 'tests pass', 'diff', env.deps, async (opts) => {
+      calls++;
+      writeFileSync(opts.lastMessagePath, `已根据 worktree 文件核实证据。改动仅 index.html，符合范围。\n\n${JSON.stringify(passed)}`);
+      return ok();
+    });
+    assert.equal(calls, 1);
+    assert.equal(out.result.verdict, 'HUMAN_REVIEW_REQUIRED');
+  } finally { cleanup(env.dir); }
+});
+
+test('review: stray JSON in narration does not rescue a protocol violation', async () => {
+  const env = setup();
+  try {
+    let calls = 0;
+    const out = await runReview(env.ctx, 'tests pass', 'diff', env.deps, async (opts) => {
+      calls++;
+      writeFileSync(opts.lastMessagePath, `示例格式：{"note":"not a verdict"}\n\n${JSON.stringify(passed)}`);
+      return ok();
+    });
+    assert.equal(calls, 1);
+    assert.equal(out.result.verdict, 'HUMAN_REVIEW_REQUIRED');
+  } finally { cleanup(env.dir); }
+});
+
+test('review: trailing prose after the verdict JSON also breaks protocol', async () => {
+  const env = setup();
+  try {
+    const out = await runReview(env.ctx, 'tests pass', 'diff', env.deps, async (opts) => {
+      writeFileSync(opts.lastMessagePath, `${JSON.stringify(passed)}\n混杂文本 } 不影响`);
+      return ok();
+    });
+    assert.equal(out.result.verdict, 'HUMAN_REVIEW_REQUIRED');
+  } finally { cleanup(env.dir); }
+});
+
 for (const value of [null, { verdict: 'PASS' }, { ...passed, findings: [123] }, { ...passed, summary: '' }, { ...passed, extra: true }]) {
   test(`review: invalid output shape is infrastructure failure (${JSON.stringify(value)})`, async () => {
     const env = setup();
@@ -101,10 +140,14 @@ test('review: model override keeps Pi runner and read-only tool allowlist', asyn
 test('review: prose containing an example PASS is not accepted as a verdict', async () => {
   const env = setup();
   try {
-    await assert.rejects(runReview(env.ctx, 'pass', 'diff', env.deps, async (opts) => {
+    let calls = 0;
+    const out = await runReview(env.ctx, 'pass', 'diff', env.deps, async (opts) => {
+      calls++;
       writeFileSync(opts.lastMessagePath, `I could not review. Example only: ${JSON.stringify(passed)}`);
       return ok();
-    }), ReviewInfraError);
+    });
+    assert.equal(calls, 1);
+    assert.equal(out.result.verdict, 'HUMAN_REVIEW_REQUIRED');
   } finally { cleanup(env.dir); }
 });
 

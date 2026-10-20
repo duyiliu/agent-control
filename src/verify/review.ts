@@ -91,15 +91,38 @@ export async function runReview(
 }
 
 function parseReviewResult(text: string): ReviewResult {
-  const value = parseVerdictJson(text);
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('expected an object');
+  const stripped = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  try {
+    const checked = checkReviewShape(JSON.parse(stripped));
+    if (checked) return checked;
+    throw new Error('expected verdict, risk, nonempty summary and string findings');
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+  }
+  // Not JSON as a whole: a narrating reviewer sometimes emits a balanced
+  // {...} amid prose. The protocol is broken, so no verdict inside is
+  // trustworthy — even a well-formed one ("example only: PASS") — and a
+  // human must look instead.
+  if (hasBalancedObject(stripped)) {
+    return {
+      verdict: 'HUMAN_REVIEW_REQUIRED',
+      risk: 'high',
+      summary: 'review output broke the JSON-only protocol (verdict object embedded in narration); human review required',
+      findings: [],
+    };
+  }
+  throw new Error('review must contain a single JSON object with verdict, risk, nonempty summary and string findings');
+}
+
+function checkReviewShape(value: unknown): ReviewResult | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const obj = value as Record<string, unknown>;
   if (Object.keys(obj).some((key) => !['verdict', 'risk', 'summary', 'findings'].includes(key))
     || typeof obj.verdict !== 'string' || !['PASS', 'BLOCK', 'HUMAN_REVIEW_REQUIRED'].includes(obj.verdict)
     || typeof obj.risk !== 'string' || !['low', 'high'].includes(obj.risk)
     || typeof obj.summary !== 'string' || !obj.summary.trim()
     || !Array.isArray(obj.findings) || obj.findings.some((finding) => typeof finding !== 'string' || !finding.trim())) {
-    throw new Error('expected verdict, risk, nonempty summary and string findings');
+    return null;
   }
   return {
     verdict: obj.verdict as ReviewResult['verdict'],
@@ -109,10 +132,25 @@ function parseReviewResult(text: string): ReviewResult {
   };
 }
 
-function parseVerdictJson(text: string): unknown {
-  const stripped = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-  try {
-    return JSON.parse(stripped);
-  } catch { /* invalid protocol output */ }
-  throw new Error('review must contain a single JSON object');
+/** True when the text contains at least one balanced `{...}` block. */
+function hasBalancedObject(text: string): boolean {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}' && depth > 0) {
+      depth--;
+      if (depth === 0) return true;
+    }
+  }
+  return false;
 }
