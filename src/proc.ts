@@ -257,6 +257,29 @@ function taskkillTree(pid: number) {
 }
 
 /**
+ * Resolve a PowerShell binary that can actually be spawned. A bare
+ * 'pwsh.exe' PATH lookup hits the App Execution Alias stub under
+ * WindowsApps first, and spawning that reparse point from a scheduled-task
+ * / non-interactive context fails with EPERM — so skip alias stubs and
+ * fall back to the always-present Windows PowerShell.
+ */
+let psBin: string | null = null;
+function resolvePowerShell(): string {
+  if (psBin) return psBin;
+  const env = process.env.POWERSHELL_EXE;
+  if (env) return (psBin = env);
+  const candidates = [
+    which('pwsh.exe'),
+    join(process.env.ProgramFiles ?? 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe'),
+  ];
+  for (const c of candidates) {
+    if (!c || c.includes('WindowsApps')) continue;
+    if (existsSync(c)) return (psBin = c);
+  }
+  return (psBin = 'powershell.exe');
+}
+
+/**
  * PIDs of live processes whose command line contains `needle` (typically a
  * worktree path). Used at recovery to detect orphaned agent processes.
  * Returns null when the scan itself fails — callers must treat that as
@@ -264,7 +287,7 @@ function taskkillTree(pid: number) {
  */
 export async function findProcessesReferencing(needle: string): Promise<number[] | null> {
   if (process.platform === 'win32') {
-    const ps = process.env.POWERSHELL_EXE ?? 'pwsh.exe';
+    const ps = resolvePowerShell();
     const esc = needle.replace(/'/g, "''");
     const res = await runProc({
       argv: [
@@ -277,7 +300,13 @@ export async function findProcessesReferencing(needle: string): Promise<number[]
       ],
       timeoutMs: 20_000,
     });
-    if (res.exitCode !== 0) return null;
+    if (res.exitCode !== 0) {
+      console.error(
+        `findProcessesReferencing scan failed: exit=${res.exitCode} spawn=${res.spawnError ?? '-'} ` +
+          `stderr=${res.stderrTail.trim().slice(0, 300)}`,
+      );
+      return null;
+    }
     const out = res.stdoutTail.trim();
     if (!out) return [];
     return out.split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
@@ -336,7 +365,7 @@ export function which(command: string, envPath = process.env.PATH ?? ''): string
 /** Query a process's start time (for PID-reuse-safe liveness checks). */
 export async function processStartedAt(pid: number): Promise<number | null> {
   if (process.platform === 'win32') {
-    const ps = process.env.POWERSHELL_EXE ?? 'pwsh.exe';
+    const ps = resolvePowerShell();
     const res = await runProc({
       argv: [
         ps,
