@@ -2,7 +2,7 @@ import type { Phase } from './api';
 import { isActivePhase, phaseHex } from './groups';
 
 /**
- * Linear-style 14px status glyphs: hollow ring (queued), breathing
+ * Linear-style 14px status glyphs: hollow ring (queued), rotating
  * three-quarter arc (in progress), filled check (done), slash (canceled),
  * exclamation (needs attention), cross (failed).
  */
@@ -15,7 +15,7 @@ export default function StatusIcon(props: { phase: Phase; size?: number; classNa
   if (isActivePhase(phase)) {
     glyph = (
       <>
-        <circle cx="8" cy="8" r="5.6" {...common} opacity={0.25} />
+        <circle cx="8" cy="8" r="5.6" {...common} opacity={0.35} />
         <circle
           cx="8"
           cy="8"
@@ -26,7 +26,7 @@ export default function StatusIcon(props: { phase: Phase; size?: number; classNa
           strokeLinecap="round"
           strokeDasharray="26 35.2"
           transform="rotate(-90 8 8)"
-          style={{ animation: 'breathe 2.4s ease-in-out infinite' }}
+          style={{ transformOrigin: '8px 8px', animation: 'spin-slow 1.6s linear infinite' }}
         />
       </>
     );

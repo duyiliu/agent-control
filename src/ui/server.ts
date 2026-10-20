@@ -50,7 +50,11 @@ function serveStatic(path: string, res: ServerResponse): boolean {
   // Only files inside ui/dist are servable — no traversal.
   if (!file.startsWith(UI_DIST)) return false;
   if (!existsSync(file)) return false;
-  res.writeHead(200, { 'content-type': MIME[extname(file)] ?? 'application/octet-stream' });
+  res.writeHead(200, {
+    'content-type': MIME[extname(file)] ?? 'application/octet-stream',
+    // index.html must not be cached: it pins the hashed bundle name.
+    'cache-control': extname(file) === '.html' ? 'no-cache' : 'public, max-age=31536000, immutable',
+  });
   createReadStream(file).pipe(res);
   return true;
 }

@@ -288,7 +288,10 @@ function Timeline({ run }: { run: RunDetail }) {
               </span>
             </div>
             {e.detail_json && (
-              <div className="mt-0.5 whitespace-pre-wrap break-all font-mono text-[10.5px] text-fg-dim">
+              <div
+                className="mt-0.5 line-clamp-3 whitespace-pre-wrap break-all font-mono text-[10.5px] text-fg-dim"
+                title={e.detail_json}
+              >
                 {e.detail_json}
               </div>
             )}
@@ -309,31 +312,32 @@ function ChecksTable(props: { run: RunDetail; onOpenArtifact: (path: string) => 
       <div className="mb-2 text-[11px] font-medium text-fg-dim">
         检查项
       </div>
-      <table className="w-full text-[11px]">
+      <table className="w-full table-fixed text-[11px]">
         <thead>
           <tr className="text-left text-fg-dim">
-            <th className="pb-1.5 pr-3 font-normal">类型</th>
-            <th className="pb-1.5 pr-3 font-normal">命令</th>
-            <th className="pb-1.5 pr-3 font-normal">结论</th>
-            <th className="pb-1.5 pr-3 font-normal">退出码</th>
-            <th className="pb-1.5 font-normal">产物</th>
+            <th className="w-10 pb-1.5 pr-2 font-normal">类型</th>
+            <th className="pb-1.5 pr-2 font-normal">命令</th>
+            <th className="w-12 pb-1.5 pr-2 font-normal">结论</th>
+            <th className="w-14 whitespace-nowrap pb-1.5 pr-2 font-normal">退出码</th>
+            <th className="w-28 pb-1.5 font-normal">产物</th>
           </tr>
         </thead>
         <tbody>
           {run.checks.map((c) => (
             <tr key={c.id} className="border-t border-edge/70">
-              <td className="py-1.5 pr-3">{c.kind}</td>
-              <td className="py-1.5 pr-3 font-mono text-fg-muted">{c.command}</td>
-              <td className={`py-1.5 pr-3 font-medium ${verdictTone(c.verdict)}`}>{c.verdict}</td>
-              <td className="py-1.5 pr-3 font-mono text-fg-muted">{c.exit_code ?? 'n/a'}</td>
+              <td className="py-1.5 pr-2">{c.kind}</td>
+              <td className="break-all py-1.5 pr-2 font-mono text-fg-muted">{c.command}</td>
+              <td className={`py-1.5 pr-2 font-medium ${verdictTone(c.verdict)}`}>{c.verdict}</td>
+              <td className="py-1.5 pr-2 font-mono text-fg-muted">{c.exit_code ?? 'n/a'}</td>
               <td className="py-1.5">
                 {c.artifact_path ? (
                   <button
                     onClick={() => onOpenArtifact(c.artifact_path!)}
-                    className="flex items-center gap-1 font-mono text-info hover:underline"
+                    className="flex min-w-0 items-center gap-1 font-mono text-info hover:underline"
+                    title={c.artifact_path}
                   >
-                    <FileText className="size-3" />
-                    {(c.artifact_path.split(/[\\/]/).pop() ?? c.artifact_path)}
+                    <FileText className="size-3 shrink-0" />
+                    <span className="truncate">{(c.artifact_path.split(/[\\/]/).pop() ?? c.artifact_path)}</span>
                   </button>
                 ) : (
                   <span className="text-fg-dim">—</span>

@@ -55,7 +55,8 @@ export default function Board(props: {
     else localStorage.removeItem(FILTER_KEY);
   };
 
-  const kw = keyword.trim().toLowerCase();
+  // `#25` is how people refer to issues; strip it so the number still matches.
+  const kw = keyword.trim().toLowerCase().replace(/^#/, '');
   let visible = activeFilter ? tasks.filter((t) => t.repo === activeFilter) : tasks;
   if (kw) {
     visible = visible.filter(
@@ -142,7 +143,7 @@ export default function Board(props: {
             >
               <header className="flex items-center gap-2 px-3 py-2.5 text-[12px] font-medium text-fg-muted">
                 <span
-                  className={`size-1.5 rounded-full ${g.dot} ${g.key === 'active' ? '[animation:pulse-dot_2.4s_infinite]' : ''}`}
+                  className={`size-1.5 rounded-full ${g.dot} ${g.key === 'active' ? '[animation:pulse-dot_1.5s_infinite]' : ''}`}
                 />
                 {g.label}
                 <span className="ml-auto rounded border border-edge px-1.5 py-px text-[10.5px] tabular-nums text-fg-dim">

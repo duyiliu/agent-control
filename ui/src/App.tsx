@@ -199,19 +199,25 @@ function HealthLine({ health }: { health: HealthInfo | null }) {
       <span className="flex items-center gap-1.5 whitespace-nowrap">
         <span
           className="size-1.5 rounded-full bg-ok"
-          style={{ animation: 'pulse-dot 2.4s ease-in-out infinite' }}
+          style={{ animation: 'pulse-dot 1.5s infinite' }}
         />
         pid {health.pid} · 已运行 {fmtDur(upFrom)} · 运行中 {health.active_runs_in_process} 个
       </span>
-      {health.last_error && (
-        <span
-          className="flex min-w-0 items-center gap-1 text-danger"
-          title={health.last_error.error}
-        >
-          <TriangleAlert className="size-3 shrink-0" />
-          <span className="truncate">{health.last_error.kind}</span>
-        </span>
-      )}
+      {health.last_error && (() => {
+        const startedAt = Date.now() - health.uptime_s * 1000;
+        const stale = Date.parse(health.last_error.at) < startedAt;
+        return (
+          <span
+            className={`flex min-w-0 items-center gap-1 ${stale ? 'text-fg-dim' : 'text-danger'}`}
+            title={health.last_error.error}
+          >
+            <TriangleAlert className="size-3 shrink-0" />
+            <span className="truncate">
+              {health.last_error.kind}{stale ? '（历史）' : ''} · {fmtDur(health.last_error.at)}前
+            </span>
+          </span>
+        );
+      })()}
     </div>
   );
 }

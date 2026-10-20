@@ -2,9 +2,9 @@ import type { Phase } from './api';
 
 export type GroupKey = 'queued' | 'active' | 'reviewing' | 'awaiting' | 'done' | 'blocked';
 
-const ACTIVE: Phase[] = ['CLAIMED', 'PREPARING', 'RUNNING', 'VERIFYING', 'FIXING'];
-/** PR exists or is being reviewed: the run is alive, but coding is done. */
-const REVIEW_PHASES: Phase[] = ['PUBLISHING_PR', 'REVIEWING'];
+const ACTIVE: Phase[] = ['CLAIMED', 'PREPARING', 'RUNNING', 'VERIFYING', 'FIXING', 'PUBLISHING_PR'];
+/** PR exists and is being reviewed: the run is alive, but coding is done. */
+const REVIEW_PHASES: Phase[] = ['REVIEWING'];
 const BLOCKED: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED'];
 
 export function groupOf(status: Phase): GroupKey {

@@ -160,12 +160,11 @@ body {
 }
 
 @keyframes pulse-dot {
-  50% { opacity: 0.4; }
+  50% { opacity: 0.25; }
 }
 
-@keyframes breathe {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.35; }
+@keyframes spin-slow {
+  to { transform: rotate(360deg); }
 }
 
 @keyframes drawer-in {
