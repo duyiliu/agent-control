@@ -24,6 +24,12 @@ export function stopTask(store: Store, task: TaskRow): string {
     store.setTaskStatus(task.id, 'CANCELED');
     return `任务 ${task.repo}#${task.issue_number} 已取消`;
   }
+  // DISCOVERED + pending_fix is a queued fix run — stoppable, and the fix
+  // intent dies with the cancellation.
+  if (task.status === 'DISCOVERED' && task.pending_fix) {
+    store.setTaskStatus(task.id, 'CANCELED', { pending_fix: null });
+    return `任务 ${task.repo}#${task.issue_number} 已取消（含待执行修复）`;
+  }
   return `任务 ${task.repo}#${task.issue_number} 没有活动的运行（状态=${task.status}）`;
 }
 
@@ -66,7 +72,9 @@ export async function retryTask(
     if (!current || !RETRYABLE.includes(current.status) || store.activeRunForTask(task.id)) {
       throw new OpsError('检查重试期间任务已变化，请刷新后重试');
     }
-    store.setTaskStatus(task.id, 'DISCOVERED', { approved_hash: approvalHash(issue) });
+    // A human retry re-approves the whole pipeline: discard any stale
+    // review-fix intent so the new run starts clean.
+    store.setTaskStatus(task.id, 'DISCOVERED', { approved_hash: approvalHash(issue), pending_fix: null });
   });
   await tracker.removeLabel(task.repo, task.issue_number, 'agent-blocked').catch(() => {});
   return `任务 ${task.repo}#${task.issue_number} 已重新排队（哈希 ${approvalHash(issue).slice(0, 12)}）`;

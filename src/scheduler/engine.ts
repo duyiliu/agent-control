@@ -11,7 +11,7 @@ import { runChecks, type ChecksSummary } from '../verify/checks.js';
 import { runReview, ReviewInfraError } from '../verify/review.js';
 import { publishDraftPr, PublishError } from '../publish/pr.js';
 import { buildCoderPrompt, buildFixPrompt, type PromptContext } from './prompts.js';
-import type { AppConfig, IssueData, Phase, ProjectConfig, ReviewResult, RunRow, TaskRow } from '../types.js';
+import type { AppConfig, IssueData, PendingFix, Phase, ProjectConfig, ReviewResult, RunRow, TaskRow } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
 
 export interface EngineDeps {
@@ -83,6 +83,7 @@ export class Engine {
       await this.mergeReconcile();
       await this.discover();
       await this.dispatch();
+      await this.dispatchReviews();
     } finally {
       this.ticking = false;
     }
@@ -140,7 +141,7 @@ export class Engine {
         if (task.status === 'DISCOVERED' && task.approved_hash) {
           const h = approvalHash(issue);
           if (h !== task.approved_hash) {
-            this.setTaskStatus(task.id, 'BLOCKED_APPROVAL_CHANGED');
+            this.setTaskStatus(task.id, 'BLOCKED_APPROVAL_CHANGED', { pending_fix: null });
             this.appLog.event('approval_drift', { task: task.id });
             await this.labelQuietly(project.repo, issue.number, 'add', 'agent-blocked');
           }
@@ -176,12 +177,12 @@ export class Engine {
   private async tryDispatch(task: TaskRow, project: ProjectConfig) {
     const issue = await this.tracker.getIssue(project.repo, task.issue_number);
     if (!issue || issue.state !== 'OPEN') {
-      this.setTaskStatus(task.id, 'CANCELED');
+      this.setTaskStatus(task.id, 'CANCELED', { pending_fix: null });
       this.appLog.event('dispatch_skip', { task: task.id, why: 'issue closed or missing' });
       return;
     }
     if (!issue.labels.includes(project.ready_label)) {
-      this.setTaskStatus(task.id, 'CANCELED');
+      this.setTaskStatus(task.id, 'CANCELED', { pending_fix: null });
       this.appLog.event('dispatch_skip', { task: task.id, why: 'ready label revoked' });
       return;
     }
@@ -196,7 +197,7 @@ export class Engine {
     if (task.approved_hash == null) {
       this.store.setApprovedHash(task.id, hash);
     } else if (task.approved_hash !== hash) {
-      this.setTaskStatus(task.id, 'BLOCKED_APPROVAL_CHANGED');
+      this.setTaskStatus(task.id, 'BLOCKED_APPROVAL_CHANGED', { pending_fix: null });
       await this.labelQuietly(project.repo, issue.number, 'add', 'agent-blocked');
       return;
     }
@@ -226,16 +227,18 @@ export class Engine {
         this.appLog.event('dispatch_skip', { task: task.id, why: `PR already merged: ${existingPr.url}` });
         return;
       }
-      if (this.store.hasReviewPass(task.id)) {
+      if (!task.pending_fix) {
+        // OPEN PR with nothing to fix: the PR is the product now. Reviews are
+        // dispatched separately against the PR head sha.
         this.setTaskStatus(task.id, 'AWAITING_MERGE', { branch, pr_url: existingPr.url });
         await this.labelQuietly(project.repo, issue.number, 'add', 'agent-pr');
         this.appLog.event('dispatch_skip', { task: task.id, why: `PR already exists: ${existingPr.url}` });
         return;
       }
-      // PR exists but was never reviewed (e.g. retry after a crash): fall
-      // through and claim a run that goes PREPARING → VERIFYING → review.
+      // OPEN PR + pending_fix: claim a code run that goes straight to RUNNING
+      // with the review findings as its prompt.
       this.store.setTaskStatus(task.id, 'DISCOVERED', { branch, pr_url: existingPr.url });
-      this.appLog.event('dispatch_skip', { task: task.id, why: `PR exists but has no review PASS; re-entering verification: ${existingPr.url}` });
+      this.appLog.event('dispatch_skip', { task: task.id, why: `PR exists with pending fix; claiming fix run: ${existingPr.url}` });
     }
 
     const run = this.store.claimRun(task.id);
@@ -266,9 +269,23 @@ export class Engine {
         try {
           const run = this.store.getRun(runId);
           if (run && RUN_ACTIVE_PHASES.includes(run.phase)) {
-            this.store.endRun(runId, 'FAILED', `engine crash: ${String(err).slice(0, 500)}`);
-            const task = this.store.getTaskById(run.task_id);
-            if (task && task.status === 'RUNNING') this.setTaskStatus(task.id, 'FAILED');
+            if (run.kind === 'review') {
+              // A crashed review leaves no verdict row; without one the same
+              // sha would be re-dispatched forever. ERROR counts as a verdict.
+              if (run.head_sha && !this.store.hasReviewVerdictForSha(run.task_id, run.head_sha)) {
+                this.store.addCheck({
+                  run_id: runId, kind: 'review', command: 'agent (review)', exit_code: null,
+                  verdict: 'ERROR', head_sha: run.head_sha,
+                });
+              }
+              this.store.endRun(runId, 'FAILED', `engine crash: ${String(err).slice(0, 500)}`);
+              const task = this.store.getTaskById(run.task_id);
+              if (task && task.status === 'REVIEWING') this.setTaskStatus(task.id, 'AWAITING_MERGE');
+            } else {
+              this.store.endRun(runId, 'FAILED', `engine crash: ${String(err).slice(0, 500)}`);
+              const task = this.store.getTaskById(run.task_id);
+              if (task && task.status === 'RUNNING') this.setTaskStatus(task.id, 'FAILED');
+            }
           }
         } catch (e2) {
           this.appLog.event('run_crashed_cleanup_failed', { run: runId, error: String(e2) });
@@ -286,8 +303,9 @@ export class Engine {
     const store = this.store;
     const run = store.getRun(runId);
     if (!run) return;
-    const task = store.getTaskById(run.task_id);
-    if (!task) { store.endRun(runId, 'FAILED', 'task row missing'); return; }
+    const taskRow = store.getTaskById(run.task_id);
+    if (!taskRow) { store.endRun(runId, 'FAILED', 'task row missing'); return; }
+    let task: TaskRow = taskRow;
     const project = this.projectFor(task.repo);
     if (!project) { this.finish(run, task, 'FAILED', 'project removed from config'); return; }
 
@@ -298,6 +316,15 @@ export class Engine {
     }, 10_000);
 
     const aborted = () => signal.aborted || store.getRun(runId)?.cancel_requested === 1;
+
+    if (run.kind === 'review') {
+      try {
+        await this.runReviewTask(run, task, project, signal, aborted);
+      } finally {
+        clearInterval(heartbeat);
+      }
+      return;
+    }
 
     // One conversation per run: FIXING continues the turn that produced the
     // failing diff instead of re-priming a cold process with the same facts.
@@ -351,17 +378,32 @@ export class Engine {
             });
             worktreePath = wt.path;
             store.updateRunFields(runId, { workspace: wt.path, branch: run.branch ?? `${project.branch_prefix}${task.issue_number}` });
-            // An existing PR with no review PASS skips coding and goes
-            // straight to verification: the code is already on the branch.
-            store.transition(runId, phase, (phase = task.pr_url ? 'VERIFYING' : 'RUNNING'));
+            // A fix run (pending_fix) must run the coder even though a PR
+            // already exists; a plain existing-PR run re-verifies only.
+            const pendingFix = task.pending_fix ? (JSON.parse(task.pending_fix) as PendingFix) : null;
+            store.transition(runId, phase, (phase = task.pr_url && !pendingFix ? 'VERIFYING' : 'RUNNING'));
             break;
           }
 
           case 'RUNNING': {
             const gate = await this.gateApproval(project, task);
             if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed during run'); return; }
+            // Consume pending_fix once: the reviewed sha is pinned on the run
+            // so publish-time can detect a fix that produced no new commits.
+            const pendingFix = task.pending_fix ? (JSON.parse(task.pending_fix) as PendingFix) : null;
+            let prompt = buildCoderPrompt(ctx);
+            if (pendingFix) {
+              store.updateRunFields(runId, { head_sha: pendingFix.head_sha });
+              store.transition(runId, phase, phase, {
+                kind: 'pending_fix_consumed', head_sha: pendingFix.head_sha,
+                summary: pendingFix.summary, findings: pendingFix.findings,
+              });
+              store.setTaskStatus(task.id, 'RUNNING', { pending_fix: null });
+              task = { ...task, pending_fix: null };
+              prompt = buildFixPrompt(ctx, `Review BLOCK：${pendingFix.summary}\n${pendingFix.findings.join('\n')}`);
+            }
             const turn = ensureCoder();
-            const res = await this.coderTurn(run, log, turn, buildCoderPrompt(ctx), 'RUNNING', signal);
+            const res = await this.coderTurn(run, log, turn, prompt, 'RUNNING', signal);
             if (res.aborted) { this.finish(run, task, 'CANCELED', 'cancelled'); return; }
             if (!res.ok) {
               this.finish(run, task, 'FAILED', res.timedOut
@@ -382,7 +424,7 @@ export class Engine {
               kind: 'checks_started', head_sha: headBeforeChecks,
               commands: project.checks.map((check) => check.argv.join(' ')),
             });
-            const summary = await this.callChecks(run, log, worktreePath, signal);
+            const summary = await this.callChecks(run, log, worktreePath, signal, headBeforeChecks);
             const headAfterChecks = await this.workspace.head(worktreePath).catch(() => null);
             const checksWorktreeClean = !(await this.workspace.isDirty(worktreePath));
             store.transition(runId, phase, phase, {
@@ -414,110 +456,9 @@ export class Engine {
           }
 
           case 'REVIEWING': {
-            // run/task are snapshots taken at launch; PUBLISHING_PR writes the
-            // PR url to the DB mid-run, so re-read instead of trusting them.
-            const prUrl = store.getRun(runId)?.pr_url ?? run.pr_url ?? task.pr_url;
-            if (!verifiedHead) {
-              store.transition(runId, phase, (phase = 'VERIFYING'), { recovered: true, reason: 'revalidate before review after restart' });
-              break;
-            }
-            if (!prUrl) {
-              store.transition(runId, phase, (phase = 'PUBLISHING_PR'), { recovered: true, reason: 'publish before review' });
-              break;
-            }
-            const gate = await this.gateApproval(project, task);
-            if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed before review'); return; }
-            let diffEvidence: string;
-            try {
-              diffEvidence = await this.workspace.diffVsBase(worktreePath, project.base_branch);
-              mkdirSync(this.artifactsDirFor(run), { recursive: true });
-              writeFileSync(join(this.artifactsDirFor(run), 'review-diff.patch'), diffEvidence, 'utf8');
-            } catch (err) {
-              if (err instanceof DiffTooLargeError) {
-                // The PR and its checks are fine; only automatic review is out
-                // of reach. Hand it to a human instead of failing the run.
-                this.finish(run, task, 'BLOCKED', err.message, { pr_url: prUrl });
-                return;
-              }
-              this.finish(run, task, 'FAILED', `review diff unavailable: ${String(err).slice(0, 300)}`);
-              return;
-            }
-            // Record HEAD pre-review: `status --porcelain` alone cannot see
-            // commits/resets/ref moves by the unsandboxed reviewer.
-            const headBefore = await this.workspace.head(worktreePath).catch(() => null);
-            if (headBefore !== verifiedHead || await this.workspace.isDirty(worktreePath)) {
-              this.finish(run, task, 'BLOCKED', 'code changed after publish; refusing review on stale verification');
-              return;
-            }
-            store.transition(runId, phase, phase, { kind: 'review_started', head_sha: headBefore, pr_url: prUrl });
-            const prNumber = prNumberFromUrl(prUrl);
-            if (prNumber) await this.setPrLabel(project.repo, prNumber, true);
-            let reviewOutcome: Awaited<ReturnType<typeof runReview>> | undefined;
-            let reviewError: unknown;
-            try {
-              reviewOutcome = await this.runReviewFn(ctx, this.testEvidenceFor(run, verifiedHead), diffEvidence, {
-                agentConfig: this.config.agent,
-                timeoutMs: this.config.server.max_task_minutes * 60_000,
-                artifactsDir: this.artifactsDirFor(run), signal, headSha: verifiedHead,
-                onSpawn: (pid, identity) => store.updateRunFields(runId, { pid, process_identity: identity }),
-              });
-            } catch (err) { reviewError = err; }
-            if (prNumber) await this.setPrLabel(project.repo, prNumber, false);
-            // A failed reviewer can still have tampered with the worktree.
-            const headAfter = await this.workspace.head(worktreePath).catch(() => null);
-            const headMoved = headBefore === null || headAfter === null || headAfter !== headBefore;
-            if (headMoved || (await this.workspace.isDirty(worktreePath))) {
-              this.finish(run, task, 'BLOCKED', headMoved
-                ? 'branch HEAD moved during review; refusing to continue'
-                : 'worktree modified during review; refusing to continue');
-              return;
-            }
-            if (aborted()) { this.finish(run, task, 'CANCELED', 'cancelled during review'); return; }
-            if (!reviewOutcome) {
-              store.addCheck({ run_id: runId, kind: 'review', command: 'agent (review)', exit_code: null,
-                artifact_path: reviewError instanceof ReviewInfraError ? reviewError.logPath : undefined, verdict: 'ERROR' });
-              store.transition(runId, phase, phase, { kind: 'review_completed', head_sha: headBefore,
-                head_sha_after: headAfter, verdict: 'ERROR', error: String(reviewError) });
-              this.finish(run, task, 'FAILED', `review infra: ${String(reviewError).slice(0, 400)}`);
-              return;
-            }
-            const { result, logPath } = reviewOutcome;
-            store.addCheck({ run_id: runId, kind: 'review', command: 'agent (review)', exit_code: null,
-              artifact_path: logPath, verdict: result.verdict });
-            store.transition(runId, phase, phase, { kind: 'review_completed', head_sha: headBefore,
-              head_sha_after: headAfter, verdict: result.verdict, risk: result.risk,
-              summary: result.summary, artifact_path: logPath });
-            if (result.verdict === 'PASS') {
-              const riskReasons = this.assessRisk(diffEvidence, result.risk);
-              if (riskReasons.length > 0) {
-                if (prNumber) {
-                  await this.tracker.commentPr(project.repo, prNumber, this.riskComment(result, riskReasons))
-                    .catch((err) => this.appLog.event('pr_comment_error', { run: run.run_id, error: String(err) }));
-                }
-                await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
-                this.finish(run, task, 'AWAITING_MERGE', `review PASS but high risk: ${riskReasons.join('; ')}`, { pr_url: prUrl });
-                return;
-              }
-              if (prNumber && this.config.approvals.auto_merge.enabled) {
-                await this.autoMerge(run, task, project, prNumber, prUrl, headBefore);
-                return;
-              }
-              this.finish(run, task, 'AWAITING_MERGE', 'review PASS', { pr_url: prUrl });
-              return;
-            } else if (result.verdict === 'HUMAN_REVIEW_REQUIRED') {
-              this.finish(run, task, 'BLOCKED', `review requires human: ${result.summary}`, { pr_url: prUrl });
-              return;
-            } else if (!result.findings.some((finding) => finding.trim())) {
-              this.finish(run, task, 'BLOCKED', `review BLOCK without concrete findings: ${result.summary}; no automatic repair`, { pr_url: prUrl });
-              return;
-            } else if (this.canFix(run)) {
-              lastFailureEvidence = `Review BLOCK: ${result.summary}\n${result.findings.join('\n')}`;
-              store.transition(runId, phase, (phase = 'FIXING'), { return_to: 'VERIFYING', head_sha: headAfter, verdict: result, pr_url: prUrl });
-              this.setReturnPhase(runId, 'VERIFYING');
-            } else {
-              this.finish(run, task, 'BLOCKED', `review blocked, fix budget exhausted: ${result.summary}`, { pr_url: prUrl });
-              return;
-            }
+            // Legacy only: code runs never enter REVIEWING anymore (reviews
+            // are separate runs). A pre-v4 run resumed here re-verifies.
+            store.transition(runId, phase, (phase = 'VERIFYING'), { recovered: true, reason: 'review moved to a separate run kind; revalidate' });
             break;
           }
 
@@ -549,6 +490,13 @@ export class Engine {
               store.transition(runId, phase, (phase = 'VERIFYING'), { recovered: true, reason: 'revalidate before publishing after restart' });
               break;
             }
+            // A fix run that produced no new commits verified the very sha a
+            // review already BLOCKED — there is nothing new to publish.
+            const reviewedSha = this.store.getRun(runId)?.head_sha ?? run.head_sha;
+            if (reviewedSha && verifiedHead === reviewedSha) {
+              this.finish(run, task, 'BLOCKED', 'fix run produced no new commits; reviewed sha unchanged');
+              return;
+            }
             const gate = await this.gateApproval(project, task);
             if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed before publish'); return; }
             const issue = (await this.tracker.getIssue(project.repo, task.issue_number))!;
@@ -572,8 +520,10 @@ export class Engine {
               }
               store.transition(runId, phase, phase, { kind: 'pr_published', head_sha: verifiedHead, pr_url: pr.url });
               await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-pr');
-              store.transition(runId, phase, (phase = 'REVIEWING'), { head_sha: verifiedHead, pr_url: pr.url });
-              break;
+              // Coding ends here. Review — if enabled — is a separate run
+              // dispatched against this PR head sha.
+              this.finish(run, task, 'AWAITING_MERGE', `PR published: ${pr.url}`, { pr_url: pr.url });
+              return;
             } catch (err) {
               if (err instanceof PublishError && err.reason === 'approval_revoked') {
                 if (aborted()) { this.finish(run, task, 'CANCELED', 'cancelled before PR create'); return; }
@@ -595,6 +545,352 @@ export class Engine {
     } finally {
       clearInterval(heartbeat);
       await coderRef.current?.session.close().catch(() => { /* run already terminal */ });
+    }
+  }
+
+  // ---------------- review runs (kind='review') ----------------
+
+  /**
+   * Dispatch a review run per AWAITING_MERGE task — every published PR head
+   * is auto-reviewed. Verdict rows are sha-idempotent: any existing review
+   * row for the current PR head (PASS/BLOCK/HUMAN_REVIEW_REQUIRED/ERROR)
+   * suppresses re-dispatch.
+   */
+  private async dispatchReviews() {
+    const max = this.config.server.max_concurrent;
+    for (const task of this.store.listTasks('AWAITING_MERGE')) {
+      if (this.activeCount() >= max) return;
+      const project = this.projectFor(task.repo);
+      if (!project) continue;
+      if (this.store.activeRunForTask(task.id)) continue;
+      try {
+        const prNum = prNumberFromUrl(task.pr_url)
+          ?? (await this.tracker.findPrForBranch(project.repo, task.branch ?? '').catch(() => null))?.number
+          ?? null;
+        if (!prNum) continue;
+        const pr = await this.tracker.getPrDetails(project.repo, prNum);
+        if (pr.state !== 'OPEN') continue;
+        if (pr.labels.includes('agent-reviewing')) continue;
+        if (this.store.hasReviewVerdictForSha(task.id, pr.headSha)) continue;
+
+        // Claim + pin fields + task status in one transaction so a crash
+        // cannot leave a zombie task with no active run or vice versa.
+        const worktree = this.store.lastCodeWorkspace(task.id) ?? this.worktreePathFor(project, task);
+        const run = this.store.tx(() => {
+          const r = this.store.claimRun(task.id, { kind: 'review', headSha: pr.headSha });
+          this.store.updateRunFields(r.run_id, {
+            workspace: worktree,
+            branch: task.branch ?? `${project.branch_prefix}${task.issue_number}`,
+            pr_url: task.pr_url ?? pr.url,
+          });
+          this.store.setTaskStatus(task.id, 'REVIEWING');
+          return r;
+        });
+        // Launch before logging: a throw after claim-tx must not strand a
+        // CLAIMED run + REVIEWING task with nothing in flight.
+        this.launch(run.run_id);
+        this.appLog.event('review_run_claimed', { run: run.run_id, task: task.id, head_sha: pr.headSha, pr: prNum });
+      } catch (err) {
+        this.appLog.event('review_dispatch_error', { task: task.id, error: String(err) });
+        this.recordError('review_dispatch_error', err);
+      }
+    }
+  }
+
+  /**
+   * A review run: CLAIMED → REVIEWING → terminal. Judges one PR head sha;
+   * the only "product" is a check_results review row + the task/run verdict.
+   * Never writes a verdict row for an abandoned or cancelled round.
+   */
+  private async runReviewTask(run: RunRow, task: TaskRow, project: ProjectConfig, signal: AbortSignal, aborted: () => boolean) {
+    const store = this.store;
+    const runId = run.run_id;
+    const reviewedSha = run.head_sha!;
+    const prNum = prNumberFromUrl(run.pr_url ?? task.pr_url);
+    let tempWorktree: string | null = null;
+    let labelApplied = false;
+
+    try {
+      if (run.phase === 'CLAIMED') store.transition(runId, 'CLAIMED', 'REVIEWING');
+
+      // --- pre-flight guards -------------------------------------------------
+      let currentHead = reviewedSha;
+      if (prNum) {
+        const pr = await this.tracker.getPrDetails(project.repo, prNum)
+          .catch((err) => { this.appLog.event('review_preflight_error', { run: runId, error: String(err) }); return null; });
+        if (pr?.state === 'MERGED') {
+          store.transition(runId, 'REVIEWING', 'REVIEWING', { kind: 'review_skipped', reason: 'PR already merged' });
+          this.finishReview(run, task, 'COMPLETED', 'PR merged before review');
+          this.appLog.event('task_completed', { task: task.id, repo: task.repo, issue: task.issue_number });
+          await this.notifyTaskCompleted(task);
+          await this.cleanupMerged(project, task);
+          return;
+        }
+        if (pr && pr.state !== 'OPEN') {
+          this.finishReview(run, task, 'BLOCKED', 'PR closed before review');
+          return;
+        }
+        if (pr) currentHead = pr.headSha;
+      }
+      const gate = await this.gateApproval(project, task);
+      if (gate !== 'ok') { this.finishReview(run, task, gate, 'approval gate failed before review'); return; }
+      if (currentHead !== reviewedSha) {
+        // Head moved since dispatch: abandon this round without a verdict.
+        // Task stays AWAITING_MERGE so the next tick re-dispatches on the
+        // new sha; the run itself is dead.
+        this.finishReview(run, task, 'CANCELED', `PR head moved ${reviewedSha} -> ${currentHead}; abandoning round`, this.cancelTaskPhase(runId));
+        return;
+      }
+      if (aborted()) { this.finishReview(run, task, 'CANCELED', 'cancelled', this.cancelTaskPhase(runId)); return; }
+
+      // --- materialize the PR head as a local review site --------------------
+      let sitePath = '';
+      const codeWt = run.workspace ?? this.store.lastCodeWorkspace(task.id);
+      if (codeWt) {
+        const head = await this.workspace.head(codeWt).catch(() => null);
+        if (head === reviewedSha && !(await this.workspace.isDirty(codeWt))) {
+          sitePath = codeWt;
+          // A resumed run reuses its own previous review site — still owned
+          // by this run, so the finally must tear it down. Exact compare:
+          // a code worktree must never be mistaken for a review site.
+          if (sitePath === resolve(join(this.config.server.worktree_root, 'review-sites', runId.slice(0, 8)))) tempWorktree = sitePath;
+        }
+      }
+      if (!sitePath) {
+        sitePath = join(this.config.server.worktree_root, 'review-sites', `${runId.slice(0, 8)}`);
+        try {
+          // Refresh both the PR branch and the base ref — a stale local base
+          // inflates the merge-base diff with unrelated commits.
+          await this.workspace.fetchBranch(project.local_repo, run.branch ?? task.branch ?? project.base_branch);
+          await this.workspace.fetchBranch(project.local_repo, project.base_branch);
+          // A previous attempt may have died mid-`worktree add`; clear any
+          // stale site path so the add cannot spuriously fail.
+          await this.workspace.removeWorktree(project.local_repo, sitePath).catch(() => {});
+          tempWorktree = await this.workspace.addDetachedWorktree(project.local_repo, reviewedSha, sitePath);
+        } catch (err) {
+          // A round cancelled during materialization must not pin the sha.
+          if (aborted()) { this.finishReview(run, task, 'CANCELED', 'cancelled during materialization', this.cancelTaskPhase(runId)); return; }
+          // Cannot build a review site: infrastructure failure, not a code
+          // verdict. ERROR counts as a verdict for this sha (no re-dispatch).
+          this.writeReviewVerdict(runId, reviewedSha, 'ERROR');
+          this.finishReview(run, task, 'AWAITING_MERGE', `review site unavailable: ${String(err).slice(0, 300)}`);
+          await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+          void this.notifyReviewInfra(task, run, '自动评审现场搭建失败，转人工评审');
+          return;
+        }
+      }
+      store.updateRunFields(runId, { workspace: sitePath });
+      if (prNum) { await this.setPrLabel(project.repo, prNum, true); labelApplied = true; }
+
+      // --- run the read-only reviewer ----------------------------------------
+      const ctx = await this.makePromptContext(run, task, project);
+      ctx.worktreePath = sitePath;
+      let diffEvidence: string;
+      try {
+        diffEvidence = await this.workspace.diffVsBase(sitePath, project.base_branch);
+        mkdirSync(this.artifactsDirFor(run), { recursive: true });
+        writeFileSync(join(this.artifactsDirFor(run), 'review-diff.patch'), diffEvidence, 'utf8');
+      } catch (err) {
+        if (aborted()) { this.finishReview(run, task, 'CANCELED', 'cancelled during diff', this.cancelTaskPhase(runId)); return; }
+        if (err instanceof DiffTooLargeError) {
+          this.writeReviewVerdict(runId, reviewedSha, 'HUMAN_REVIEW_REQUIRED');
+          this.finishReview(run, task, 'AWAITING_MERGE', 'review diff too large; human review required');
+          await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+          return;
+        }
+        this.writeReviewVerdict(runId, reviewedSha, 'ERROR');
+        this.finishReview(run, task, 'AWAITING_MERGE', `review diff unavailable: ${String(err).slice(0, 300)}`);
+        await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+        return;
+      }
+
+      store.transition(runId, 'REVIEWING', 'REVIEWING', { kind: 'review_started', head_sha: reviewedSha, pr_url: run.pr_url ?? task.pr_url });
+      let outcome: Awaited<ReturnType<typeof runReview>> | undefined;
+      let reviewError: unknown;
+      try {
+        outcome = await this.runReviewFn(ctx, this.testEvidenceFor(task, reviewedSha), diffEvidence, {
+          agentConfig: this.config.agent,
+          timeoutMs: this.config.server.max_task_minutes * 60_000,
+          artifactsDir: this.artifactsDirFor(run), signal, headSha: reviewedSha,
+          onSpawn: (pid, identity) => store.updateRunFields(runId, { pid, process_identity: identity }),
+        });
+      } catch (err) { reviewError = err; }
+
+      // Cancel before any verdict row: a cancelled round must not pin the sha.
+      if (aborted()) { this.finishReview(run, task, 'CANCELED', 'cancelled during review', this.cancelTaskPhase(runId)); return; }
+
+      // Tamper check on the materialized site before trusting the verdict.
+      const headAfter = await this.workspace.head(sitePath).catch(() => null);
+      const siteDirty = await this.workspace.isDirty(sitePath).catch(() => true);
+      if (headAfter !== reviewedSha || siteDirty) {
+        this.writeReviewVerdict(runId, reviewedSha, 'ERROR');
+        this.finishReview(run, task, 'AWAITING_MERGE', headAfter !== reviewedSha
+          ? 'review site HEAD moved during review; refusing verdict'
+          : 'review site modified during review; refusing verdict');
+        await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+        return;
+      }
+
+      if (!outcome) {
+        this.writeReviewVerdict(runId, reviewedSha, 'ERROR',
+          reviewError instanceof ReviewInfraError ? reviewError.logPath : undefined);
+        store.transition(runId, 'REVIEWING', 'REVIEWING', { kind: 'review_completed', head_sha: reviewedSha, verdict: 'ERROR', error: String(reviewError) });
+        this.finishReview(run, task, 'AWAITING_MERGE', `review infra: ${String(reviewError).slice(0, 400)}`);
+        await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+        void this.notifyReviewInfra(task, run, '自动评审不可用，转人工评审');
+        return;
+      }
+
+      // --- verdict ------------------------------------------------------------
+      const { result, logPath } = outcome;
+      store.addCheck({ run_id: runId, kind: 'review', command: 'agent (review)', exit_code: null,
+        artifact_path: logPath, verdict: result.verdict, head_sha: reviewedSha });
+      store.transition(runId, 'REVIEWING', 'REVIEWING', { kind: 'review_completed', head_sha: reviewedSha,
+        verdict: result.verdict, risk: result.risk, summary: result.summary, artifact_path: logPath });
+
+      if (result.verdict === 'PASS') {
+        const riskReasons = this.assessRisk(diffEvidence, result.risk);
+        if (riskReasons.length > 0) {
+          if (prNum) {
+            await this.tracker.commentPr(project.repo, prNum, this.riskComment(result, riskReasons))
+              .catch((err) => this.appLog.event('pr_comment_error', { run: runId, error: String(err) }));
+          }
+          await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+          this.finishReview(run, task, 'AWAITING_MERGE', `review PASS but high risk: ${riskReasons.join('; ')}`);
+          return;
+        }
+        if (prNum && this.config.approvals.auto_merge.enabled) {
+          await this.autoMergeReview(run, task, project, prNum, reviewedSha);
+          return;
+        }
+        this.finishReview(run, task, 'AWAITING_MERGE', 'review PASS');
+        return;
+      }
+
+      if (result.verdict === 'HUMAN_REVIEW_REQUIRED') {
+        await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+        if (prNum) {
+          await this.tracker.commentPr(project.repo, prNum, this.riskComment(result, ['reviewer requires human judgement']))
+            .catch((err) => this.appLog.event('pr_comment_error', { run: runId, error: String(err) }));
+        }
+        this.finishReview(run, task, 'AWAITING_MERGE', `review requires human: ${result.summary}`);
+        return;
+      }
+
+      // BLOCK
+      const findings = result.findings.filter((f) => f.trim());
+      const budgetLeft = this.store.getTaskById(task.id)!.fix_rounds < this.config.server.retry_limit;
+      if (findings.length > 0 && budgetLeft) {
+        const payload: PendingFix = { head_sha: reviewedSha, summary: result.summary, findings };
+        const spawned = store.tx(() => {
+          // CAS: an out-of-band stop/merge between the abort check and this
+          // write must not be overridden by a fix dispatch.
+          const now = store.getTaskById(task.id);
+          const cancelled = store.getRun(runId)?.cancel_requested === 1;
+          if (!now || now.status !== 'REVIEWING') return false;
+          // A stop in the verdict window: honor the cancel intent — never
+          // leave a REVIEWING task with no live run and nothing to sweep it.
+          if (cancelled) { store.setTaskStatus(task.id, 'CANCELED'); return false; }
+          store.bumpFixRounds(task.id);
+          store.setTaskStatus(task.id, 'DISCOVERED', { pending_fix: JSON.stringify(payload) });
+          return true;
+        });
+        store.endRun(runId, 'BLOCKED', spawned
+          ? `review BLOCK -> fix run spawned: ${result.summary}`
+          : 'review BLOCK; fix spawn skipped — task state changed');
+        if (spawned && prNum) {
+          await this.tracker.commentPr(project.repo, prNum,
+            `## 自动审查：BLOCK\n\n- 摘要：${result.summary}\n\n### Findings\n${findings.map((f) => `- ${f}`).join('\n')}\n\n已派生修复任务。`)
+            .catch((err) => this.appLog.event('pr_comment_error', { run: runId, error: String(err) }));
+        }
+        this.appLog.event('review_block_fix_spawned', { run: runId, task: task.id, head_sha: reviewedSha, spawned });
+        return;
+      }
+      this.finishReview(run, task, 'BLOCKED', findings.length === 0
+        ? `review BLOCK without concrete findings: ${result.summary}; no automatic repair`
+        : `review blocked, fix budget exhausted: ${result.summary}`);
+    } finally {
+      if (prNum && labelApplied) await this.setPrLabel(project.repo, prNum, false);
+      if (tempWorktree) {
+        await this.workspace.removeWorktree(project.local_repo, tempWorktree)
+          .catch((err) => this.appLog.event('review_site_cleanup_error', { run: runId, error: String(err) }));
+      }
+    }
+  }
+
+  /**
+   * Terminal write for review runs. Unlike finish() it never overrides a
+   * task status already moved past REVIEWING (e.g. mergeReconcile COMPLETED
+   * while the verdict was being written).
+   */
+  private finishReview(run: RunRow, task: TaskRow, finalPhase: Phase, reason?: string, taskPhase: Phase = finalPhase) {
+    if (!TERMINAL_FOR_TASK.includes(finalPhase)) throw new Error(`finishReview() requires terminal phase, got ${finalPhase}`);
+    try {
+      this.store.tx(() => {
+        this.store.endRun(run.run_id, finalPhase, reason);
+        const current = this.store.getTaskById(task.id);
+        if (current && current.status === 'REVIEWING') {
+          this.store.setTaskStatus(task.id, taskPhase);
+        }
+      });
+      if (ATTENTION_PHASES.includes(finalPhase)) void this.notifyTaskAttention(task, finalPhase, reason);
+      if (finalPhase === 'BLOCKED' || finalPhase === 'BLOCKED_APPROVAL_CHANGED') {
+        void this.labelQuietly(task.repo, task.issue_number, 'add', 'agent-blocked');
+      }
+      void this.labelQuietly(task.repo, task.issue_number, 'remove', 'agent-running');
+    } catch (err) {
+      this.appLog.event('finish_error', { run: run.run_id, error: String(err) });
+      this.recordError('finish_error', err);
+    }
+  }
+
+  /** Review-run auto-merge: ready + squash pinned to the reviewed sha. */
+  private async autoMergeReview(run: RunRow, task: TaskRow, project: ProjectConfig, prNumber: number, headSha: string) {
+    try {
+      const actual = await this.tracker.getPrHeadSha(project.repo, prNumber);
+      if (actual !== headSha) {
+        this.finishReview(run, task, 'CANCELED', `PR head moved before merge; re-dispatch on new sha`, this.cancelTaskPhase(run.run_id));
+        return;
+      }
+      await this.tracker.markPrReady(project.repo, prNumber);
+      await this.tracker.mergePr(project.repo, prNumber, headSha);
+      const state = await this.tracker.getPrState(project.repo, prNumber);
+      if (state !== 'MERGED') {
+        this.finishReview(run, task, 'AWAITING_MERGE', 'auto-merge did not confirm MERGED; waiting for a human');
+        return;
+      }
+      this.store.transition(run.run_id, 'REVIEWING', 'REVIEWING', { kind: 'auto_merged', head_sha: headSha });
+      this.finishReview(run, task, 'COMPLETED', 'auto-merged low-risk PR');
+      await this.notifyTaskCompleted(task);
+      await this.cleanupMerged(project, task);
+    } catch (err) {
+      this.finishReview(run, task, 'AWAITING_MERGE', `auto-merge failed: ${String(err).slice(0, 300)}`);
+    }
+  }
+
+  /**
+   * User-requested cancel ends the task; a bare signal abort (shutdown) just
+   * parks it back at AWAITING_MERGE so the review can re-dispatch later.
+   */
+  private cancelTaskPhase(runId: string): Phase {
+    return this.store.getRun(runId)?.cancel_requested === 1 ? 'CANCELED' : 'AWAITING_MERGE';
+  }
+
+  /** Verdict row shared by all review exit paths that reach a conclusion. */
+  private writeReviewVerdict(runId: string, headSha: string, verdict: string, artifactPath?: string) {
+    this.store.addCheck({
+      run_id: runId, kind: 'review', command: 'agent (review)', exit_code: null,
+      artifact_path: artifactPath, verdict, head_sha: headSha,
+    });
+  }
+
+  /** Issue-side note when auto-review cannot run — never throws. */
+  private async notifyReviewInfra(task: TaskRow, run: RunRow, detail: string) {
+    try {
+      await this.tracker.addComment(task.repo, task.issue_number,
+        `agent-control: ${detail}。\nrun：\`${run.run_id}\``);
+    } catch (err) {
+      this.appLog.event('comment_error', { task: task.id, error: String(err) });
     }
   }
 
@@ -655,7 +951,7 @@ export class Engine {
     return res;
   }
 
-  private async callChecks(run: RunRow, log: RunLog, worktreePath: string, signal: AbortSignal): Promise<ChecksSummary> {
+  private async callChecks(run: RunRow, log: RunLog, worktreePath: string, signal: AbortSignal, headSha?: string | null): Promise<ChecksSummary> {
     const project = this.projectFor((this.store.getTaskById(run.task_id))!.repo)!;
     const summary = await this.runChecksFn(
       project.checks, worktreePath,
@@ -668,17 +964,17 @@ export class Engine {
         run_id: run.run_id, kind: 'check', command: o.command,
         exit_code: o.exitCode, artifact_path: o.logPath,
         verdict: summary.aborted ? 'CANCELED' : summary.infraError ? 'ERROR' : o.exitCode === 0 ? 'PASS' : 'FAIL',
+        head_sha: headSha,
       });
     });
     log.event('checks', { run: run.run_id, ok: summary.ok, count: summary.outcomes.length });
     return summary;
   }
 
-  private testEvidenceFor(run: RunRow, headSha?: string | null): string {
-    const checks = this.store.checksForRun(run.run_id).filter((c) => c.kind === 'check');
-    const latest = [...new Map(checks.map((c) => [c.command, c])).values()];
-    const prefix = headSha ? `提交 SHA: ${headSha}\n` : '';
-    if (checks.length === 0) return `${prefix}(no checks recorded)`;
+  private testEvidenceFor(task: TaskRow, headSha: string): string {
+    const latest = this.store.checkEvidenceForSha(task.id, headSha);
+    const prefix = `提交 SHA: ${headSha}\n`;
+    if (latest.length === 0) return `${prefix}(no checks recorded)`;
     return prefix + latest
       .map((c) => `命令: ${c.command}\n结果: ${c.verdict} (exit ${c.exit_code ?? 'n/a'})\n日志: ${c.artifact_path ?? '-'}\n日志尾部:\n${this.checkLogTail(c.artifact_path)}`)
       .join('\n\n');
@@ -798,31 +1094,6 @@ export class Engine {
     ].join('\n');
   }
 
-  /** Ready + squash-merge pinned to the reviewed SHA; any doubt falls back to a human. */
-  private async autoMerge(
-    run: RunRow, task: TaskRow, project: ProjectConfig, prNumber: number, prUrl: string, headSha: string,
-  ) {
-    try {
-      const actual = await this.tracker.getPrHeadSha(project.repo, prNumber);
-      if (actual !== headSha) {
-        this.finish(run, task, 'BLOCKED', 'auto-merge aborted: PR head moved since review', { pr_url: prUrl });
-        return;
-      }
-      await this.tracker.markPrReady(project.repo, prNumber);
-      await this.tracker.mergePr(project.repo, prNumber, headSha);
-      const state = await this.tracker.getPrState(project.repo, prNumber);
-      if (state !== 'MERGED') {
-        this.finish(run, task, 'AWAITING_MERGE', 'auto-merge did not confirm MERGED; waiting for a human', { pr_url: prUrl });
-        return;
-      }
-      this.store.transition(run.run_id, 'REVIEWING', 'REVIEWING', { kind: 'auto_merged', head_sha: headSha, pr_url: prUrl });
-      this.finish(run, task, 'COMPLETED', 'auto-merged low-risk PR', { pr_url: prUrl });
-      await this.cleanupMerged(project, task);
-    } catch (err) {
-      this.finish(run, task, 'AWAITING_MERGE', `auto-merge failed: ${String(err).slice(0, 300)}`, { pr_url: prUrl });
-    }
-  }
-
   private finish(run: RunRow, task: TaskRow, finalPhase: Phase, reason?: string, taskFields?: { pr_url?: string }) {
     if (!TERMINAL_FOR_TASK.includes(finalPhase)) throw new Error(`finish() requires terminal phase, got ${finalPhase}`);
     try {
@@ -847,7 +1118,7 @@ export class Engine {
   private setTaskStatus(
     taskId: number,
     status: Phase,
-    fields?: { approved_hash?: string | null; branch?: string | null; pr_url?: string | null },
+    fields?: { approved_hash?: string | null; branch?: string | null; pr_url?: string | null; pending_fix?: string | null },
   ) {
     this.store.setTaskStatus(taskId, status, fields);
     if (ATTENTION_PHASES.includes(status)) {
@@ -908,8 +1179,9 @@ export class Engine {
    * independent and best-effort — a cleanup failure never un-completes.
    */
   private async cleanupMerged(project: ProjectConfig, task: TaskRow) {
-    const last = this.store.runsForTask(task.id).at(-1);
-    const worktree = last?.workspace ?? this.worktreePathFor(project, task);
+    // The cleanup target is the CODING worktree — never a review run's
+    // materialized site (the review's own finally already removes that).
+    const worktree = this.store.lastCodeWorkspace(task.id) ?? this.worktreePathFor(project, task);
     const done: string[] = [];
     const step = async (name: string, fn: () => Promise<unknown>) => {
       try {

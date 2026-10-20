@@ -119,6 +119,26 @@ export class GitHubTracker {
     return r.state === 'CLOSED' ? 'CLOSED' : 'OPEN';
   }
 
+  /** One-shot PR snapshot for the review dispatcher: state + pinned head + labels. */
+  async getPrDetails(repo: string, prNumber: number): Promise<{
+    state: 'MERGED' | 'CLOSED' | 'OPEN';
+    headSha: string;
+    labels: string[];
+    isDraft: boolean;
+    url: string;
+  }> {
+    const r = await this.ghJson<{ state: string; headRefOid: string; labels: { name: string }[]; isDraft: boolean; url: string }>([
+      'pr', 'view', String(prNumber), '-R', repo, '--json', 'state,headRefOid,labels,isDraft,url',
+    ]);
+    return {
+      state: r.state === 'MERGED' ? 'MERGED' : r.state === 'CLOSED' ? 'CLOSED' : 'OPEN',
+      headSha: r.headRefOid,
+      labels: (r.labels ?? []).map((l) => l.name),
+      isDraft: r.isDraft,
+      url: r.url,
+    };
+  }
+
   async createDraftPr(
     repo: string,
     opts: { head: string; base: string; title: string; body: string },

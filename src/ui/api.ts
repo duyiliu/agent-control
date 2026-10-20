@@ -36,7 +36,7 @@ export interface HealthInfo {
   uptime_s: number;
   poll_interval_seconds: number;
   active_runs_in_process: number;
-  active_runs: { run_id: string; task_id: number; phase: Phase; heartbeat_at: string }[];
+  active_runs: { run_id: string; task_id: number; kind: string; phase: Phase; heartbeat_at: string }[];
   last_error: { at: string; kind: string; error: string } | null;
 }
 
@@ -107,7 +107,7 @@ export function healthPayload(deps: UiDeps): HealthInfo {
     poll_interval_seconds: deps.config.server.poll_interval_seconds,
     active_runs_in_process: deps.activeCount(),
     active_runs: store.activeRuns().map((r) => ({
-      run_id: r.run_id, task_id: r.task_id, phase: r.phase, heartbeat_at: r.heartbeat_at,
+      run_id: r.run_id, task_id: r.task_id, kind: r.kind, phase: r.phase, heartbeat_at: r.heartbeat_at,
     })),
     last_error: lastError,
   };

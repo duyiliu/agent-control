@@ -121,6 +121,22 @@ export class GitWorkspace {
     await this.git(args, worktreePath, 180_000);
   }
 
+  /** Fetch a branch so a remote head sha resolves locally. */
+  async fetchBranch(repoDir: string, branch: string): Promise<void> {
+    await this.git(['fetch', 'origin', branch], repoDir, 120_000);
+  }
+
+  /**
+   * Materialize one commit as a detached worktree — the review site for a PR
+   * head sha, independent of any coding worktree state.
+   */
+  async addDetachedWorktree(repoDir: string, sha: string, worktreePath: string): Promise<string> {
+    const wt = resolve(worktreePath);
+    mkdirSync(dirname(wt), { recursive: true });
+    await this.git(['worktree', 'add', '--detach', wt, sha], repoDir, 120_000);
+    return wt;
+  }
+
   /** Remove a worktree after its PR merged. Forced: merged work is upstream. */
   async removeWorktree(repoDir: string, worktreePath: string): Promise<void> {
     await this.git(['worktree', 'remove', '--force', worktreePath], repoDir);

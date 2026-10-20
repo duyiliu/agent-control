@@ -47,6 +47,7 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
   const o = asObj(v, name);
   const checksRaw = o['checks'] ?? [];
   if (!Array.isArray(checksRaw)) fail(`${name}.checks must be an array`);
+  if (o['review'] !== undefined) fail(`${name}.review was removed — every published PR head is auto-reviewed`);
   return {
     repo: asStr(o['repo'], `${name}.repo`),
     local_repo: resolve(asStr(o['local_repo'], `${name}.local_repo`)),
@@ -119,6 +120,7 @@ export function loadConfig(path: string): AppConfig {
         enabled: asBool(uiRaw['enabled'] ?? true, 'server.ui.enabled'),
         host: uiHost,
         port: asNum(uiRaw['port'] ?? 8787, 'server.ui.port', 1),
+        token: uiRaw['token'] !== undefined ? asStr(uiRaw['token'], 'server.ui.token') : undefined,
       },
     },
     projects: projectsRaw.map(parseProject),

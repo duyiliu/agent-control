@@ -6,10 +6,11 @@ server:
   worktree_root: C:/path/to/agent-control-data/worktrees
   database: C:/path/to/agent-control-data/agent-control.db
   logs_dir: C:/path/to/agent-control-data/logs
-  ui:                              # embedded web dashboard (loopback only)
+  ui:                              # embedded web dashboard
     enabled: true
     host: 127.0.0.1
     port: 8787
+    # token: <random-secret>        # required when exposed beyond loopback; gates all routes
 
 projects:
   - repo: your-org/your-sandbox-repo
@@ -17,7 +18,7 @@ projects:
     base_branch: main
     ready_label: agent-ready
     branch_prefix: agent/issue-
-    checks:
+    checks:                          # 每个发布的 PR head 都会自动派发独立评审 run（无开关）
       - argv: [node, --test]
         timeout_seconds: 300
 

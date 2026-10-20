@@ -24,6 +24,8 @@ function fakeWorkspace(calls?: string[]): GitWorkspace {
     aheadCount: async () => 1,
     diffVsBase: async () => 'diff',
     push: async () => {},
+    fetchBranch: async () => {},
+    addDetachedWorktree: async (_repo: string, _sha: string, p: string) => p,
     removeWorktree: async (_repo: string, p: string) => { calls?.push(`rm-wt:${p}`); },
     deleteLocalBranch: async (_repo: string, b: string) => { calls?.push(`del-local:${b}`); },
     deleteRemoteBranch: async (_repo: string, b: string) => { calls?.push(`del-remote:${b}`); },
@@ -131,10 +133,12 @@ test('AC1: happy path produces exactly one draft PR and awaits merge', async () 
     assert.ok(env.tracker.labelsAdded.some(([n, l]) => n === 1 && l === 'agent-pr'));
     const run = store.runsForTask(task.id)[0]!;
     const phases = store.eventsForRun(run.run_id).filter((e) => e.from_phase !== e.to_phase).map((e) => e.to_phase);
-    assert.deepEqual(phases, ['CLAIMED', 'PREPARING', 'RUNNING', 'VERIFYING', 'PUBLISHING_PR', 'REVIEWING', 'AWAITING_MERGE']);
+    assert.deepEqual(phases, ['CLAIMED', 'PREPARING', 'RUNNING', 'VERIFYING', 'PUBLISHING_PR', 'AWAITING_MERGE']);
 
-    await tickAndDrain(engine);
-    assert.equal(store.runsForTask(task.id).length, 1);
+    await tickAndDrain(engine); // dispatches the auto review run — no second PR
+    const runs = store.runsForTask(task.id);
+    assert.equal(runs.filter((r) => r.kind === 'code').length, 1);
+    assert.equal(runs.filter((r) => r.kind === 'review').length, 1);
     assert.equal(env.tracker.prCreated, 1);
   } finally { env.done(); }
 });
@@ -255,7 +259,7 @@ test('AC4b: check fails once, fix succeeds → AWAITING_MERGE', async () => {
   } finally { env.done(); }
 });
 
-test('AC5: review BLOCK → fix → re-review → PASS', async () => {
+test('AC5: review BLOCK → fix run → re-review → PASS', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(6, { ...ISSUE });
@@ -265,15 +269,23 @@ test('AC5: review BLOCK → fix → re-review → PASS', async () => {
       reviews++;
       return { result: { verdict: reviews === 1 ? 'BLOCK' : 'PASS', risk: 'low', summary: 'r', findings: reviews === 1 ? ['parser.ts: empty input crashes; validate with an empty-input test'] : [] }, logPath: 'l' };
     };
-    const { store, engine } = makeEngine(env, { review, checks: async () => { checks++; return checksOk(); } });
-    await tickAndDrain(engine);
-    const task = store.getTask('me/sandbox', 6)!;
+    const ws = fakeWorkspace();
+    ws.head = async () => env.tracker.headSha;
+    const { store, engine } = makeEngine(env, { review, checks: async () => { checks++; return checksOk(); }, workspace: ws });
+    await tickAndDrain(engine); // code run → publish → AWAITING_MERGE
+    await tickAndDrain(engine); // review #1 → BLOCK → pending_fix → DISCOVERED
+    let task = store.getTask('me/sandbox', 6)!;
+    assert.equal(task.status, 'DISCOVERED');
+    assert.ok(task.pending_fix);
+    env.tracker.headSha = 'sha-2'; // the fix produces a new head
+    await tickAndDrain(engine); // fix code run → publish → AWAITING_MERGE
+    await tickAndDrain(engine); // review #2 on the new sha → PASS
+    task = store.getTask('me/sandbox', 6)!;
     assert.equal(task.status, 'AWAITING_MERGE');
     assert.equal(reviews, 2);
     assert.equal(checks, 2, 'review-driven fixes must rerun checks');
-    const phases = store.eventsForRun(store.runsForTask(task.id)[0]!.run_id)
-      .filter((e) => e.from_phase !== e.to_phase).map((e) => e.to_phase);
-    assert.deepEqual(phases.slice(4), ['PUBLISHING_PR', 'REVIEWING', 'FIXING', 'VERIFYING', 'PUBLISHING_PR', 'REVIEWING', 'AWAITING_MERGE']);
+    assert.equal(store.runsForTask(task.id).length, 4); // code + review + fix-code + review#2
+    assert.equal(store.getTask('me/sandbox', 6)!.fix_rounds, 1);
   } finally { env.done(); }
 });
 
@@ -286,37 +298,51 @@ test('review BLOCK without findings stops without a blind repair', async () => {
       coder: async () => { coderCalls++; return okCoder(); },
       review: async () => ({ result: { verdict: 'BLOCK', risk: 'low', summary: 'unclear concern', findings: [] }, logPath: 'r' }),
     });
-    await tickAndDrain(engine);
+    await tickAndDrain(engine); // code run
+    await tickAndDrain(engine); // review run → BLOCK, no findings
     const task = store.getTask('me/sandbox', 17)!;
     assert.equal(task.status, 'BLOCKED');
     assert.equal(coderCalls, 1);
-    assert.equal(store.runsForTask(task.id)[0]!.fix_count, 0);
+    const runs = store.runsForTask(task.id);
+    assert.equal(runs.length, 2);
+    assert.equal(runs[1]!.kind, 'review');
+    assert.equal(runs[1]!.phase, 'BLOCKED');
+    assert.ok(store.checksForRun(runs[1]!.run_id).some((c) => c.kind === 'review' && c.verdict === 'BLOCK' && c.head_sha === 'head-sha'));
   } finally { env.done(); }
 });
 
-test('review infrastructure failure does not consume fix budget', async () => {
+test('review infrastructure failure degrades to human review, not task failure', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(18, { ...ISSUE });
     const { store, engine } = makeEngine(env, { review: async () => { throw new Error('review output unavailable'); } });
     await tickAndDrain(engine);
+    await tickAndDrain(engine);
     const task = store.getTask('me/sandbox', 18)!;
-    assert.equal(task.status, 'FAILED');
-    assert.equal(store.runsForTask(task.id)[0]!.fix_count, 0);
+    // An un-runnable review never punishes the code: ERROR verdict pins the
+    // sha so it is not re-dispatched, and the task waits for a human.
+    assert.equal(task.status, 'AWAITING_MERGE');
+    assert.equal(task.fix_rounds, 0);
+    const runs = store.runsForTask(task.id);
+    assert.equal(runs.length, 2);
+    assert.ok(store.checksForRun(runs[1]!.run_id).some((c) => c.kind === 'review' && c.verdict === 'ERROR'));
+    assert.ok(env.tracker.labelsAdded.some(([n, l]) => n === 18 && l === 'agent-high-risk'));
     assert.equal(env.tracker.prCreated, 1);
     assert.equal(env.tracker.merged.length, 0);
   } finally { env.done(); }
 });
 
-test('AC5b: HUMAN_REVIEW_REQUIRED → BLOCKED, PR stays draft', async () => {
+test('AC5b: HUMAN_REVIEW_REQUIRED → AWAITING_MERGE + high-risk, PR stays draft', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(7, { ...ISSUE });
     const { store, engine } = makeEngine(env, { review: reviewHuman });
     await tickAndDrain(engine);
-    assert.equal(store.getTask('me/sandbox', 7)!.status, 'BLOCKED');
+    await tickAndDrain(engine);
+    assert.equal(store.getTask('me/sandbox', 7)!.status, 'AWAITING_MERGE');
     assert.equal(env.tracker.prCreated, 1);
     assert.equal(env.tracker.merged.length, 0);
+    assert.ok(env.tracker.labelsAdded.some(([n, l]) => n === 7 && l === 'agent-high-risk'));
   } finally { env.done(); }
 });
 
@@ -337,7 +363,8 @@ test('review evidence carries the check log tail, not just the verdict', async (
         return { result: { verdict: 'PASS', risk: 'low', summary: 'ok', findings: [] } as ReviewResult, logPath: 'r' };
       }) as ReviewFn,
     });
-    await tickAndDrain(engine);
+    await tickAndDrain(engine); // code run
+    await tickAndDrain(engine); // review run reads cross-run sha-bound evidence
     assert.equal(store.getTask('me/sandbox', 41)!.status, 'AWAITING_MERGE');
     assert.equal(seen.length, 1);
     assert.match(seen[0]!, /3 passed, 0 failed/); // raw output, not just "PASS (exit 0)"
@@ -565,7 +592,7 @@ test('approval drift before repair stops without another coder call', async () =
   } finally { env.done(); }
 });
 
-test('review tampering is blocked even when reviewer throws', async () => {
+test('review tampering is refused even when reviewer throws', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(22, { ...ISSUE });
@@ -575,9 +602,12 @@ test('review tampering is blocked even when reviewer throws', async () => {
       review: async () => { dirty = true; throw new Error('review failed'); },
     });
     await tickAndDrain(engine);
+    await tickAndDrain(engine);
     const task = store.getTask('me/sandbox', 22)!;
-    assert.equal(task.status, 'BLOCKED');
-    assert.match(store.runsForTask(task.id)[0]!.reason ?? '', /modified during review/);
+    assert.equal(task.status, 'AWAITING_MERGE');
+    const reviewRun = store.runsForTask(task.id).find((r) => r.kind === 'review')!;
+    assert.match(reviewRun.reason ?? '', /modified during review/);
+    assert.ok(store.checksForRun(reviewRun.run_id).some((c) => c.verdict === 'ERROR'));
     assert.equal(env.tracker.merged.length, 0);
   } finally { env.done(); }
 });
@@ -630,7 +660,7 @@ test('successful checks that change HEAD cannot authorize review or publish', as
   } finally { env.done(); }
 });
 
-test('recovering publish without in-memory evidence reruns checks and review', async () => {
+test('recovering publish without in-memory evidence reruns checks; review is a separate run', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(27, { ...ISSUE });
@@ -648,7 +678,10 @@ test('recovering publish without in-memory evidence reruns checks and review', a
     engine.resumeRun(run.run_id);
     for (let i = 0; i < 150 && engine.activeCount(); i++) await sleep(20);
     assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_MERGE');
-    assert.equal(coder, 0); assert.equal(checks, 1); assert.equal(reviews, 1);
+    assert.equal(coder, 0); assert.equal(checks, 1); assert.equal(reviews, 0);
+    await tickAndDrain(engine); // review is dispatched separately against the PR head
+    assert.equal(reviews, 1);
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_MERGE');
   } finally { env.done(); }
 });
 
@@ -659,7 +692,7 @@ test('truncated captured diff is not sent for automatic review', async () => {
   await assert.rejects(ws.diffVsBase('.', 'main'), DiffTooLargeError);
 });
 
-test('oversized review diff blocks for a human instead of failing the run', async () => {
+test('oversized review diff degrades to human review instead of failing', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(31, { ...ISSUE });
@@ -671,9 +704,13 @@ test('oversized review diff blocks for a human instead of failing the run', asyn
       } as unknown as GitWorkspace,
     });
     await tickAndDrain(engine);
+    await tickAndDrain(engine);
     const task = store.getTask('me/sandbox', 31)!;
-    assert.equal(task.status, 'BLOCKED');
-    assert.match(store.runsForTask(task.id)[0]!.reason ?? '', /human review required/);
+    assert.equal(task.status, 'AWAITING_MERGE');
+    const reviewRun = store.runsForTask(task.id).find((r) => r.kind === 'review')!;
+    assert.match(reviewRun.reason ?? '', /human review required|too large/);
+    assert.ok(store.checksForRun(reviewRun.run_id).some((c) => c.verdict === 'HUMAN_REVIEW_REQUIRED'));
+    assert.ok(env.tracker.labelsAdded.some(([n, l]) => n === 31 && l === 'agent-high-risk'));
   } finally { env.done(); }
 });
 
@@ -701,8 +738,9 @@ test('checks and review events bind their evidence to the published SHA', async 
       },
     });
     await tickAndDrain(engine);
+    await tickAndDrain(engine);
     const task = store.getTask('me/sandbox', 30)!;
-    const events = store.eventsForRun(store.runsForTask(task.id)[0]!.run_id);
+    const events = store.runsForTask(task.id).flatMap((r) => store.eventsForRun(r.run_id));
     const details = events.flatMap((event) => event.detail_json ? [JSON.parse(event.detail_json) as Record<string, unknown>] : []);
     assert.ok(details.some((detail) => detail.kind === 'checks_completed' && detail.head_sha === 'head-sha' && detail.ok === true));
     assert.ok(details.some((detail) => detail.kind === 'review_completed' && detail.head_sha === 'head-sha' && detail.verdict === 'PASS'));
@@ -764,4 +802,123 @@ test('workspace ensureWorktree creates and reuses (real git)', async () => {
   } finally {
     try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* temp residue ok */ }
   }
+});
+
+// ---------- review-run terminals (kind=review) ----------
+
+test('AC15: PR head moved mid-review → run CANCELED, task stays AWAITING_MERGE, no verdict row', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(50, { ...ISSUE });
+    const ws = fakeWorkspace();
+    ws.head = async () => env.tracker.headSha;
+    const { store, engine } = makeEngine(env, { workspace: ws });
+    await tickAndDrain(engine); // code run → AWAITING_MERGE
+    const task = store.getTask('me/sandbox', 50)!;
+    // Review run pinned to the old sha; PR head moves before it starts.
+    const run = store.claimRun(task.id, { kind: 'review', headSha: 'sha-old' });
+    store.updateRunFields(run.run_id, { pr_url: task.pr_url, workspace: env.dir });
+    store.setTaskStatus(task.id, 'REVIEWING');
+    env.tracker.headSha = 'sha-new';
+    engine.resumeRun(run.run_id);
+    for (let i = 0; i < 150 && engine.activeCount(); i++) await sleep(20);
+    assert.equal(store.getRun(run.run_id)!.phase, 'CANCELED');
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_MERGE');
+    assert.equal(store.checksForRun(run.run_id).filter((c) => c.kind === 'review').length, 0);
+    // Next tick re-dispatches on the NEW sha and reaches a verdict.
+    await tickAndDrain(engine);
+    const reviewRuns = store.runsForTask(task.id).filter((r) => r.kind === 'review');
+    assert.equal(reviewRuns.length, 2);
+    assert.equal(reviewRuns[1]!.head_sha, 'sha-new');
+    assert.ok(store.checksForRun(reviewRuns[1]!.run_id).some((c) => c.verdict === 'PASS' && c.head_sha === 'sha-new'));
+  } finally { env.done(); }
+});
+
+test('AC19: cancel_requested on a review run cancels task and writes no verdict', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(51, { ...ISSUE });
+    const { store, engine } = makeEngine(env);
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 51)!;
+    const run = store.claimRun(task.id, { kind: 'review', headSha: 'head-sha' });
+    store.updateRunFields(run.run_id, { pr_url: task.pr_url, workspace: env.dir });
+    store.setTaskStatus(task.id, 'REVIEWING');
+    store.requestCancel(run.run_id);
+    engine.resumeRun(run.run_id);
+    for (let i = 0; i < 150 && engine.activeCount(); i++) await sleep(20);
+    assert.equal(store.getRun(run.run_id)!.phase, 'CANCELED');
+    assert.equal(store.getTaskById(task.id)!.status, 'CANCELED');
+    assert.equal(store.checksForRun(run.run_id).filter((c) => c.kind === 'review').length, 0);
+  } finally { env.done(); }
+});
+
+test('AC14: fix run that produces no new commits is a dead end, not silent', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(52, { ...ISSUE });
+    const { store, engine } = makeEngine(env);
+    await tickAndDrain(engine); // publish at head-sha
+    const task = store.getTask('me/sandbox', 52)!;
+    // Simulate a review-BLOCK pending fix whose fix changes nothing.
+    store.setTaskStatus(task.id, 'DISCOVERED', {
+      pending_fix: JSON.stringify({ head_sha: 'head-sha', summary: 'block', findings: ['f1'] }),
+    });
+    await tickAndDrain(engine);
+    const t2 = store.getTaskById(task.id)!;
+    assert.equal(t2.status, 'BLOCKED');
+    const fixRun = store.runsForTask(task.id).at(-1)!;
+    assert.equal(fixRun.kind, 'code');
+    assert.match(fixRun.reason ?? '', /no new commits/);
+  } finally { env.done(); }
+});
+
+test('AC04: review PASS + low risk + auto_merge enabled merges and completes', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(53, { ...ISSUE });
+    env.config.approvals.auto_merge.enabled = true;
+    const { store, engine } = makeEngine(env);
+    await tickAndDrain(engine); // code run
+    await tickAndDrain(engine); // review run → PASS → merge
+    const task = store.getTask('me/sandbox', 53)!;
+    assert.equal(task.status, 'COMPLETED');
+    assert.equal(env.tracker.merged.length, 1);
+  } finally { env.done(); }
+});
+
+test('AC11: PR merged mid-review finalizes task COMPLETED', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(54, { ...ISSUE });
+    const { store, engine } = makeEngine(env);
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 54)!;
+    const run = store.claimRun(task.id, { kind: 'review', headSha: 'head-sha' });
+    store.updateRunFields(run.run_id, { pr_url: task.pr_url, workspace: env.dir });
+    store.setTaskStatus(task.id, 'REVIEWING');
+    const prNum = Number(task.pr_url!.match(/pull\/(\d+)/)![1]);
+    env.tracker.prStates.set(prNum, 'MERGED');
+    engine.resumeRun(run.run_id);
+    for (let i = 0; i < 150 && engine.activeCount(); i++) await sleep(20);
+    assert.equal(store.getRun(run.run_id)!.phase, 'COMPLETED');
+    assert.equal(store.getTaskById(task.id)!.status, 'COMPLETED');
+  } finally { env.done(); }
+});
+
+test('AC08: a sha with any verdict row is never re-reviewed', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(55, { ...ISSUE });
+    let reviews = 0;
+    const { store, engine } = makeEngine(env, {
+      review: async () => { reviews++; return { result: { verdict: 'PASS', risk: 'low', summary: 'ok', findings: [] }, logPath: 'r' }; },
+    });
+    await tickAndDrain(engine);
+    await tickAndDrain(engine); // review PASS recorded
+    await tickAndDrain(engine);
+    await tickAndDrain(engine);
+    assert.equal(reviews, 1);
+    assert.equal(store.runsForTask(store.getTask('me/sandbox', 55)!.id).filter((r) => r.kind === 'review').length, 1);
+  } finally { env.done(); }
 });

@@ -59,6 +59,8 @@ npm run ac -- start                           # 启动常驻调度
 http://127.0.0.1:8788     # 端口以 agent-control.yaml 的 server.ui.port 为准（默认 8787）
 ```
 
+UI 能停/重跑任务、读日志目录，默认无鉴权、只应绑 loopback。**暴露到非本机入口（内网穿透、反代）前必须配 `server.ui.token`**——配置后所有路由（含静态资源）要求鉴权：`?token=` 一次种 HttpOnly cookie、`Authorization: Bearer`、或已种的 `ac_ui_token` cookie，未鉴权访问 API 得 401 JSON、访问页面得极简 token 输入页。
+
 - **五列看板**：Queued → In Progress（7 个活跃相位聚合，卡片显示具体阶段）→ Awaiting Merge → Done → Needs Attention（BLOCKED/FAILED/RECOVERY/CANCELED）。卡片带 repo#issue、相位徽章、实时运行时长、PR 链接；5 秒自动刷新。
 - **详情抽屉**：点卡片右侧滑出——相位时间线（`run_events`）、checks 结果（`check_results`）、修复轮次；artifact（测试日志、review 结论、diff.patch、`run-*.jsonl`）点击弹窗查看，`.jsonl` 逐行解析成事件流——服务端强制路径必须落在 `logs_dir` 内，穿越访问返回 403。
 - **操作**：Stop（= `stop`，一个轮询周期内安全取消）/ Retry（= `retry`，以当前 Issue 正文重新审批入队），均有确认弹窗。
@@ -99,7 +101,7 @@ schtasks /delete /tn agent-control  # 卸载
    npm run ac -- runs <issue>  # 单任务事件时间线 + 证据路径
    ```
    原始证据在 `<数据目录>\logs\`：`agent-control.jsonl` 事件流 + 每轮 artifacts（agent 事件、测试日志、review 结论、diff.patch）。
-3. **收口**：checks 全过 → 自动 push 出 Draft PR + `agent-pr` 标签 → 对 PR 做独立只读 Review；通过后等待合并，高危或阻塞转人工。GitHub 上打开 PR → Ready for review → 审完 Merge。调度器检测到 merged → `COMPLETED` → 自动删 worktree/分支。
+3. **收口**：checks 全过 → 自动 push 出 Draft PR + `agent-pr` 标签 → 编码 run 结束于 `AWAITING_MERGE`。调度器随后对该 PR head 自动派发**独立评审 run**（一次性只读 reviewer，所有 PR 统一自动评审、无开关）：PASS 低风险可自动合并，高风险转人工，BLOCK 派生修复 run。GitHub 上打开 PR → Ready for review → 审完 Merge。调度器检测到 merged → `COMPLETED` → 自动删 worktree/分支。
 4. **异常**：
 
    | 情况 | 表现 | 处理 |
@@ -111,10 +113,10 @@ schtasks /delete /tn agent-control  # 卸载
 
 ### 质量闸门与人工接管
 
-- 任意代码修复后均重新执行 checks，再进入独立只读 Review；测试、Review 和发布前都会检查工作区与 HEAD，发布不再兜底提交新改动。
-- 每次检查开始/完成、Review 开始/完成、进入修复和发布 PR 时，`run_events.detail_json` 记录关联提交 SHA；Review 提示与测试证据、PR 正文也带该 SHA，便于追溯被验证、审查和发布的代码版本。
-- 每次 Review（包括一次失败重试）使用独立证据文件。缺失或无效 JSON 只重试 reviewer 一次，仍失败则 `FAILED`，不会让 coder 为格式或工具故障消耗修复次数。
-- Review 仅对有证据的正确性、验收或越界问题返回 `BLOCK`，每条 finding 应包含位置、触发条件、影响和验证方式；风格偏好及可选重构不阻塞。无具体 finding、高风险或证据不完整时停止并等待人工处理。
+- 任意代码修复后均重新执行 checks；评审是独立 run（`kind='review'`），评审对象是 PR 的 head sha——评审现场为该 sha 的本地物化（复用编码 worktree 或 detached worktree），评审后校验 HEAD 与干净状态，被改动即拒绝结论。
+- 每次检查开始/完成、评审开始/完成、进入修复和发布 PR 时，`run_events.detail_json` 记录关联提交 SHA；checks 与 review 结论行也写入 `check_results.head_sha`，同 sha 已有任何评审结论即不再重复派发；PR head 移动则放弃当轮不写结论、按新 sha 重派。
+- 评审基础设施不可用（现场物化失败、diff 不可得、reviewer 异常）记 `ERROR` 结论并降级人工（`AWAITING_MERGE` + `agent-high-risk`），不消耗修复预算、不惩罚编码成果。
+- Review 仅对有证据的正确性、验收或越界问题返回 `BLOCK`；BLOCK 且有 findings 且任务级修复预算未耗尽时写入 `pending_fix` 派生冷启动修复 run，否则 `BLOCKED` 转人工。修复 run 若未产生新提交（与评审 sha 相同）判死端 `BLOCKED`，不会无声卡住。
 - checks 的命令启动失败、超时或异常终止记为基础设施错误，不自动修改业务代码。Windows 上 `npm`/`npx` 使用 Node 入口启动，未知 `.cmd`/`.bat` 需显式配置可执行入口，不启用通用 shell。
 - Stop 独立按 `cancel_poll_seconds`（默认 5 秒）检查，取消信号传递到测试进程。调度 tick 不重叠，慢速 GitHub 请求不阻挡本地取消。
 - 恢复时 GitHub 查询失败不等于授权撤销，不关闭 PR；进入 `RECOVERY_REQUIRED` 并保留现场。人工 Retry 也会检查旧 PID 身份和 worktree 孤儿进程，无法证明已退出则拒绝重试；若仍有 `agent-running` 标签，需确认无其它调度器占用后再人工移除过期标签。
@@ -135,7 +137,7 @@ schtasks /delete /tn agent-control  # 卸载
 
 ## 状态机
 
-`DISCOVERED → CLAIMED → PREPARING → RUNNING → VERIFYING ↔ FIXING → PUBLISHING_PR → REVIEWING ↔ FIXING → AWAITING_MERGE → COMPLETED`；首次发布后，REVIEWING 触发的修复会重跑 checks 并通过 `PUBLISHING_PR` 复用已有 PR，不会新建。任意运行相位可落入 `BLOCKED / FAILED / CANCELED / RECOVERY_REQUIRED`。所有迁移写入 `run_events`，测试与 Review 证据写入 `check_results`。
+编码 run：`DISCOVERED → CLAIMED → PREPARING → RUNNING → VERIFYING ↔ FIXING → PUBLISHING_PR → AWAITING_MERGE → COMPLETED`（checks 失败的 FIXING 环路保留）。评审 run（`kind='review'`）：`CLAIMED → REVIEWING → 终态`，绑定 PR head sha；BLOCK 且预算内时经 `pending_fix` 派生新的编码 run（冷启动修复，计任务级 `fix_rounds` 预算）。任意运行相位可落入 `BLOCKED / FAILED / CANCELED / RECOVERY_REQUIRED`。所有迁移写入 `run_events`，测试与评审证据写入 `check_results`（含 `head_sha`）。
 
 ## 与设计的偏差（已记录）
 

@@ -53,6 +53,26 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
       continue;
     }
 
+    if (run.kind === 'review') {
+      // A review run is resumable whenever it still pins a head sha: the
+      // site is re-materialized, no workspace required. Anything else
+      // (missing sha, unknown phase) cannot safely continue.
+      if (run.head_sha && (run.phase === 'CLAIMED' || run.phase === 'REVIEWING')) {
+        if (run.resume_count >= MAX_RESUMES) {
+          markRecoveryRequired(deps, task, run, 'review resume budget exhausted');
+          report.recoveryRequired.push({ run_id: run.run_id, why: 'resume budget' });
+        } else {
+          resume(store, run, run.phase);
+          deps.engine.resumeRun(run.run_id);
+          report.resumed.push(run.run_id);
+        }
+      } else {
+        markRecoveryRequired(deps, task, run, `review run missing head_sha or in unexpected phase ${run.phase}`);
+        report.recoveryRequired.push({ run_id: run.run_id, why: 'unexpected phase' });
+      }
+      continue;
+    }
+
     switch (run.phase) {
       case 'PUBLISHING_PR': {
         const project = deps.config.projects.find((p) => p.repo === task.repo)!;
@@ -89,22 +109,10 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
           const labelled = !!issue && issue.state === 'OPEN' && issue.labels.includes(project.ready_label);
           const hashOk = !!issue && (!task.approved_hash || approvalHash(issue) === task.approved_hash);
           if (labelled && hashOk) {
-            // Review runs after publish now: an existing PR alone is not
-            // evidence that the change was reviewed. Resume the phase
-            // instead of declaring it ready for merge.
-            const reviewed = store.checksForRun(run.run_id)
-              .some((check) => check.kind === 'review' && check.verdict === 'PASS');
-            if (reviewed) {
-              store.endRun(run.run_id, 'AWAITING_MERGE', 'recovered: PR already exists');
-              store.setTaskStatus(task.id, 'AWAITING_MERGE', { pr_url: existing.url });
-            } else if (run.resume_count >= MAX_RESUMES) {
-              markRecoveryRequired(deps, task, run, 'review resume budget exhausted');
-              report.recoveryRequired.push({ run_id: run.run_id, why: 'review resume budget' });
-            } else {
-              resume(store, run, 'REVIEWING');
-              deps.engine.resumeRun(run.run_id);
-              report.resumed.push(run.run_id);
-            }
+            // Publish already happened. Reviews are separate runs now — the
+            // PR goes to AWAITING_MERGE and dispatchReviews picks it up.
+            store.endRun(run.run_id, 'AWAITING_MERGE', 'recovered: PR already exists');
+            store.setTaskStatus(task.id, 'AWAITING_MERGE', { pr_url: existing.url, branch });
           } else {
             try { await deps.tracker.closePr(project.repo, existing.number); } catch { /* best effort */ }
             const phase: Phase = labelled ? 'BLOCKED_APPROVAL_CHANGED' : 'CANCELED';
@@ -126,8 +134,21 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
         break;
       }
 
-      case 'VERIFYING':
       case 'REVIEWING': {
+        // Legacy pre-v4 code run: review is a separate run kind now. Send it
+        // back through VERIFYING so the code state machine stays consistent.
+        if (run.resume_count >= MAX_RESUMES || !run.workspace || !existsSync(run.workspace)) {
+          markRecoveryRequired(deps, task, run, 'resume budget exhausted or workspace missing');
+          report.recoveryRequired.push({ run_id: run.run_id, why: 'budget/workspace' });
+        } else {
+          resume(store, run, 'VERIFYING');
+          deps.engine.resumeRun(run.run_id);
+          report.resumed.push(run.run_id);
+        }
+        break;
+      }
+
+      case 'VERIFYING': {
         if (run.resume_count >= MAX_RESUMES || !run.workspace || !existsSync(run.workspace)) {
           markRecoveryRequired(deps, task, run, 'resume budget exhausted or workspace missing');
           report.recoveryRequired.push({ run_id: run.run_id, why: 'budget/workspace' });
@@ -191,4 +212,13 @@ function markRecoveryRequired(deps: RecoveryDeps, task: TaskRow, run: RunRow, wh
   deps.store.endRun(run.run_id, 'RECOVERY_REQUIRED', why);
   deps.store.setTaskStatus(task.id, 'RECOVERY_REQUIRED');
   void deps.engine.notifyTaskAttention(task, 'RECOVERY_REQUIRED', why);
+  // A stranded review run must not leave `agent-reviewing` on the PR — that
+  // label suppresses all future review dispatch for the task.
+  if (run.kind === 'review') {
+    const prNum = (run.pr_url ?? task.pr_url)?.match(/\/pull\/(\d+)/)?.[1];
+    if (prNum) {
+      deps.tracker.removePrLabel(task.repo, Number(prNum), 'agent-reviewing')
+        .catch(() => { /* best effort */ });
+    }
+  }
 }

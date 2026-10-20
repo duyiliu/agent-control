@@ -10,7 +10,7 @@ import type {
 } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -133,6 +133,21 @@ export class Store {
           .run(3, now());
       });
     }
+    if (current < 4) {
+      // v4: review becomes a separately-dispatched run kind; evidence is
+      // bound to a commit sha; review-driven fixes travel via pending_fix.
+      this.tx(() => {
+        this.db.exec(`
+          ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'code';
+          ALTER TABLE runs ADD COLUMN head_sha TEXT;
+          ALTER TABLE check_results ADD COLUMN head_sha TEXT;
+          ALTER TABLE tasks ADD COLUMN pending_fix TEXT;
+        `);
+        this.db
+          .prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)')
+          .run(4, now());
+      });
+    }
   }
 
   private txDepth = 0;
@@ -211,12 +226,13 @@ export class Store {
     return this.db.prepare('SELECT * FROM tasks ORDER BY id').all() as unknown as TaskRow[];
   }
 
-  setTaskStatus(id: number, status: Phase, fields?: { approved_hash?: string | null; branch?: string | null; pr_url?: string | null }) {
+  setTaskStatus(id: number, status: Phase, fields?: { approved_hash?: string | null; branch?: string | null; pr_url?: string | null; pending_fix?: string | null }) {
     const sets = ['status = ?', 'updated_at = ?'];
     const vals: (string | number | null)[] = [status, now()];
     if (fields?.approved_hash !== undefined) { sets.push('approved_hash = ?'); vals.push(fields.approved_hash); }
     if (fields?.branch !== undefined) { sets.push('branch = ?'); vals.push(fields.branch); }
     if (fields?.pr_url !== undefined) { sets.push('pr_url = ?'); vals.push(fields.pr_url); }
+    if (fields?.pending_fix !== undefined) { sets.push('pending_fix = ?'); vals.push(fields.pending_fix); }
     vals.push(id);
     this.db.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
   }
@@ -239,7 +255,7 @@ export class Store {
   // ---------- runs ----------
 
   /** Atomically verify no active run exists and create a new attempt. */
-  claimRun(taskId: number): RunRow {
+  claimRun(taskId: number, opts?: { kind?: 'code' | 'review'; headSha?: string }): RunRow {
     return this.tx(() => {
       const active = this.activeRunForTask(taskId);
       if (active) throw new Error(`task ${taskId} already has active run ${active.run_id}`);
@@ -251,11 +267,11 @@ export class Store {
       const t = now();
       this.db
         .prepare(
-          `INSERT INTO runs (run_id, task_id, attempt, phase, started_at, heartbeat_at)
-           VALUES (?, ?, ?, 'CLAIMED', ?, ?)`,
+          `INSERT INTO runs (run_id, task_id, kind, attempt, phase, head_sha, started_at, heartbeat_at)
+           VALUES (?, ?, ?, ?, 'CLAIMED', ?, ?, ?)`,
         )
-        .run(runId, taskId, attempt, t, t);
-      this.insertEvent(runId, null, 'CLAIMED', { attempt });
+        .run(runId, taskId, opts?.kind ?? 'code', attempt, opts?.headSha ?? null, t, t);
+      this.insertEvent(runId, null, 'CLAIMED', { attempt, kind: opts?.kind ?? 'code', head_sha: opts?.headSha ?? null });
       return this.getRun(runId)!;
     });
   }
@@ -325,6 +341,7 @@ export class Store {
       workspace: string | null;
       branch: string | null;
       pr_url: string | null;
+      head_sha: string | null;
       resume_count: number;
       fix_count: number;
     }>,
@@ -378,13 +395,14 @@ export class Store {
     exit_code: number | null;
     artifact_path?: string;
     verdict: string;
+    head_sha?: string | null;
   }): number {
     const res = this.db
       .prepare(
-        `INSERT INTO check_results (run_id, kind, command, exit_code, artifact_path, verdict, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO check_results (run_id, kind, command, exit_code, artifact_path, verdict, head_sha, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(input.run_id, input.kind, input.command, input.exit_code, input.artifact_path ?? null, input.verdict, now());
+      .run(input.run_id, input.kind, input.command, input.exit_code, input.artifact_path ?? null, input.verdict, input.head_sha ?? null, now());
     return Number(res.lastInsertRowid);
   }
 
@@ -394,14 +412,38 @@ export class Store {
       .all(runId) as unknown as CheckResultRow[];
   }
 
-  /** True when any attempt for this task recorded a passing review. */
-  hasReviewPass(taskId: number): boolean {
+  /** True when a review verdict row (any verdict) exists for this head sha. */
+  hasReviewVerdictForSha(taskId: number, headSha: string): boolean {
     return this.db
       .prepare(
         `SELECT 1 FROM check_results c JOIN runs r ON r.run_id = c.run_id
-         WHERE r.task_id = ? AND c.kind = 'review' AND c.verdict = 'PASS' LIMIT 1`,
+         WHERE r.task_id = ? AND c.kind = 'review' AND c.head_sha = ? LIMIT 1`,
       )
-      .get(taskId) !== undefined;
+      .get(taskId, headSha) !== undefined;
+  }
+
+  /**
+   * Check evidence for one head sha across all runs of a task — latest row
+   * per command wins. Review runs consume this to build testEvidence.
+   */
+  checkEvidenceForSha(taskId: number, headSha: string): CheckResultRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT c.* FROM check_results c JOIN runs r ON r.run_id = c.run_id
+         WHERE r.task_id = ? AND c.kind = 'check' AND c.head_sha = ? ORDER BY c.id`,
+      )
+      .all(taskId, headSha) as unknown as CheckResultRow[];
+    return [...new Map(rows.map((c) => [c.command, c])).values()];
+  }
+
+  /** Workspace of the task's most recent code run (review materialization hint). */
+  lastCodeWorkspace(taskId: number): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT workspace FROM runs WHERE task_id = ? AND kind = 'code' AND workspace IS NOT NULL ORDER BY id DESC LIMIT 1`,
+      )
+      .get(taskId) as { workspace: string | null } | undefined;
+    return row?.workspace ?? null;
   }
 
   // ---------- meta ----------

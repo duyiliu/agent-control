@@ -118,7 +118,7 @@ test('crash after PR create with review PASS → AWAITING_MERGE, no second PR', 
   } finally { env.done(); }
 });
 
-test('crash after PR create before review → resumes REVIEWING, not AWAITING_MERGE', async () => {
+test('crash after PR create → AWAITING_MERGE; review dispatches separately', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(1, { title: 't', body: 'b', labels: ['agent-ready'], state: 'OPEN', url: 'u' });
@@ -129,9 +129,26 @@ test('crash after PR create before review → resumes REVIEWING, not AWAITING_ME
       appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [],
       isPidAlive: () => false,
     });
+    assert.deepEqual(report.finalized, [run.run_id]);
+    assert.equal(env.store.getRun(run.run_id)!.phase, 'AWAITING_MERGE');
+    assert.equal(env.store.getTaskById(task.id)!.status, 'AWAITING_MERGE');
+  } finally { env.done(); }
+});
+
+test('stranded review run resumes on its pinned head sha', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(1, { title: 't', body: 'b', labels: ['agent-ready'], state: 'OPEN', url: 'u' });
+    const { task, run } = await seedRun(env.store, 'REVIEWING', { workspace: env.dir });
+    env.store.db.prepare("UPDATE runs SET kind = 'review', head_sha = 'sha-x', pr_url = 'https://x/pull/9' WHERE run_id = ?").run(run.run_id);
+    const report = await reconcile({
+      store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [],
+      isPidAlive: () => false,
+    });
     assert.deepEqual(report.resumed, [run.run_id]);
     assert.equal(env.store.getRun(run.run_id)!.phase, 'REVIEWING');
-    assert.notEqual(env.store.getTaskById(task.id)!.status, 'AWAITING_MERGE');
+    assert.deepEqual(env.resumed, [run.run_id]);
   } finally { env.done(); }
 });
 

@@ -16,8 +16,13 @@
   `GH_TOKEN`/`GITHUB_TOKEN` to it. The scrub also kills on-disk auth: empty
   `GH_CONFIG_DIR`, cleared `credential.helper`, dead `GIT_SSH_COMMAND`. Child
   `git push`/`gh` must stay unauthenticated — do not weaken.
-- REVIEWING asserts HEAD sha + clean status afterwards; a moved HEAD or dirty
-  worktree is reviewer tampering → BLOCKED, never a fixable verdict.
+- Reviews are separate runs (`runs.kind='review'`) pinned to one PR head sha,
+  auto-dispatched for every published PR head. The review site is a
+  materialization of that sha (coding worktree reuse or a detached worktree);
+  HEAD sha + clean status is asserted afterwards — a moved HEAD or dirty site
+  is reviewer tampering → ERROR verdict + human path, never a fixable verdict.
+  A verdict row (`check_results.head_sha`) suppresses re-dispatch for that sha;
+  head-moved/cancelled rounds write no row so a new sha can be reviewed.
 - Only the Pi runner is supported. The coder is one long-lived `pi --mode rpc`
   session per run (`runners/session.ts`): RUNNING and every FIXING turn share the
   same conversation, and that child **is** the run's `pid` — it must be closed in

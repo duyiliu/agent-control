@@ -92,11 +92,14 @@ export interface AppConfig {
 
 export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 
-/** Embedded web UI. Loopback-only by default — it can stop/retry tasks. */
+/** Embedded web UI. Loopback-only by default — it can stop/retry tasks.
+ *  Set token when exposing beyond loopback (e.g. an NPS tunnel): all
+ *  routes then require it via cookie, ?token=, or Bearer header. */
 export interface UiConfig {
   enabled: boolean;
   host: string;
   port: number;
+  token?: string;
 }
 
 /** Pi thinking levels accepted by the --thinking option. */
@@ -119,6 +122,17 @@ export interface PrInfo {
   isDraft: boolean;
 }
 
+/** Run kind: 'code' drives the coding state machine; 'review' is a
+ *  separately-dispatched verdict on one PR head sha. */
+export type RunKind = 'code' | 'review';
+
+/** tasks.pending_fix JSON payload: a review BLOCK that spawned a fix run. */
+export interface PendingFix {
+  head_sha: string;
+  summary: string;
+  findings: string[];
+}
+
 export interface TaskRow {
   id: number;
   repo: string;
@@ -130,6 +144,7 @@ export interface TaskRow {
   branch: string | null;
   pr_url: string | null;
   fix_rounds: number;
+  pending_fix: string | null;
   updated_at: string;
   created_at: string;
 }
@@ -138,6 +153,7 @@ export interface RunRow {
   id: number;
   run_id: string;
   task_id: number;
+  kind: RunKind;
   attempt: number;
   phase: Phase;
   return_phase: Phase | null;
@@ -149,6 +165,7 @@ export interface RunRow {
   workspace: string | null;
   branch: string | null;
   pr_url: string | null;
+  head_sha: string | null;
   reason: string | null;
   started_at: string;
   heartbeat_at: string;
@@ -163,6 +180,7 @@ export interface CheckResultRow {
   exit_code: number | null;
   artifact_path: string | null;
   verdict: string;
+  head_sha: string | null;
   created_at: string;
 }
 

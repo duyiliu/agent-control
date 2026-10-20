@@ -81,6 +81,7 @@ export interface FakeTracker {
   prComments: [number, string][];
   merged: number[];
   prCreated: number;
+  headSha: string;
 }
 
 export function makeFakeTracker(): FakeTracker & {
@@ -110,6 +111,7 @@ export function makeFakeTracker(): FakeTracker & {
     prComments: [],
     merged: [],
     prCreated: 0,
+    headSha: 'head-sha',
   };
   return Object.assign(t, {
     async listReadyIssues(_repo: string, label: string) {
@@ -139,7 +141,17 @@ export function makeFakeTracker(): FakeTracker & {
       return t.prStates.get(n) ?? 'OPEN';
     },
     async getPrHeadSha(_repo: string, _n: number) {
-      return 'head-sha';
+      return t.headSha;
+    },
+    async getPrDetails(_repo: string, n: number) {
+      const pr = [...t.prs.values()].find((p) => p.number === n);
+      return {
+        state: (t.prStates.get(n) ?? pr?.state ?? 'OPEN') as 'OPEN' | 'CLOSED' | 'MERGED',
+        headSha: t.headSha,
+        labels: [] as string[],
+        isDraft: pr?.isDraft ?? true,
+        url: pr?.url ?? `https://github.com/x/y/pull/${n}`,
+      };
     },
     async markPrReady(_repo: string, _n: number) {},
     async mergePr(_repo: string, n: number, _sha: string) {
