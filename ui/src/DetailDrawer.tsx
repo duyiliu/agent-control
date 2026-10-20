@@ -306,7 +306,10 @@ function Timeline({ run }: { run: RunDetail }) {
 function ChecksTable(props: { run: RunDetail; onOpenArtifact: (path: string) => void }) {
   const { run, onOpenArtifact } = props;
   const verdictTone = (v: string) =>
-    v === 'PASS' ? 'text-ok' : v === 'BLOCK' || v === 'FAIL' ? 'text-danger' : 'text-fg';
+    v === 'PASS' ? 'text-ok'
+      : v === 'BLOCK' || v === 'FAIL' || v === 'ERROR' ? 'text-danger'
+        : v === 'HUMAN_REVIEW_REQUIRED' ? 'text-warn'
+          : 'text-fg';
   return (
     <div className="border-t border-edge px-3.5 py-3">
       <div className="mb-2 text-[11px] font-medium text-fg-dim">

@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { Store } from '../store/sqlite.js';
@@ -504,8 +504,11 @@ export class Engine {
               }
               this.finish(run, task, 'AWAITING_MERGE', 'review PASS', { pr_url: prUrl });
               return;
-            } else if (result.verdict === 'HUMAN_REVIEW_REQUIRED' || !result.findings.some((finding) => finding.trim())) {
-              this.finish(run, task, 'BLOCKED', `review requires human: ${result.summary}; no automatic repair without concrete findings`, { pr_url: prUrl });
+            } else if (result.verdict === 'HUMAN_REVIEW_REQUIRED') {
+              this.finish(run, task, 'BLOCKED', `review requires human: ${result.summary}`, { pr_url: prUrl });
+              return;
+            } else if (!result.findings.some((finding) => finding.trim())) {
+              this.finish(run, task, 'BLOCKED', `review BLOCK without concrete findings: ${result.summary}; no automatic repair`, { pr_url: prUrl });
               return;
             } else if (this.canFix(run)) {
               lastFailureEvidence = `Review BLOCK: ${result.summary}\n${result.findings.join('\n')}`;
@@ -677,8 +680,23 @@ export class Engine {
     const prefix = headSha ? `提交 SHA: ${headSha}\n` : '';
     if (checks.length === 0) return `${prefix}(no checks recorded)`;
     return prefix + latest
-      .map((c) => `命令: ${c.command}\n结果: ${c.verdict} (exit ${c.exit_code ?? 'n/a'})\n日志: ${c.artifact_path ?? '-'}`)
+      .map((c) => `命令: ${c.command}\n结果: ${c.verdict} (exit ${c.exit_code ?? 'n/a'})\n日志: ${c.artifact_path ?? '-'}\n日志尾部:\n${this.checkLogTail(c.artifact_path)}`)
       .join('\n\n');
+  }
+
+  /**
+   * The reviewer has no shell, so "verdict PASS (exit 0)" alone proves
+   * nothing — it cannot tell a real suite from an empty script that exits 0.
+   * Host-read output tail is the only evidence it can inspect.
+   */
+  private checkLogTail(path: string | null, lines = 30): string {
+    if (!path) return '(日志文件缺失)';
+    try {
+      const tail = readFileSync(path, 'utf8').split('\n').slice(-lines).join('\n').trim();
+      return tail || '(日志为空)';
+    } catch (err) {
+      return `(日志不可读: ${String(err).slice(0, 80)})`;
+    }
   }
 
   private canFix(run: RunRow): boolean {

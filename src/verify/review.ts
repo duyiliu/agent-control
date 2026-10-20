@@ -80,7 +80,10 @@ export async function runReview(
     } else {
       try {
         if (!existsSync(lastMessagePath)) throw new Error('review produced no structured output');
-        return { result: parseReviewResult(readFileSync(lastMessagePath, 'utf8')), logPath };
+        // On a protocol break the narration itself is the evidence a human
+        // needs, so point the artifact at it instead of the agent jsonl.
+        const parsed = parseReviewResult(readFileSync(lastMessagePath, 'utf8'));
+        return { result: parsed.result, logPath: parsed.protocolBroken ? lastMessagePath : logPath };
       } catch (err) {
         failure = `invalid review output: ${String(err)}`;
       }
@@ -90,11 +93,11 @@ export async function runReview(
   throw new ReviewInfraError('review did not complete');
 }
 
-function parseReviewResult(text: string): ReviewResult {
+function parseReviewResult(text: string): { result: ReviewResult; protocolBroken: boolean } {
   const stripped = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   try {
     const checked = checkReviewShape(JSON.parse(stripped));
-    if (checked) return checked;
+    if (checked) return { result: checked, protocolBroken: false };
     throw new Error('expected verdict, risk, nonempty summary and string findings');
   } catch (err) {
     if (!(err instanceof SyntaxError)) throw err;
@@ -105,10 +108,13 @@ function parseReviewResult(text: string): ReviewResult {
   // human must look instead.
   if (hasBalancedObject(stripped)) {
     return {
-      verdict: 'HUMAN_REVIEW_REQUIRED',
-      risk: 'high',
-      summary: 'review output broke the JSON-only protocol (verdict object embedded in narration); human review required',
-      findings: [],
+      result: {
+        verdict: 'HUMAN_REVIEW_REQUIRED',
+        risk: 'high',
+        summary: 'review output broke the JSON-only protocol (verdict object embedded in narration); human review required',
+        findings: [],
+      },
+      protocolBroken: true,
     };
   }
   throw new Error('review must contain a single JSON object with verdict, risk, nonempty summary and string findings');

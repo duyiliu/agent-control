@@ -320,6 +320,30 @@ test('AC5b: HUMAN_REVIEW_REQUIRED → BLOCKED, PR stays draft', async () => {
   } finally { env.done(); }
 });
 
+test('review evidence carries the check log tail, not just the verdict', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(41, { ...ISSUE });
+    const logFile = join(env.dir, 'check.log');
+    writeFileSync(logFile, 'start\nPASS src/a.test.ts\n3 passed, 0 failed\n');
+    const seen: string[] = [];
+    const { store, engine } = makeEngine(env, {
+      checks: async () => ({
+        ...checksOk(),
+        outcomes: [{ spec: { argv: ['x'] }, command: 'npm test', exitCode: 0, timedOut: false, tail: '', logPath: logFile }],
+      }),
+      review: (async (_ctx, ev: string) => {
+        seen.push(ev);
+        return { result: { verdict: 'PASS', risk: 'low', summary: 'ok', findings: [] } as ReviewResult, logPath: 'r' };
+      }) as ReviewFn,
+    });
+    await tickAndDrain(engine);
+    assert.equal(store.getTask('me/sandbox', 41)!.status, 'AWAITING_MERGE');
+    assert.equal(seen.length, 1);
+    assert.match(seen[0]!, /3 passed, 0 failed/); // raw output, not just "PASS (exit 0)"
+  } finally { env.done(); }
+});
+
 test('review tamper: HEAD moved during review → BLOCKED, no merge', async () => {
   const env = setup();
   try {

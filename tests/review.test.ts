@@ -107,6 +107,21 @@ for (const value of [null, { verdict: 'PASS' }, { ...passed, findings: [123] }, 
   });
 }
 
+test('review: protocol break points the artifact at the raw narration', async () => {
+  const env = setup();
+  try {
+    let written = '';
+    const out = await runReview(env.ctx, 'tests pass', 'diff', env.deps, async (opts) => {
+      written = opts.lastMessagePath;
+      writeFileSync(opts.lastMessagePath, `先分析一下改动。\n\n${JSON.stringify(passed)}`);
+      return ok();
+    });
+    assert.equal(out.result.verdict, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(out.logPath, written);
+    assert.match(readFileSync(out.logPath, 'utf8'), /先分析一下改动/);
+  } finally { cleanup(env.dir); }
+});
+
 test('review: incomplete diff escalates without invoking a model', async () => {
   const env = setup();
   try {
