@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Activity, RefreshCw, TriangleAlert } from 'lucide-react';
-import { fetchHealth, fetchTasks, type HealthInfo, type TaskSummary } from './api';
+import { fetchHealth, fetchTasks, postAction, type HealthInfo, type TaskSummary } from './api';
 import { fmtDur } from './groups';
 import Board from './Board';
 import DetailDrawer from './DetailDrawer';
@@ -24,6 +24,23 @@ export default function App() {
       setHealth(h);
     } catch { /* transient — next cycle retries */ }
   }, []);
+
+  // Drag-to-Needs-Attention equivalent of the drawer's Stop button.
+  const stopByDrag = useCallback(
+    async (task: TaskSummary) => {
+      const ok = window.confirm(
+        `Stop "${task.issue_title || `#${task.issue_number}`}"? The scheduler aborts the active run within one poll cycle.`,
+      );
+      if (!ok) return;
+      try {
+        setToast({ msg: await postAction(task.id, 'stop') });
+      } catch (e) {
+        setToast({ msg: (e as Error).message, err: true });
+      }
+      refresh();
+    },
+    [refresh],
+  );
 
   useEffect(() => {
     refresh();
@@ -57,7 +74,7 @@ export default function App() {
           auto 5s
         </div>
       </header>
-      <Board tasks={tasks} tick={tick} selected={selected} onSelect={setSelected} />
+      <Board tasks={tasks} tick={tick} selected={selected} onSelect={setSelected} onStop={stopByDrag} />
       {selected !== null && (
         <DetailDrawer
           taskId={selected}

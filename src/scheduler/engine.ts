@@ -34,6 +34,16 @@ const TERMINAL_FOR_TASK: Phase[] = [
 /** Task states a human must look at — surfaced as a GitHub issue comment. */
 const ATTENTION_PHASES: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED'];
 
+/** Compact elapsed span for issue comments; a null `to` means "until now". */
+function fmtSpan(fromIso: string, toIso: string | null): string {
+  const ms = (toIso ? Date.parse(toIso) : Date.now()) - Date.parse(fromIso);
+  if (!Number.isFinite(ms) || ms < 0) return '-';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
 export class Engine {
   private controllers = new Map<string, AbortController>();
   private inFlight = new Set<string>(); // run_ids currently executing in this process
@@ -91,6 +101,7 @@ export class Engine {
         if (state === 'MERGED') {
           this.setTaskStatus(task.id, 'COMPLETED');
           this.appLog.event('task_completed', { task: task.id, repo: task.repo, issue: task.issue_number });
+          await this.notifyTaskCompleted(task);
           await this.cleanupMerged(project, task);
         } else if (state === 'CLOSED') {
           this.setTaskStatus(task.id, 'BLOCKED');
@@ -697,11 +708,36 @@ export class Engine {
       const runs = this.store.runsForTask(task.id);
       const last = runs[runs.length - 1];
       const reason = detail ?? last?.reason;
+      const checks = last ? this.store.checksForRun(last.run_id) : [];
       const body = [
         `agent-control: 任务进入 **${status}**，需要人工处理。`,
         reason ? `\n原因：${reason}` : '',
-        last ? `\nrun：\`${last.run_id}\`（attempt ${last.attempt}）` : '',
+        last ? `\nrun：\`${last.run_id}\`（attempt ${last.attempt}，耗时 ${fmtSpan(last.started_at, last.ended_at)}）` : '',
+        checks.length
+          ? `\n检查结果：\n${checks.map((c) => `- ${c.kind}: **${c.verdict}**${c.exit_code !== null ? `（exit ${c.exit_code}）` : ''}`).join('\n')}`
+          : '',
         `\n排查：\`npm run ac -- runs ${task.issue_number}\`；处理后用 \`npm run ac -- retry ${task.issue_number}\` 重新排队。`,
+      ].join('');
+      await this.tracker.addComment(task.repo, task.issue_number, body);
+    } catch (err) {
+      this.appLog.event('comment_error', { task: task.id, error: String(err) });
+      this.recordError('comment_error', err);
+    }
+  }
+
+  /** Run summary on the issue when the PR merges — GitHub-side audit trail. */
+  async notifyTaskCompleted(task: TaskRow): Promise<void> {
+    try {
+      const runs = this.store.runsForTask(task.id);
+      const first = runs[0];
+      const last = runs[runs.length - 1];
+      const body = [
+        `agent-control: 任务完成，PR 已合并。`,
+        `\n- attempt：${runs.length} 次`,
+        first ? `\n- 总耗时：${fmtSpan(first.started_at, null)}（首次领取 → 合并）` : '',
+        task.fix_rounds > 0 ? `\n- 修复轮次：${task.fix_rounds}` : '',
+        last && last.fix_count > 0 ? `\n- 本轮修复次数：${last.fix_count}` : '',
+        task.pr_url ? `\n- PR：${task.pr_url}` : '',
       ].join('');
       await this.tracker.addComment(task.repo, task.issue_number, body);
     } catch (err) {

@@ -376,7 +376,7 @@ test('mergeReconcile: cleanup failure never un-completes a task', async () => {
   } finally { env.done(); }
 });
 
-test('attention state posts an issue comment', async () => {
+test('attention state posts an issue comment with check summary', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(14, { ...ISSUE });
@@ -385,6 +385,25 @@ test('attention state posts an issue comment', async () => {
     assert.equal(store.getTask('me/sandbox', 14)!.status, 'BLOCKED');
     const c = env.tracker.comments.find(([n, body]) => n === 14 && /BLOCKED/.test(body));
     assert.ok(c, 'attention comment posted');
+    assert.match(c[1], /检查结果/, 'check summary included');
+    assert.match(c[1], /FAIL/);
+  } finally { env.done(); }
+});
+
+test('mergeReconcile posts a completion summary comment', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(15, { ...ISSUE });
+    const { store, engine } = makeEngine(env, { workspace: fakeWorkspace() });
+    const { task } = store.upsertDiscovered({ repo: 'me/sandbox', issue_number: 15, issue_title: 't', issue_url: 'u' });
+    store.setTaskStatus(task.id, 'AWAITING_MERGE', { pr_url: 'https://x/pull/79', branch: 'agent/issue-15' });
+    env.tracker.prStates.set(79, 'MERGED');
+    await engine.tick();
+    assert.equal(store.getTask('me/sandbox', 15)!.status, 'COMPLETED');
+    const c = env.tracker.comments.find(([n, body]) => n === 15 && /任务完成/.test(body));
+    assert.ok(c, 'completion summary posted');
+    assert.match(c[1], /https:\/\/x\/pull\/79/);
+    assert.match(c[1], /attempt/);
   } finally { env.done(); }
 });
 
