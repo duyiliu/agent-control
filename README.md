@@ -110,6 +110,16 @@ schtasks /delete /tn agent-control  # 卸载
    | 中途叫停 | — | `npm run ac -- stop <issue>` |
    | 服务崩溃 | `RECOVERY_REQUIRED` 评论 | 确认子进程已死后 `retry` |
 
+### 质量闸门与人工接管
+
+- 任意代码修复后均重新执行 checks，再进入独立只读 Review；测试、Review 和发布前都会检查工作区与 HEAD，发布不再兜底提交新改动。
+- 每次 Review（包括一次失败重试）使用独立证据文件。缺失或无效 JSON 只重试 reviewer 一次，仍失败则 `FAILED`，不会让 coder 为格式或工具故障消耗修复次数。
+- Review 仅对有证据的正确性、验收或越界问题返回 `BLOCK`，每条 finding 应包含位置、触发条件、影响和验证方式；风格偏好及可选重构不阻塞。无具体 finding、高风险或证据不完整时停止并等待人工处理。
+- checks 的命令启动失败、超时或异常终止记为基础设施错误，不自动修改业务代码。Windows 上 `npm`/`npx` 使用 Node 入口启动，未知 `.cmd`/`.bat` 需显式配置可执行入口，不启用通用 shell。
+- Stop 独立按 `cancel_poll_seconds`（默认 5 秒）检查，取消信号传递到测试进程。调度 tick 不重叠，慢速 GitHub 请求不阻挡本地取消。
+- 恢复时 GitHub 查询失败不等于授权撤销，不关闭 PR；进入 `RECOVERY_REQUIRED` 并保留现场。人工 Retry 也会检查旧 PID 身份和 worktree 孤儿进程，无法证明已退出则拒绝重试；若仍有 `agent-running` 标签，需确认无其它调度器占用后再人工移除过期标签。
+- PR 已关闭时不会伪装为等待合并：需人工重开原 PR，或新建任务。自动修复仍受每次 run 的 `retry_limit` 限制；人工合并和部署边界不变。
+
 ## 安全边界（MVP）
 
 - 只接入可信测试仓库；Issue 正文只作数据，不会变成 shell 命令（测试命令只能来自仓库配置白名单）。注意：Issue 正文仍是**不可信输入**——提示词里的"数据边界"只是约定而非强制边界。环境白名单只限制传入子进程的环境变量；worktree 是工作目录约定，不构成文件访问隔离。恶意 Issue 最坏能诱导 agent 在 worktree 里写坏代码——坏代码由检查、独立 review 与人工合并拦截。不要对非本人撰写/未确认可信的 Issue 启用本工具。

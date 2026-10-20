@@ -151,6 +151,7 @@ export async function startService(app: App): Promise<void> {
   });
   appLog.event('recovery_report', { ...report });
 
+  const cancelTimer = setInterval(() => engine.sweepCancels(), config.server.cancel_poll_seconds * 1000);
   const tickMs = config.server.poll_interval_seconds * 1000;
   const tick = () =>
     engine.tick().catch((err) => {
@@ -171,6 +172,7 @@ export async function startService(app: App): Promise<void> {
     appLog.event('service_stop', { sig });
     ui?.close();
     clearInterval(timer);
+    clearInterval(cancelTimer);
     for (const run of store.activeRuns()) engine.abortRun(run.run_id, 'service shutdown');
     // Give in-flight runs a moment to land in CANCELED.
     await new Promise((r) => setTimeout(r, 3_000));

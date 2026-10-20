@@ -1,12 +1,16 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { pickRunner } from '../runners/dispatch.js';
 import { PI_REVIEW_TOOLS } from '../runners/pi.js';
-import { REVIEW_SCHEMA, buildReviewPrompt, type PromptContext } from '../scheduler/prompts.js';
+import type { AgentCallOpts, AgentCallResult } from '../runners/types.js';
+import { REVIEW_SCHEMA, buildReviewPrompt, MAX_REVIEW_DIFF_CHARS, type PromptContext } from '../scheduler/prompts.js';
 import type { AppConfig, ReviewResult } from '../types.js';
 
-/** The review PROCESS failed (exit/timeout/spawn) — not a code verdict. */
-export class ReviewInfraError extends Error {}
+export class ReviewInfraError extends Error {
+  constructor(message: string, readonly logPath?: string) { super(message); }
+}
 
 export interface ReviewDeps {
   agentConfig: AppConfig['agent'];
@@ -16,26 +20,19 @@ export interface ReviewDeps {
   onSpawn?: (pid: number | null, identity: string | null) => void;
 }
 
-/**
- * Independent read-only review session. pi confines the reviewer via the
- * read-only tool allowlist (no bash/edit/write) with a prompt-level JSON
- * contract; codex confines via `-s` sandbox and gets hard schema enforcement
- * via --output-schema. An unparseable/absent verdict is a non-pass (BLOCK).
- */
+type ReviewRunner = (opts: AgentCallOpts, config: AppConfig['agent']) => Promise<AgentCallResult>;
+
+/** Output/protocol failures retry the reviewer, never the code being reviewed. */
 export async function runReview(
   ctx: PromptContext,
   testEvidence: string,
   diffEvidence: string,
   deps: ReviewDeps,
+  runner: ReviewRunner = (opts, config) => pickRunner(config)(opts, config),
 ): Promise<{ result: ReviewResult; logPath: string }> {
   mkdirSync(deps.artifactsDir, { recursive: true });
   const schemaPath = join(deps.artifactsDir, 'review-schema.json');
-  const lastMsgPath = join(deps.artifactsDir, 'review-last-message.txt');
-  const logPath = join(deps.artifactsDir, 'review-agent.jsonl');
   writeFileSync(schemaPath, JSON.stringify(REVIEW_SCHEMA), 'utf8');
-
-  // review_provider/review_model may select a different (ideally heterogeneous)
-  // runner+model for review than the coder used — decorrelates blind spots.
   const agentConfig: AppConfig['agent'] = {
     ...deps.agentConfig,
     provider: deps.agentConfig.review_provider ?? deps.agentConfig.provider,
@@ -43,76 +40,76 @@ export async function runReview(
     reasoning_effort: deps.agentConfig.review_reasoning_effort ?? deps.agentConfig.reasoning_effort,
   };
   const isPi = agentConfig.provider === 'pi';
-  const callReview = () =>
-    pickRunner(agentConfig)(
-      {
-        workdir: ctx.worktreePath,
-        prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence),
-        sandbox: agentConfig.review_sandbox,
-        timeoutMs: deps.timeoutMs,
-        logPath,
-        schemaPath: isPi ? undefined : schemaPath,
-        lastMessagePath: lastMsgPath,
-        tools: isPi ? PI_REVIEW_TOOLS : undefined,
-        signal: deps.signal,
-        onSpawn: deps.onSpawn,
-      },
-      agentConfig,
-    );
+  const cancelled = (logPath: string) => ({
+    result: { verdict: 'HUMAN_REVIEW_REQUIRED', summary: 'review cancelled', findings: [] } as ReviewResult,
+    logPath,
+  });
 
-  let proc = await callReview();
-  // One retry for transient infra failures (e.g. model-list refresh timeouts).
-  if (!proc.aborted && (proc.exitCode !== 0 || proc.timedOut)) {
-    await new Promise((r) => setTimeout(r, 10_000));
-    proc = await callReview();
-  }
-
-  if (proc.aborted) {
-    return { result: { verdict: 'BLOCK', summary: 'review aborted (cancelled)', findings: [] }, logPath };
-  }
-  if (proc.timedOut) {
-    throw new ReviewInfraError(`review timed out after ${deps.timeoutMs}ms`);
-  }
-  if (proc.exitCode !== 0) {
-    throw new ReviewInfraError(`review process exited ${proc.exitCode}: ${proc.stderrTail.slice(-2000)}`);
-  }
-  if (!existsSync(lastMsgPath)) {
-    return { result: { verdict: 'BLOCK', summary: 'review produced no structured output', findings: [] }, logPath };
-  }
-  try {
-    const parsed = parseVerdictJson(readFileSync(lastMsgPath, 'utf8')) as {
-      verdict?: string;
-      summary?: string;
-      findings?: string[];
-    };
-    if (parsed.verdict !== 'PASS' && parsed.verdict !== 'BLOCK' && parsed.verdict !== 'HUMAN_REVIEW_REQUIRED') {
-      return { result: { verdict: 'BLOCK', summary: `unparseable verdict: ${String(parsed.verdict)}`, findings: [] }, logPath };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const id = randomUUID();
+    const logPath = join(deps.artifactsDir, `review-agent-${id}.jsonl`);
+    const lastMessagePath = join(deps.artifactsDir, `review-last-${id}.txt`);
+    if (deps.signal?.aborted) return cancelled(logPath);
+    if (diffEvidence.length > MAX_REVIEW_DIFF_CHARS || /\.\.\.\[truncated \d+ (?:chars|bytes)\]/.test(diffEvidence)) {
+      const result: ReviewResult = { verdict: 'HUMAN_REVIEW_REQUIRED', summary: 'review diff is incomplete or too large; narrow the task or review manually', findings: [] };
+      writeFileSync(logPath, JSON.stringify({ result }) + '\n', 'utf8');
+      return { result, logPath };
     }
-    return {
-      result: {
-        verdict: parsed.verdict,
-        summary: parsed.summary ?? '',
-        findings: Array.isArray(parsed.findings) ? parsed.findings.map(String) : [],
-      },
+    const proc = await runner({
+      workdir: ctx.worktreePath,
+      prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence),
+      sandbox: agentConfig.review_sandbox,
+      timeoutMs: deps.timeoutMs,
       logPath,
-    };
-  } catch {
-    return { result: { verdict: 'BLOCK', summary: 'review output was not valid JSON', findings: [] }, logPath };
+      schemaPath: isPi ? undefined : schemaPath,
+      lastMessagePath,
+      tools: isPi ? PI_REVIEW_TOOLS : undefined,
+      signal: deps.signal,
+      onSpawn: deps.onSpawn,
+    }, agentConfig);
+    if (proc.aborted || deps.signal?.aborted) return cancelled(logPath);
+
+    let failure: string;
+    if (proc.timedOut || proc.exitCode !== 0) {
+      failure = proc.timedOut
+        ? `review timed out after ${deps.timeoutMs}ms`
+        : `review process exited ${proc.exitCode}: ${proc.stderrTail.slice(-2000)}`;
+      if (attempt === 0) {
+        await sleep(10_000, undefined, { signal: deps.signal }).catch((err: unknown) => {
+          if (!deps.signal?.aborted) throw err;
+        });
+        continue;
+      }
+    } else {
+      try {
+        if (!existsSync(lastMessagePath)) throw new Error('review produced no structured output');
+        return { result: parseReviewResult(readFileSync(lastMessagePath, 'utf8')), logPath };
+      } catch (err) {
+        failure = `invalid review output: ${String(err)}`;
+      }
+    }
+    if (attempt === 1) throw new ReviewInfraError(failure, logPath);
   }
+  throw new ReviewInfraError('review did not complete');
 }
 
-/**
- * Parse the verdict JSON from the reviewer's last message. The prompt asks
- * for bare JSON, but the model may wrap it in fences or prose — strip those
- * before failing as unparseable.
- */
+function parseReviewResult(text: string): ReviewResult {
+  const value = parseVerdictJson(text);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('expected an object');
+  const obj = value as Record<string, unknown>;
+  if (Object.keys(obj).some((key) => !['verdict', 'summary', 'findings'].includes(key))
+    || typeof obj.verdict !== 'string' || !['PASS', 'BLOCK', 'HUMAN_REVIEW_REQUIRED'].includes(obj.verdict)
+    || typeof obj.summary !== 'string' || !obj.summary.trim()
+    || !Array.isArray(obj.findings) || obj.findings.some((finding) => typeof finding !== 'string' || !finding.trim())) {
+    throw new Error('expected verdict, nonempty summary and string findings');
+  }
+  return { verdict: obj.verdict as ReviewResult['verdict'], summary: obj.summary, findings: obj.findings as string[] };
+}
+
 function parseVerdictJson(text: string): unknown {
   const stripped = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   try {
     return JSON.parse(stripped);
-  } catch { /* fall through to object extraction */ }
-  const start = stripped.indexOf('{');
-  const end = stripped.lastIndexOf('}');
-  if (start >= 0 && end > start) return JSON.parse(stripped.slice(start, end + 1));
-  return JSON.parse(stripped); // throws with the original-shaped error
+  } catch { /* invalid protocol output */ }
+  throw new Error('review must contain a single JSON object');
 }

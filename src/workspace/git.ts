@@ -100,13 +100,17 @@ export class GitWorkspace {
     const range = mb.exitCode === 0 ? `${baseBranch}...HEAD` : `${baseBranch}..HEAD`;
     const stat = await this.git(['diff', '--stat', range], worktreePath);
     const diff = await this.git(['diff', '--find-renames', range], worktreePath, 120_000);
+    if (stat.stdoutTruncated || diff.stdoutTruncated) throw new WorkspaceError('review diff exceeds captured output limit; narrow the task or review manually');
     let out = `## STAT\n${stat.stdoutTail}\n## DIFF\n${diff.stdoutTail}`;
     if (out.length > maxChars) out = `${out.slice(0, maxChars)}\n...[truncated ${out.length - maxChars} chars]`;
     return out;
   }
 
-  async push(worktreePath: string, branch: string): Promise<void> {
-    await this.git(['push', '-u', 'origin', branch], worktreePath, 180_000);
+  async push(worktreePath: string, branch: string, reviewedHead?: string): Promise<void> {
+    const args = reviewedHead
+      ? ['push', 'origin', `${reviewedHead}:refs/heads/${branch}`]
+      : ['push', '-u', 'origin', branch];
+    await this.git(args, worktreePath, 180_000);
   }
 
   /** Remove a worktree after its PR merged. Forced: merged work is upstream. */

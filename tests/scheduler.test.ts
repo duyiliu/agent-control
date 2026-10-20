@@ -7,7 +7,7 @@ import { Engine } from '../src/scheduler/engine.js';
 import { GitWorkspace } from '../src/workspace/git.js';
 import type { GitHubTracker } from '../src/tracker/github.js';
 import type { AgentCallResult } from '../src/runners/types.js';
-import type { ChecksSummary } from '../src/verify/checks.js';
+import { runChecks, type ChecksSummary } from '../src/verify/checks.js';
 import type { AppConfig, ReviewResult } from '../src/types.js';
 import { makeConfig, makeFakeTracker, makeStore, nullLog, teardown } from './helpers.js';
 import type { Store } from '../src/store/sqlite.js';
@@ -201,14 +201,49 @@ test('AC5: review BLOCK → fix → re-review → PASS', async () => {
   try {
     env.tracker.issues.set(6, { ...ISSUE });
     let reviews = 0;
+    let checks = 0;
     const review: ReviewFn = async () => {
       reviews++;
-      return { result: { verdict: reviews === 1 ? 'BLOCK' : 'PASS', summary: 'r', findings: [] }, logPath: 'l' };
+      return { result: { verdict: reviews === 1 ? 'BLOCK' : 'PASS', summary: 'r', findings: reviews === 1 ? ['parser.ts: empty input crashes; validate with an empty-input test'] : [] }, logPath: 'l' };
     };
-    const { store, engine } = makeEngine(env, { review });
+    const { store, engine } = makeEngine(env, { review, checks: async () => { checks++; return checksOk(); } });
     await tickAndDrain(engine);
-    assert.equal(store.getTask('me/sandbox', 6)!.status, 'AWAITING_MERGE');
+    const task = store.getTask('me/sandbox', 6)!;
+    assert.equal(task.status, 'AWAITING_MERGE');
     assert.equal(reviews, 2);
+    assert.equal(checks, 2, 'review-driven fixes must rerun checks');
+    const phases = store.eventsForRun(store.runsForTask(task.id)[0]!.run_id).map((e) => e.to_phase);
+    assert.deepEqual(phases.slice(4), ['REVIEWING', 'FIXING', 'VERIFYING', 'REVIEWING', 'PUBLISHING_PR', 'AWAITING_MERGE']);
+  } finally { env.done(); }
+});
+
+test('review BLOCK without findings stops without a blind repair', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(17, { ...ISSUE });
+    let coderCalls = 0;
+    const { store, engine } = makeEngine(env, {
+      coder: async () => { coderCalls++; return okCoder(); },
+      review: async () => ({ result: { verdict: 'BLOCK', summary: 'unclear concern', findings: [] }, logPath: 'r' }),
+    });
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 17)!;
+    assert.equal(task.status, 'BLOCKED');
+    assert.equal(coderCalls, 1);
+    assert.equal(store.runsForTask(task.id)[0]!.fix_count, 0);
+  } finally { env.done(); }
+});
+
+test('review infrastructure failure does not consume fix budget', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(18, { ...ISSUE });
+    const { store, engine } = makeEngine(env, { review: async () => { throw new Error('review output unavailable'); } });
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 18)!;
+    assert.equal(task.status, 'FAILED');
+    assert.equal(store.runsForTask(task.id)[0]!.fix_count, 0);
+    assert.equal(env.tracker.prCreated, 0);
   } finally { env.done(); }
 });
 
@@ -230,7 +265,7 @@ test('review tamper: HEAD moved during review → BLOCKED, no PR', async () => {
     let headCalls = 0;
     const ws = {
       ...fakeWorkspace(),
-      head: async () => (headCalls++ === 0 ? 'sha-a' : 'sha-b'),
+      head: async () => (headCalls++ < 3 ? 'sha-a' : 'sha-b'),
     } as unknown as GitWorkspace;
     const { store, engine } = makeEngine(env, { workspace: ws });
     await tickAndDrain(engine);
@@ -350,6 +385,182 @@ test('attention state posts an issue comment', async () => {
     const c = env.tracker.comments.find(([n, body]) => n === 14 && /BLOCKED/.test(body));
     assert.ok(c, 'attention comment posted');
   } finally { env.done(); }
+});
+
+test('overlapping ticks never overlap discovery or dispatch', async () => {
+  const env = setup();
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    let calls = 0;
+    env.tracker.listReadyIssues = async () => { calls++; entered(); await gate; return []; };
+    const { engine } = makeEngine(env);
+    const first = engine.tick(); await waiting;
+    await engine.tick();
+    assert.equal(calls, 1);
+    release(); await first;
+  } finally { release?.(); env.done(); }
+});
+
+test('stop during checks aborts their process before network polling completes', async () => {
+  const env = setup();
+  let started!: () => void;
+  const checking = new Promise<void>((resolve) => { started = resolve; });
+  try {
+    env.tracker.issues.set(19, { ...ISSUE });
+    env.config.projects[0]!.checks = [{ argv: [process.execPath, '-e', 'setTimeout(() => {}, 60000)'], timeout_seconds: 60 }];
+    const store = makeStore(env.dir); env.stores.push(store);
+    const engine = new Engine({ store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
+      workspace: fakeWorkspace(), appLog: nullLog, installDir: env.dir, runCoderFn: async () => okCoder(),
+      runReviewFn: reviewPass as never,
+      runChecksFn: (...args) => runChecks(args[0], args[1], args[2], args[3], args[4], (pid) => { args[5]?.(pid); started(); }) });
+    await engine.tick(); await checking;
+    const task = store.getTask('me/sandbox', 19)!; const run = store.activeRunForTask(task.id)!;
+    store.requestCancel(run.run_id);
+    engine.sweepCancels();
+    for (let i = 0; i < 150 && engine.activeCount(); i++) await sleep(20);
+    assert.equal(engine.activeCount(), 0);
+    assert.equal(store.getTaskById(task.id)!.status, 'CANCELED');
+    assert.equal(store.getRun(run.run_id)!.fix_count, 0);
+  } finally { env.done(); }
+});
+
+test('checks infrastructure failure never triggers a code repair', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(20, { ...ISSUE });
+    let coderCalls = 0;
+    const { store, engine } = makeEngine(env, {
+      coder: async () => { coderCalls++; return okCoder(); },
+      checks: async () => ({ ...checksFail(), infraError: 'executable missing' }),
+    });
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 20)!;
+    assert.equal(task.status, 'FAILED');
+    assert.equal(coderCalls, 1);
+    assert.equal(store.runsForTask(task.id)[0]!.fix_count, 0);
+  } finally { env.done(); }
+});
+
+test('approval drift before repair stops without another coder call', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(21, { ...ISSUE });
+    let coderCalls = 0;
+    const { store, engine } = makeEngine(env, {
+      coder: async () => { coderCalls++; return okCoder(); },
+      checks: async () => { env.tracker.issues.get(21)!.body = 'changed requirements'; return checksFail(); },
+    });
+    await tickAndDrain(engine);
+    assert.equal(store.getTask('me/sandbox', 21)!.status, 'BLOCKED_APPROVAL_CHANGED');
+    assert.equal(coderCalls, 1);
+  } finally { env.done(); }
+});
+
+test('review tampering is blocked even when reviewer throws', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(22, { ...ISSUE });
+    let dirty = false;
+    const { store, engine } = makeEngine(env, {
+      workspace: { ...fakeWorkspace(), isDirty: async () => dirty } as unknown as GitWorkspace,
+      review: async () => { dirty = true; throw new Error('review failed'); },
+    });
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 22)!;
+    assert.equal(task.status, 'BLOCKED');
+    assert.match(store.runsForTask(task.id)[0]!.reason ?? '', /modified during review/);
+    assert.equal(env.tracker.prCreated, 0);
+  } finally { env.done(); }
+});
+
+test('PR summary uses final review PASS after a repaired BLOCK', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(23, { ...ISSUE });
+    let body = ''; let reviews = 0;
+    const create = env.tracker.createDraftPr.bind(env.tracker);
+    env.tracker.createDraftPr = async (repo, opts) => { body = opts.body; return create(repo, opts); };
+    const { engine } = makeEngine(env, { review: async () => ({ result: { verdict: ++reviews === 1 ? 'BLOCK' : 'PASS',
+      summary: 'checked', findings: reviews === 1 ? ['parser: empty input causes crash; add a regression'] : [] }, logPath: 'r' }) });
+    await tickAndDrain(engine);
+    assert.match(body, /Review 结论：PASS/);
+    assert.doesNotMatch(body, /Review 结论：BLOCK/);
+  } finally { env.done(); }
+});
+
+test('closed and merged existing PRs do not masquerade as awaiting review', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(24, { ...ISSUE });
+    env.tracker.issues.set(25, { ...ISSUE });
+    env.tracker.prs.set('agent/issue-24', { number: 24, url: 'https://x/pull/24', state: 'CLOSED', isDraft: true });
+    env.tracker.prs.set('agent/issue-25', { number: 25, url: 'https://x/pull/25', state: 'MERGED', isDraft: false });
+    let coderCalls = 0;
+    const { store, engine } = makeEngine(env, { coder: async () => { coderCalls++; return okCoder(); } });
+    await tickAndDrain(engine);
+    assert.equal(store.getTask('me/sandbox', 24)!.status, 'BLOCKED');
+    assert.equal(store.getTask('me/sandbox', 25)!.status, 'COMPLETED');
+    assert.equal(coderCalls, 0);
+  } finally { env.done(); }
+});
+
+test('successful checks that change HEAD cannot authorize review or publish', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(26, { ...ISSUE });
+    let sha = 'before'; let reviews = 0;
+    const { store, engine } = makeEngine(env, {
+      workspace: { ...fakeWorkspace(), head: async () => sha } as unknown as GitWorkspace,
+      checks: async () => { sha = 'after'; return checksOk(); },
+      review: async () => { reviews++; return { result: { verdict: 'PASS', summary: 'ok', findings: [] }, logPath: 'r' }; },
+    });
+    await tickAndDrain(engine);
+    assert.equal(store.getTask('me/sandbox', 26)!.status, 'BLOCKED');
+    assert.equal(reviews, 0);
+    assert.equal(env.tracker.prCreated, 0);
+  } finally { env.done(); }
+});
+
+test('recovering publish without in-memory evidence reruns checks and review', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(27, { ...ISSUE });
+    let checks = 0; let reviews = 0; let coder = 0;
+    const { store, engine } = makeEngine(env, {
+      coder: async () => { coder++; return okCoder(); },
+      checks: async () => { checks++; return checksOk(); },
+      review: async () => { reviews++; return { result: { verdict: 'PASS', summary: 'ok', findings: [] }, logPath: 'r' }; },
+    });
+    const { task } = store.upsertDiscovered({ repo: 'me/sandbox', issue_number: 27, issue_title: 't', issue_url: 'u' });
+    store.setTaskStatus(task.id, 'RUNNING');
+    const run = store.claimRun(task.id);
+    store.updateRunFields(run.run_id, { workspace: env.dir, branch: 'agent/issue-27' });
+    store.transition(run.run_id, 'CLAIMED', 'PUBLISHING_PR');
+    engine.resumeRun(run.run_id);
+    for (let i = 0; i < 150 && engine.activeCount(); i++) await sleep(20);
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_MERGE');
+    assert.equal(coder, 0); assert.equal(checks, 1); assert.equal(reviews, 1);
+  } finally { env.done(); }
+});
+
+test('truncated captured diff is not sent for automatic review', async () => {
+  const { WorkspaceError } = await import('../src/workspace/git.js');
+  const result = { exitCode: 0, signal: null, timedOut: false, aborted: false, durationMs: 1, stdoutTail: 'output', stderrTail: '' };
+  const ws = new GitWorkspace(async (opts) => ({ ...result, stdoutTruncated: opts.argv.includes('--find-renames') }));
+  await assert.rejects(ws.diffVsBase('.', 'main'), WorkspaceError);
+});
+
+test('workspace publishes the reviewed SHA rather than a moving branch ref', async () => {
+  const calls: string[][] = [];
+  const ws = new GitWorkspace(async (opts) => {
+    calls.push(opts.argv);
+    return { exitCode: 0, signal: null, timedOut: false, aborted: false, durationMs: 1, stdoutTail: '', stderrTail: '' };
+  });
+  await ws.push('.', 'agent/issue-1', 'reviewed-sha');
+  assert.deepEqual(calls[0], ['git', 'push', 'origin', 'reviewed-sha:refs/heads/agent/issue-1']);
 });
 
 test('workspace ensureWorktree creates and reuses (real git)', async () => {

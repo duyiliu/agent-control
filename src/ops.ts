@@ -1,4 +1,5 @@
 import { approvalHash } from './tracker/github.js';
+import { runProcessRisk, type ProcessSafetyDeps } from './proc.js';
 import type { Store } from './store/sqlite.js';
 import type { AppConfig, IssueData, Phase, TaskRow } from './types.js';
 import { RUN_ACTIVE_PHASES } from './types.js';
@@ -31,12 +32,20 @@ export async function retryTask(
   config: AppConfig,
   tracker: OpsTracker,
   task: TaskRow,
+  processDeps: ProcessSafetyDeps = {},
 ): Promise<string> {
   if (!RETRYABLE.includes(task.status)) {
     throw new OpsError(`task status ${task.status} is not retryable`);
   }
   if (store.activeRunForTask(task.id)) {
     throw new OpsError('an active run still exists; stop it first');
+  }
+
+  const previous = store.runsForTask(task.id);
+  for (const run of previous) {
+    if (run.phase === 'AWAITING_MERGE' || run.phase === 'COMPLETED') continue;
+    const risk = await runProcessRisk(run, processDeps);
+    if (risk) throw new OpsError(`cannot retry: ${risk}`);
   }
 
   // Re-validate approval against the CURRENT issue content — a human
@@ -48,8 +57,17 @@ export async function retryTask(
   if (!issue.labels.includes(project.ready_label)) {
     throw new OpsError(`issue lacks ${project.ready_label} label`);
   }
+  if (issue.labels.includes('agent-running')) {
+    throw new OpsError('issue is marked agent-running; confirm no scheduler owns it before removing a stale label and retrying');
+  }
 
-  store.setTaskStatus(task.id, 'DISCOVERED', { approved_hash: approvalHash(issue) });
+  store.tx(() => {
+    const current = store.getTaskById(task.id);
+    if (!current || !RETRYABLE.includes(current.status) || store.activeRunForTask(task.id)) {
+      throw new OpsError('task changed while retry was being checked; refresh and try again');
+    }
+    store.setTaskStatus(task.id, 'DISCOVERED', { approved_hash: approvalHash(issue) });
+  });
   await tracker.removeLabel(task.repo, task.issue_number, 'agent-blocked').catch(() => {});
   return `task ${task.repo}#${task.issue_number} re-queued (hash ${approvalHash(issue).slice(0, 12)})`;
 }

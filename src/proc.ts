@@ -27,14 +27,18 @@ export interface ProcResult {
   durationMs: number;
   stdoutTail: string;
   stderrTail: string;
+  spawnError?: string;
+  stdoutTruncated?: boolean;
 }
 
 class TailBuffer {
   private chunks: Buffer[] = [];
   private size = 0;
+  truncated = false;
   push(chunk: Buffer) {
     this.chunks.push(chunk);
     this.size += chunk.length;
+    if (this.size > TAIL_LIMIT) this.truncated = true;
     while (this.size > TAIL_LIMIT && this.chunks.length > 1) {
       this.size -= this.chunks[0]!.length;
       this.chunks.shift();
@@ -50,6 +54,9 @@ class TailBuffer {
  * stream full output to logPath, enforce timeout, support abort.
  */
 export function runProc(opts: RunProcOpts): Promise<ProcResult> {
+  if (opts.signal?.aborted) {
+    return Promise.resolve({ exitCode: null, signal: null, timedOut: false, aborted: true, durationMs: 0, stdoutTail: '', stderrTail: '' });
+  }
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const stdout = new TailBuffer();
@@ -79,6 +86,7 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
         durationMs: Date.now() - startedAt,
         stdoutTail: '',
         stderrTail: `spawn failed: ${String(err)}`,
+        spawnError: String(err),
       });
       return;
     }
@@ -87,6 +95,7 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
     let timedOut = false;
     let aborted = false;
     let settled = false;
+    let spawnError: string | undefined;
     let killTimer: NodeJS.Timeout | null = null;
 
     const finish = (exitCode: number | null, signal: string | null) => {
@@ -104,6 +113,8 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
         durationMs: Date.now() - startedAt,
         stdoutTail: stdout.text(),
         stderrTail: stderr.text(),
+        ...(spawnError ? { spawnError } : {}),
+        ...(stdout.truncated ? { stdoutTruncated: true } : {}),
       });
     };
 
@@ -147,9 +158,11 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
       log?.write(c);
     });
     child.on('error', (err) => {
+      spawnError = String(err);
       stderr.push(Buffer.from(`\nspawn error: ${String(err)}\n`));
     });
     child.on('close', (code, signal) => finish(code, signal));
+    if (opts.signal?.aborted) onAbort();
 
     if (opts.stdinData !== undefined) {
       child.stdin!.write(opts.stdinData);
@@ -244,7 +257,7 @@ function taskkillTree(pid: number) {
  */
 export async function findProcessesReferencing(needle: string): Promise<number[] | null> {
   if (process.platform === 'win32') {
-    const ps = process.env.POWERSHELL_EXE ?? 'powershell.exe';
+    const ps = process.env.POWERSHELL_EXE ?? 'pwsh.exe';
     const esc = needle.replace(/'/g, "''");
     const res = await runProc({
       argv: [
@@ -270,6 +283,33 @@ export async function findProcessesReferencing(needle: string): Promise<number[]
     .filter((n) => Number.isFinite(n) && n > 0);
 }
 
+export interface ProcessSafetyDeps {
+  isPidAlive?: (pid: number) => boolean;
+  processStartedAt?: (pid: number) => Promise<number | null>;
+  findProcs?: (needle: string) => Promise<number[] | null>;
+}
+
+export async function runProcessRisk(
+  run: { pid: number | null; process_identity: string | null; workspace: string | null },
+  deps: ProcessSafetyDeps = {},
+): Promise<string | null> {
+  if (run.pid && (deps.isPidAlive ?? pidAlive)(run.pid)) {
+    const [pid, start] = (run.process_identity ?? '').split(':');
+    const expected = Number(start);
+    const actual = await (deps.processStartedAt ?? processStartedAt)(run.pid).catch(() => null);
+    if (Number(pid) !== run.pid || !start || !Number.isFinite(expected) || actual === null || Math.abs(actual - expected) < 10_000) {
+      return 'child process may still be alive; refusing duplicate';
+    }
+  }
+  if (run.workspace && existsSync(run.workspace)) {
+    const pids = await (deps.findProcs ?? findProcessesReferencing)(run.workspace).catch(() => null);
+    if (pids === null) return 'cannot verify no orphaned processes on worktree';
+    const strays = pids.filter((pid) => pid !== process.pid);
+    if (strays.length) return `orphaned process(es) on worktree: ${strays.join(', ')}`;
+  }
+  return null;
+}
+
 /** Locate a command on PATH (Windows-aware PATHEXT handling). */
 export function which(command: string, envPath = process.env.PATH ?? ''): string | null {
   const isWin = process.platform === 'win32';
@@ -289,7 +329,7 @@ export function which(command: string, envPath = process.env.PATH ?? ''): string
 /** Query a process's start time (for PID-reuse-safe liveness checks). */
 export async function processStartedAt(pid: number): Promise<number | null> {
   if (process.platform === 'win32') {
-    const ps = process.env.POWERSHELL_EXE ?? 'powershell.exe';
+    const ps = process.env.POWERSHELL_EXE ?? 'pwsh.exe';
     const res = await runProc({
       argv: [
         ps,

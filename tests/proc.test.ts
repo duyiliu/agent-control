@@ -37,6 +37,28 @@ test('runProc abort signal kills child', async () => {
   assert.equal(res.aborted, true);
 });
 
+test('runProc: already aborted signal never spawns a process', async () => {
+  const ctl = new AbortController(); ctl.abort();
+  let spawned = false;
+  const res = await runProc({ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1000,
+    signal: ctl.signal, onSpawn: () => { spawned = true; } });
+  assert.equal(res.aborted, true);
+  assert.equal(spawned, false);
+});
+
+test('runProc reports spawn failure separately from command exit', async () => {
+  const res = await runProc({ argv: ['agent-control-nonexistent-test-executable'], timeoutMs: 1000 });
+  assert.ok(res.spawnError);
+  assert.notEqual(res.exitCode, 0);
+});
+
+test('runProc marks captured output that exceeds the tail limit', async () => {
+  const res = await runProc({ argv: [process.execPath, '-e', 'process.stdout.write("x".repeat(100000))'], timeoutMs: 1000 });
+  assert.equal(res.exitCode, 0);
+  assert.equal(res.stdoutTruncated, true);
+  assert.ok(res.stdoutTail.length <= 64 * 1024);
+});
+
 test('runProc stdinData is piped and stdin closed', async () => {
   const res = await runProc({
     argv: [process.execPath, '-e', 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log("got:"+d))'],

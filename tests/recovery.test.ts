@@ -136,6 +136,45 @@ test('crash after PR create + approval revoked → PR closed, task CANCELED', as
   } finally { env.done(); }
 });
 
+test('GitHub issue read failure during publish recovery never closes PR', async () => {
+  const env = setup();
+  try {
+    let closed = 0;
+    env.tracker.prs.set('agent/issue-1', { number: 9, url: 'https://x/pull/9', state: 'OPEN', isDraft: true });
+    env.tracker.getIssue = async () => { throw new Error('network timeout'); };
+    (env.tracker as { closePr?: () => Promise<void> }).closePr = async () => { closed++; };
+    const { task } = await seedRun(env.store, 'PUBLISHING_PR', { workspace: env.dir });
+    const report = await reconcile({ store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [], isPidAlive: () => false });
+    assert.equal(closed, 0);
+    assert.equal(report.resumed.length, 0);
+    assert.equal(env.store.getTaskById(task.id)!.status, 'RECOVERY_REQUIRED');
+  } finally { env.done(); }
+});
+
+test('PR query failure during recovery never starts another publisher', async () => {
+  const env = setup();
+  try {
+    env.tracker.findPrForBranch = async () => { throw new Error('network timeout'); };
+    const { task } = await seedRun(env.store, 'PUBLISHING_PR', { workspace: env.dir });
+    const report = await reconcile({ store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [], isPidAlive: () => false });
+    assert.equal(report.resumed.length, 0);
+    assert.equal(env.store.getTaskById(task.id)!.status, 'RECOVERY_REQUIRED');
+  } finally { env.done(); }
+});
+
+test('live recorded PID without identity is never safe to resume', async () => {
+  const env = setup();
+  try {
+    const { task } = await seedRun(env.store, 'RUNNING', { pid: 123, workspace: env.dir });
+    await reconcile({ store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [], isPidAlive: () => true, processStartedAt: async () => null });
+    assert.equal(env.resumed.length, 0);
+    assert.equal(env.store.getTaskById(task.id)!.status, 'RECOVERY_REQUIRED');
+  } finally { env.done(); }
+});
+
 test('crash before PR create → publish re-run (idempotent check first)', async () => {
   const env = setup();
   try {

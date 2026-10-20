@@ -5,7 +5,7 @@ import type { IssueData, PrInfo, ProjectConfig } from '../types.js';
 export class PublishError extends Error {
   constructor(
     message: string,
-    readonly reason: 'uncommitted_changes' | 'no_commits' | 'push_failed' | 'create_failed' | 'approval_revoked',
+    readonly reason: 'uncommitted_changes' | 'head_changed' | 'no_commits' | 'push_failed' | 'create_failed' | 'approval_revoked',
   ) {
     super(message);
   }
@@ -24,6 +24,7 @@ export async function publishDraftPr(input: {
   prBody: string;
   workspace: GitWorkspace;
   tracker: GitHubTracker;
+  expectedHead: string;
   /**
    * Final approval re-check invoked immediately before `gh pr create`
    * (after push). Returns 'ok' or the terminal phase the run should end with.
@@ -33,27 +34,23 @@ export async function publishDraftPr(input: {
 }): Promise<PrInfo> {
   const { project, worktreePath, branch, issue, workspace, tracker } = input;
 
-  if (await workspace.isDirty(worktreePath)) {
-    // The agent is asked to commit, but it may leave uncommitted leftovers.
-    // Commit them verbatim as the host — never fabricate content, just
-    // record what exists.
-    await workspace.commitAll(
-      worktreePath,
-      `agent-control: commit uncommitted agent work for issue #${issue.number}`,
-    );
+  const assertReviewed = async () => {
     if (await workspace.isDirty(worktreePath)) {
-      throw new PublishError(
-        `worktree still has uncommitted changes after fallback commit`,
-        'uncommitted_changes',
-      );
+      throw new PublishError('worktree changed after verification; refusing to commit during publish', 'uncommitted_changes');
     }
-  }
+    if (!input.expectedHead || await workspace.head(worktreePath) !== input.expectedHead) {
+      throw new PublishError('branch HEAD changed after review', 'head_changed');
+    }
+  };
+  await assertReviewed();
   if ((await workspace.aheadCount(worktreePath, project.base_branch)) === 0) {
     throw new PublishError(`branch ${branch} has no commits vs ${project.base_branch}`, 'no_commits');
   }
 
   const existing = await tracker.findPrForBranch(project.repo, branch);
-  await workspace.push(worktreePath, branch);
+  await assertReviewed();
+  await workspace.push(worktreePath, branch, input.expectedHead);
+  await assertReviewed();
   if (existing) return existing;
 
   const gate = await input.beforeCreate?.();

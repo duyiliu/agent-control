@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { findProcessesReferencing, pidAlive, processStartedAt } from '../proc.js';
+import { runProcessRisk } from '../proc.js';
 import type { Store } from '../store/sqlite.js';
 import type { AppLog } from '../telemetry/logging.js';
 import type { Phase, RunRow, TaskRow } from '../types.js';
@@ -37,8 +37,6 @@ const MAX_RESUMES = 2;
  */
 export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
   const { store, appLog } = deps;
-  const alive = deps.isPidAlive ?? pidAlive;
-  const startedAt = deps.processStartedAt ?? processStartedAt;
   const report: RecoveryReport = { resumed: [], recoveryRequired: [], finalized: [] };
 
   for (const run of store.activeRuns()) {
@@ -48,48 +46,46 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
       continue;
     }
 
-    const childMightLive = await childAliveCheck(run, alive, startedAt);
-    if (childMightLive) {
-      markRecoveryRequired(deps, task, run, 'child process still alive; refusing duplicate');
-      report.recoveryRequired.push({ run_id: run.run_id, why: 'child alive' });
+    const risk = await runProcessRisk(run, deps);
+    if (risk) {
+      markRecoveryRequired(deps, task, run, risk);
+      report.recoveryRequired.push({ run_id: run.run_id, why: risk });
       continue;
-    }
-
-    // Orphan scan: the recorded child is gone, but a killed host may have left
-    // grandchildren behind. Refuse to resume a phase that could have spawned
-    // subprocesses while anything still references the worktree — and also
-    // refuse when we cannot prove the worktree is clean.
-    const childPhases = ['RUNNING', 'FIXING', 'VERIFYING', 'REVIEWING', 'PUBLISHING_PR'];
-    if (childPhases.includes(run.phase) && run.workspace && existsSync(run.workspace)) {
-      const scan = deps.findProcs ?? findProcessesReferencing;
-      const strays = await scan(run.workspace)
-        .then((pids) => pids?.filter((p) => p !== process.pid) ?? null)
-        .catch(() => null);
-      if (strays === null) {
-        markRecoveryRequired(deps, task, run, 'cannot verify no orphaned processes on worktree');
-        report.recoveryRequired.push({ run_id: run.run_id, why: 'orphan scan failed' });
-        continue;
-      }
-      if (strays.length > 0) {
-        markRecoveryRequired(deps, task, run, `orphaned process(es) on worktree: ${strays.join(', ')}`);
-        report.recoveryRequired.push({ run_id: run.run_id, why: 'orphans alive' });
-        continue;
-      }
     }
 
     switch (run.phase) {
       case 'PUBLISHING_PR': {
         const project = deps.config.projects.find((p) => p.repo === task.repo)!;
         const branch = run.branch ?? (project ? `${project.branch_prefix}${task.issue_number}` : null);
-        let existing = null;
-        if (project && branch) {
-          existing = await deps.tracker.findPrForBranch(project.repo, branch).catch(() => null);
+        let existing;
+        try {
+          existing = project && branch ? await deps.tracker.findPrForBranch(project.repo, branch) : null;
+        } catch (err) {
+          const why = `cannot query PR during recovery; no external action taken: ${String(err).slice(0, 300)}`;
+          markRecoveryRequired(deps, task, run, why);
+          report.recoveryRequired.push({ run_id: run.run_id, why });
+          break;
+        }
+        if (existing?.state === 'MERGED' || existing?.state === 'CLOSED') {
+          const phase = existing.state === 'MERGED' ? 'COMPLETED' : 'BLOCKED';
+          store.endRun(run.run_id, phase, `recovered: PR is ${existing.state}`);
+          store.setTaskStatus(task.id, phase, { pr_url: existing.url, branch });
+          report.finalized.push(run.run_id);
+          break;
         }
         if (existing) {
           // Side effect already happened before the crash. Re-validate
           // approval — the crash may have landed between PR create and the
           // engine's post-create gate. If revoked, close the stray PR.
-          const issue = await deps.tracker.getIssue(project.repo, task.issue_number).catch(() => null);
+          let issue;
+          try {
+            issue = await deps.tracker.getIssue(project.repo, task.issue_number);
+          } catch (err) {
+            const why = `cannot confirm approval during recovery; PR left unchanged: ${String(err).slice(0, 300)}`;
+            markRecoveryRequired(deps, task, run, why);
+            report.recoveryRequired.push({ run_id: run.run_id, why });
+            break;
+          }
           const labelled = !!issue && issue.state === 'OPEN' && issue.labels.includes(project.ready_label);
           const hashOk = !!issue && (!task.approved_hash || approvalHash(issue) === task.approved_hash);
           if (labelled && hashOk) {
@@ -166,28 +162,6 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
     finalized: report.finalized.length,
   });
   return report;
-}
-
-async function childAliveCheck(
-  run: RunRow,
-  alive: (pid: number) => boolean,
-  startedAt: (pid: number) => Promise<number | null>,
-): Promise<boolean> {
-  if (!run.pid || !run.process_identity) return false;
-  if (!alive(run.pid)) return false;
-  const [, startMsStr] = run.process_identity.split(':');
-  const expectedMs = Number(startMsStr);
-  if (!Number.isFinite(expectedMs)) {
-    // Identity unverifiable while PID is alive -> assume it might be the child.
-    return true;
-  }
-  const actual = await startedAt(run.pid);
-  if (actual == null) {
-    // Cannot prove it's someone else's process -> conservative.
-    return true;
-  }
-  // PID was reused if the live process started notably after our recorded spawn.
-  return Math.abs(actual - expectedMs) < 10_000;
 }
 
 function resume(store: Store, run: RunRow, phase: Phase) {
