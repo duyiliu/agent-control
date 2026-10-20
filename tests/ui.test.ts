@@ -187,6 +187,58 @@ test('web ui', async (t) => {
   });
 });
 
+test('web ui token auth', async (t) => {
+  const dir = tmpDir();
+  const config = makeConfig(dir);
+  config.server.ui = { enabled: true, host: '127.0.0.1', port: 0, token: 's3cr3t-token' };
+  const store = makeStore(dir);
+  const tracker = makeFakeTracker();
+  mkdirLogs(config.server.logs_dir);
+
+  const ui = await startUiServer({
+    deps: { store, config, tracker, activeCount: () => 0 },
+    host: '127.0.0.1', port: 0, appLog: nullLog,
+  });
+  t.after(() => {
+    ui.close();
+    teardown(dir, [store]);
+  });
+
+  await t.test('unauthenticated requests are rejected', async () => {
+    const api = await fetch(`${ui.url}/api/tasks`);
+    assert.equal(api.status, 401);
+    const page = await fetch(ui.url, { redirect: 'manual' });
+    assert.equal(page.status, 401);
+    assert.match(page.headers.get('content-type') ?? '', /text\/html/);
+    const wrong = await fetch(`${ui.url}/?token=nope`, { redirect: 'manual' });
+    assert.equal(wrong.status, 401);
+  });
+
+  await t.test('?token= sets cookie and redirects to a clean URL', async () => {
+    const r = await fetch(`${ui.url}/?token=s3cr3t-token`, { redirect: 'manual' });
+    assert.equal(r.status, 302);
+    assert.equal(r.headers.get('location'), '/');
+    const cookie = r.headers.get('set-cookie') ?? '';
+    assert.match(cookie, /ac_ui_token=/);
+    assert.match(cookie, /HttpOnly/);
+  });
+
+  await t.test('cookie and bearer token authenticate', async () => {
+    const viaCookie = await fetch(`${ui.url}/api/tasks`, {
+      headers: { cookie: 'ac_ui_token=s3cr3t-token' },
+    });
+    assert.equal(viaCookie.status, 200);
+    const viaBearer = await fetch(`${ui.url}/api/tasks`, {
+      headers: { authorization: 'Bearer s3cr3t-token' },
+    });
+    assert.equal(viaBearer.status, 200);
+    const wrongBearer = await fetch(`${ui.url}/api/tasks`, {
+      headers: { authorization: 'Bearer wrong' },
+    });
+    assert.equal(wrongBearer.status, 401);
+  });
+});
+
 function mkdirLogs(dir: string) {
   mkdirSync(dir, { recursive: true });
 }

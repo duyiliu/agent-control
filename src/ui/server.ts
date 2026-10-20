@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createReadStream, existsSync } from 'node:fs';
+import { timingSafeEqual } from 'node:crypto';
 import { extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppLog } from '../telemetry/logging.js';
@@ -59,6 +60,75 @@ function serveStatic(path: string, res: ServerResponse): boolean {
   return true;
 }
 
+const TOKEN_COOKIE = 'ac_ui_token';
+
+function tokenEq(given: string, expected: string): boolean {
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function cookieToken(req: IncomingMessage): string | null {
+  const raw = req.headers.cookie;
+  if (!raw) return null;
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === TOKEN_COOKIE) {
+      return decodeURIComponent(part.slice(i + 1).trim());
+    }
+  }
+  return null;
+}
+
+function bearerToken(req: IncomingMessage): string | null {
+  const h = req.headers.authorization;
+  return h?.startsWith('Bearer ') ? h.slice('Bearer '.length).trim() : null;
+}
+
+function unauthorized(res: ServerResponse, isApi: boolean) {
+  if (isApi) {
+    json(res, 401, { error: 'unauthorized' });
+    return;
+  }
+  res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' });
+  res.end(
+    `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+     <body style="font:14px system-ui;background:#0b0d10;color:#d5d9e0;display:grid;place-items:center;min-height:100vh;margin:0">
+     <form method="GET" action="/" style="display:flex;gap:8px">
+       <input name="token" type="password" autofocus placeholder="access token"
+              style="padding:10px 14px;width:280px;background:#15181d;border:1px solid #2a2f37;border-radius:6px;color:#d5d9e0">
+       <button style="padding:10px 18px;border:0;border-radius:6px;background:#4f7cff;color:#fff;cursor:pointer">进入</button>
+     </form></body>`,
+  );
+}
+
+// Returns true when the request is allowed to proceed. With no token
+// configured the gate is a no-op (loopback-only local usage).
+function checkAuth(deps: UiDeps, req: IncomingMessage, res: ServerResponse, url: URL): boolean {
+  const expected = deps.config.server.ui.token;
+  if (!expected) return true;
+
+  const q = url.searchParams.get('token');
+  if (q !== null && tokenEq(q, expected)) {
+    // Convert the shareable ?token= URL into a cookie and strip it from the
+    // address bar so it never sits in history or Referer headers.
+    url.searchParams.delete('token');
+    const target = url.pathname + (url.search ? url.search : '');
+    res.writeHead(302, {
+      location: target || '/',
+      'set-cookie': `${TOKEN_COOKIE}=${encodeURIComponent(expected)}; Path=/; HttpOnly; SameSite=Lax`,
+    });
+    res.end();
+    return false;
+  }
+
+  const presented = bearerToken(req) ?? cookieToken(req);
+  if (presented !== null && tokenEq(presented, expected)) return true;
+
+  unauthorized(res, url.pathname.startsWith('/api/'));
+  return false;
+}
+
 function notBuilt(res: ServerResponse) {
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(
@@ -72,6 +142,8 @@ async function handle(deps: UiDeps, req: IncomingMessage, res: ServerResponse): 
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const path = url.pathname;
   const method = req.method ?? 'GET';
+
+  if (!checkAuth(deps, req, res, url)) return;
 
   if (method === 'GET' && path === '/api/tasks') {
     json(res, 200, tasksPayload(deps.store));
