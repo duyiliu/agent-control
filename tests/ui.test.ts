@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { startUiServer } from '../src/ui/server.js';
 import { makeConfig, makeFakeTracker, makeStore, nullLog, teardown, tmpDir } from './helpers.js';
@@ -107,6 +107,18 @@ test('web ui', async (t) => {
     assert.ok(tail.offset > 128 * 1024, 'starts near the end instead of replaying history');
     assert.doesNotMatch(tail.chunk, /"i":0[,}]/);
     assert.ok(tail.pending < 1024 * 1024);
+  });
+
+  await t.test('GET /api/runs/:id/tail follows the newest reviewer log', async () => {
+    const dir4 = join(config.server.logs_dir, 'artifacts', run.run_id);
+    const review = join(dir4, 'review-agent-1.jsonl');
+    writeFileSync(review, '{"type":"review_started"}\n');
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(review, later, later);
+
+    const tail = await fetchJson(`${ui.url}/api/runs/${run.run_id}/tail?offset=0`);
+    assert.equal(tail.file, 'review-agent-1.jsonl');
+    assert.match(tail.chunk, /review_started/);
   });
 
   await t.test('GET /api/runs/:id/tail rejects foreign file names', async () => {

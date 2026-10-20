@@ -187,8 +187,10 @@ export function tailPayload(
   } else {
     let names: string[];
     try { names = readdirSync(dir); } catch { return { status: 404, body: { error: 'no artifacts for run' } }; }
+    // Follow whichever log is being written now: the coder log during
+    // RUNNING/FIXING, the reviewer log during REVIEWING.
     const agentLogs = names
-      .filter((n) => /^agent-[\w.-]+\.jsonl$/.test(n))
+      .filter((n) => /^(?:agent|review-agent)-[\w.-]+\.jsonl$/.test(n))
       .map((n) => ({ n, m: statSync(join(dir, n)).mtimeMs }))
       .sort((a, b) => b.m - a.m);
     if (agentLogs.length === 0) return { status: 404, body: { error: 'no agent log yet' } };

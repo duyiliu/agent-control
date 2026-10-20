@@ -629,10 +629,28 @@ test('recovering publish without in-memory evidence reruns checks and review', a
 });
 
 test('truncated captured diff is not sent for automatic review', async () => {
-  const { WorkspaceError } = await import('../src/workspace/git.js');
+  const { DiffTooLargeError } = await import('../src/workspace/git.js');
   const result = { exitCode: 0, signal: null, timedOut: false, aborted: false, durationMs: 1, stdoutTail: 'output', stderrTail: '' };
   const ws = new GitWorkspace(async (opts) => ({ ...result, stdoutTruncated: opts.argv.includes('--find-renames') }));
-  await assert.rejects(ws.diffVsBase('.', 'main'), WorkspaceError);
+  await assert.rejects(ws.diffVsBase('.', 'main'), DiffTooLargeError);
+});
+
+test('oversized review diff blocks for a human instead of failing the run', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(31, { ...ISSUE });
+    const { DiffTooLargeError } = await import('../src/workspace/git.js');
+    const { store, engine } = makeEngine(env, {
+      workspace: {
+        ...fakeWorkspace(),
+        diffVsBase: async () => { throw new DiffTooLargeError('review diff exceeds captured output limit; human review required'); },
+      } as unknown as GitWorkspace,
+    });
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 31)!;
+    assert.equal(task.status, 'BLOCKED');
+    assert.match(store.runsForTask(task.id)[0]!.reason ?? '', /human review required/);
+  } finally { env.done(); }
 });
 
 test('workspace publishes the reviewed SHA rather than a moving branch ref', async () => {

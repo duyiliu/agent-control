@@ -59,6 +59,16 @@ test('runProc marks captured output that exceeds the tail limit', async () => {
   assert.ok(res.stdoutTail.length <= 64 * 1024);
 });
 
+test('runProc can keep a larger stdout tail for large diffs', async () => {
+  const res = await runProc({
+    argv: [process.execPath, '-e', 'process.stdout.write("x".repeat(200000))'],
+    timeoutMs: 5_000,
+    stdoutLimit: 512 * 1024,
+  });
+  assert.equal(res.stdoutTruncated, undefined);
+  assert.equal(res.stdoutTail.length, 200_000);
+});
+
 test('runProc stdinData is piped and stdin closed', async () => {
   const res = await runProc({
     argv: [process.execPath, '-e', 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log("got:"+d))'],

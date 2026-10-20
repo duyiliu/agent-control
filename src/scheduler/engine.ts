@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import type { Store } from '../store/sqlite.js';
 import { RunLog, type AppLog } from '../telemetry/logging.js';
 import { approvalHash, GitHubTracker } from '../tracker/github.js';
-import { GitWorkspace } from '../workspace/git.js';
+import { DiffTooLargeError, GitWorkspace } from '../workspace/git.js';
 import { openPiCoderSession, type CoderSession, type CoderSessionOpts, type CoderTurn } from '../runners/session.js';
 import { PI_ALL_TOOLS } from '../runners/pi.js';
 import { runChecks, type ChecksSummary } from '../verify/checks.js';
@@ -433,6 +433,12 @@ export class Engine {
               mkdirSync(this.artifactsDirFor(run), { recursive: true });
               writeFileSync(join(this.artifactsDirFor(run), 'review-diff.patch'), diffEvidence, 'utf8');
             } catch (err) {
+              if (err instanceof DiffTooLargeError) {
+                // The PR and its checks are fine; only automatic review is out
+                // of reach. Hand it to a human instead of failing the run.
+                this.finish(run, task, 'BLOCKED', err.message, { pr_url: prUrl });
+                return;
+              }
               this.finish(run, task, 'FAILED', `review diff unavailable: ${String(err).slice(0, 300)}`);
               return;
             }

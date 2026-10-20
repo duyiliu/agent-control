@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runReview, ReviewInfraError } from '../src/verify/review.js';
-import { buildReviewPrompt, type PromptContext } from '../src/scheduler/prompts.js';
+import { buildReviewPrompt, MAX_REVIEW_DIFF_CHARS, type PromptContext } from '../src/scheduler/prompts.js';
 import type { AgentCallOpts, AgentCallResult } from '../src/runners/types.js';
 import { makeConfig, tmpDir, cleanup } from './helpers.js';
 
@@ -72,7 +72,7 @@ test('review: incomplete diff escalates without invoking a model', async () => {
   const env = setup();
   try {
     let calls = 0;
-    const out = await runReview(env.ctx, 'pass', 'x'.repeat(60_001), env.deps, async () => { calls++; return ok(); });
+    const out = await runReview(env.ctx, 'pass', 'x'.repeat(MAX_REVIEW_DIFF_CHARS + 1), env.deps, async () => { calls++; return ok(); });
     assert.equal(calls, 0);
     assert.equal(out.result.verdict, 'HUMAN_REVIEW_REQUIRED');
   } finally { cleanup(env.dir); }

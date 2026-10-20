@@ -108,7 +108,9 @@ export default function LiveLog(props: {
 
     const tick = async () => {
       try {
-        const res = await fetchTail(runId, offset.current, file);
+        // Always let the server pick the newest log, so REVIEWING switches from
+        // the coder log to the reviewer log without reopening the drawer.
+        const res = await fetchTail(runId, offset.current, null);
         if (!alive) return;
         if (res.file !== file) {
           // A new turn opened a fresh log file: start over rather than mix runs.

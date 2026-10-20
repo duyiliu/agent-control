@@ -17,6 +17,8 @@ export interface RunProcOpts {
   onSpawn?: (pid: number | null) => void;
   /** Also append structured stdout (JSONL) to logPath. Default true. */
   streamStdoutToLog?: boolean;
+  /** Bytes of stdout kept for the tail. Default 64 KiB; raise for large diffs. */
+  stdoutLimit?: number;
 }
 
 export interface ProcResult {
@@ -35,17 +37,18 @@ class TailBuffer {
   private chunks: Buffer[] = [];
   private size = 0;
   truncated = false;
+  constructor(private readonly limit = TAIL_LIMIT) {}
   push(chunk: Buffer) {
     this.chunks.push(chunk);
     this.size += chunk.length;
-    if (this.size > TAIL_LIMIT) this.truncated = true;
-    while (this.size > TAIL_LIMIT && this.chunks.length > 1) {
+    if (this.size > this.limit) this.truncated = true;
+    while (this.size > this.limit && this.chunks.length > 1) {
       this.size -= this.chunks[0]!.length;
       this.chunks.shift();
     }
   }
   text(): string {
-    return Buffer.concat(this.chunks).subarray(-TAIL_LIMIT).toString('utf8');
+    return Buffer.concat(this.chunks).subarray(-this.limit).toString('utf8');
   }
 }
 
@@ -59,7 +62,7 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
   }
   return new Promise((resolve) => {
     const startedAt = Date.now();
-    const stdout = new TailBuffer();
+    const stdout = new TailBuffer(opts.stdoutLimit);
     const stderr = new TailBuffer();
     let log: WriteStream | null = null;
     if (opts.logPath) {

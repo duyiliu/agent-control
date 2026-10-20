@@ -16,7 +16,7 @@
 | Node ≥ 22.13 | 用了内置 `node:sqlite`，低于此版本起不来 |
 | git + GitHub CLI | `gh auth login` 完成认证——发布 PR、探测合并全靠它，跑在宿主侧 |
 | Pi agent runner | `npm i -g @earendil-works/pi-coding-agent` + `~/.pi/agent/models.json`（见下）。运行 `pi --version` 确认在 PATH 上——npm 全局前缀不在 PATH 时 shim 会装到别处 |
-| 托管仓标签 | `agent-ready`、`agent-running`、`agent-blocked`、`agent-pr` 需预先存在——doctor **只验不建**：<br>`gh label create agent-ready -R <owner>/<repo>`（四个都建） |
+| 托管仓标签 | `agent-ready`、`agent-running`、`agent-blocked`、`agent-pr`、`agent-reviewing`、`agent-high-risk` 需预先存在——doctor **只验不建**：<br>`gh label create <label> -R <owner>/<repo>`（六个都建） |
 
 `~/.pi/agent/models.json` 最小形态（OpenAI 兼容网关示例）：
 
@@ -99,7 +99,7 @@ schtasks /delete /tn agent-control  # 卸载
    npm run ac -- runs <issue>  # 单任务事件时间线 + 证据路径
    ```
    原始证据在 `<数据目录>\logs\`：`agent-control.jsonl` 事件流 + 每轮 artifacts（agent 事件、测试日志、review 结论、diff.patch）。
-3. **收口**：checks + review 全过 → 自动出 Draft PR + `agent-pr` 标签。GitHub 上打开 PR → Ready for review → 审完 Merge。调度器检测到 merged → `COMPLETED` → 自动删 worktree/分支。
+3. **收口**：checks 全过 → 自动 push 出 Draft PR + `agent-pr` 标签 → 对 PR 做独立只读 Review；通过后等待合并，高危或阻塞转人工。GitHub 上打开 PR → Ready for review → 审完 Merge。调度器检测到 merged → `COMPLETED` → 自动删 worktree/分支。
 4. **异常**：
 
    | 情况 | 表现 | 处理 |
@@ -135,7 +135,7 @@ schtasks /delete /tn agent-control  # 卸载
 
 ## 状态机
 
-`DISCOVERED → CLAIMED → PREPARING → RUNNING → VERIFYING ↔ FIXING → REVIEWING ↔ FIXING → PUBLISHING_PR → AWAITING_MERGE → COMPLETED`；任意运行相位可落入 `BLOCKED / FAILED / CANCELED / RECOVERY_REQUIRED`。所有迁移写入 `run_events`，测试与 Review 证据写入 `check_results`。
+`DISCOVERED → CLAIMED → PREPARING → RUNNING → VERIFYING ↔ FIXING → PUBLISHING_PR → REVIEWING ↔ FIXING → AWAITING_MERGE → COMPLETED`；首次发布后，REVIEWING 触发的修复会重跑 checks 并通过 `PUBLISHING_PR` 复用已有 PR，不会新建。任意运行相位可落入 `BLOCKED / FAILED / CANCELED / RECOVERY_REQUIRED`。所有迁移写入 `run_events`，测试与 Review 证据写入 `check_results`。
 
 ## 与设计的偏差（已记录）
 

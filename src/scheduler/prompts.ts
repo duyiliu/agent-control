@@ -97,7 +97,7 @@ export function buildFixPrompt(ctx: PromptContext, evidence: string): string {
   ].join('\n');
 }
 
-export const MAX_REVIEW_DIFF_CHARS = 60_000;
+export const MAX_REVIEW_DIFF_CHARS = 120_000;
 
 export function buildReviewPrompt(ctx: PromptContext, testEvidence: string, diffEvidence: string, headSha?: string): string {
   return [

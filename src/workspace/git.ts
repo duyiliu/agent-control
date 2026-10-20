@@ -4,11 +4,17 @@ import { runProc } from '../proc.js';
 
 export class WorkspaceError extends Error {}
 
+/** The diff exists but is too large to review safely; this needs a human. */
+export class DiffTooLargeError extends WorkspaceError {}
+
+/** A 4 MiB capture keeps typical multi-file PRs intact; the review layer caps prompt size. */
+const DIFF_CAPTURE_LIMIT = 4 * 1024 * 1024;
+
 export class GitWorkspace {
   constructor(private exec: typeof runProc = runProc) {}
 
-  private async git(args: string[], cwd: string, timeoutMs = 60_000) {
-    const res = await this.exec({ argv: ['git', ...args], cwd, timeoutMs });
+  private async git(args: string[], cwd: string, timeoutMs = 60_000, stdoutLimit?: number) {
+    const res = await this.exec({ argv: ['git', ...args], cwd, timeoutMs, ...(stdoutLimit ? { stdoutLimit } : {}) });
     if (res.exitCode !== 0) {
       throw new WorkspaceError(
         `git ${args.join(' ')} failed in ${cwd}: ${res.stderrTail.trim() || res.stdoutTail.trim()}`,
@@ -99,8 +105,10 @@ export class GitWorkspace {
     });
     const range = mb.exitCode === 0 ? `${baseBranch}...HEAD` : `${baseBranch}..HEAD`;
     const stat = await this.git(['diff', '--stat', range], worktreePath);
-    const diff = await this.git(['diff', '--find-renames', range], worktreePath, 120_000);
-    if (stat.stdoutTruncated || diff.stdoutTruncated) throw new WorkspaceError('review diff exceeds captured output limit; narrow the task or review manually');
+    const diff = await this.git(['diff', '--find-renames', range], worktreePath, 120_000, DIFF_CAPTURE_LIMIT);
+    // Never hand a truncated diff to the reviewer: a missing prefix can hide
+    // the very change that would have blocked it.
+    if (stat.stdoutTruncated || diff.stdoutTruncated) throw new DiffTooLargeError('review diff exceeds captured output limit; human review required');
     let out = `## STAT\n${stat.stdoutTail}\n## DIFF\n${diff.stdoutTail}`;
     if (out.length > maxChars) out = `${out.slice(0, maxChars)}\n...[truncated ${out.length - maxChars} chars]`;
     return out;
