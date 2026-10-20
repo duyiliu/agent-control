@@ -68,18 +68,13 @@ export interface AppConfig {
   };
   projects: ProjectConfig[];
   agent: {
-    provider: 'pi' | 'codex';
-    /** pi: "<provider>/<model id>" (models.json); codex: `-m` model name. */
+    provider: 'pi';
+    /** pi model identifier from models.json: "<provider>/<model id>". */
     model: string;
-    /** Optional thinking level — pi `--thinking`, codex `model_reasoning_effort`. */
     reasoning_effort?: ReasoningEffort;
-    /** Review phase overrides; fall back to provider/model/reasoning_effort. */
-    review_provider?: 'pi' | 'codex';
+    /** Optional reviewer model and thinking level; the runner remains Pi. */
     review_model?: string;
     review_reasoning_effort?: ReasoningEffort;
-    /** codex only: `-s` confinement for coder / reviewer. pi ignores these. */
-    sandbox: SandboxMode;
-    review_sandbox: SandboxMode;
     env_deny: string[];
   };
   approvals: {
@@ -98,7 +93,7 @@ export interface UiConfig {
   port: number;
 }
 
-/** Union across runners — pi accepts all; codex maps to model_reasoning_effort. */
+/** Pi thinking levels accepted by the --thinking option. */
 export type ReasoningEffort = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface IssueData {

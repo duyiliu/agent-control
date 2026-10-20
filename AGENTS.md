@@ -18,13 +18,11 @@
   `git push`/`gh` must stay unauthenticated — do not weaken.
 - REVIEWING asserts HEAD sha + clean status afterwards; a moved HEAD or dirty
   worktree is reviewer tampering → BLOCKED, never a fixable verdict.
-- `agent.provider` selects the runner (`runners/{pi,codex}.ts`, dispatch via
-  `runners/dispatch.ts`): pi confines via tool allowlist (review = read-only
-  tools, no bash/edit/write), codex via `-s` sandbox. `review_provider`/
-  `review_model` may run the reviewer on a different (heterogeneous)
-  runner+model. `agent.model` is required — no implicit model default;
-  `reasoning_effort` is optional (unset = runner default). Shared call
-  shape `AgentCallOpts`/`AgentCallResult`; all children get the scrubbed env.
+- Only the Pi runner is supported (`runners/pi.ts`); review uses a read-only
+  tool allowlist (no bash/edit/write). `review_model` and
+  `review_reasoning_effort` may select a different Pi model/settings for review.
+  `agent.model` is required — no implicit model default; `reasoning_effort` is
+  optional (unset = runner default). All children get the scrubbed env.
 - Cross-instance claiming is label-based: `agent-running` on an issue means
   another scheduler owns it — `listReadyIssues` filters it and `tryDispatch`
   skips it (stays DISCOVERED, reconciles via the existing-PR path). Not

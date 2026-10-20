@@ -78,21 +78,19 @@ test('review: incomplete diff escalates without invoking a model', async () => {
   } finally { cleanup(env.dir); }
 });
 
-test('review: retry preserves read-only confinement and heterogeneous model config', async () => {
+test('review: model override keeps Pi runner and read-only tool allowlist', async () => {
   const env = setup();
   try {
     await runReview(env.ctx, 'pass', 'diff', {
-      ...env.deps, headSha: 'verified-sha', agentConfig: { ...env.config.agent, review_provider: 'codex', review_model: 'test/reviewer', review_sandbox: 'read-only' },
+      ...env.deps,
+      headSha: 'verified-sha',
+      agentConfig: { ...env.config.agent, review_model: 'test/reviewer', review_reasoning_effort: 'low' },
     }, async (opts, config) => {
       assert.match(opts.prompt, /本轮待审查提交 SHA：verified-sha/);
-      assert.equal(config.provider, 'codex');
+      assert.equal(config.provider, 'pi');
       assert.equal(config.model, 'test/reviewer');
-      assert.equal(opts.sandbox, 'read-only');
-      assert.ok(opts.schemaPath);
-      writeFileSync(opts.lastMessagePath, JSON.stringify(passed));
-      return ok();
-    });
-    await runReview(env.ctx, 'pass', 'diff', env.deps, async (opts) => {
+      assert.equal(opts.model, 'test/reviewer');
+      assert.equal(opts.thinking, 'low');
       assert.deepEqual(opts.tools, ['read', 'grep', 'find', 'ls']);
       writeFileSync(opts.lastMessagePath, JSON.stringify(passed));
       return ok();

@@ -97,18 +97,6 @@ export function buildFixPrompt(ctx: PromptContext, evidence: string): string {
   ].join('\n');
 }
 
-// OpenAI structured outputs require `required` to list every property key.
-export const REVIEW_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['verdict', 'summary', 'findings'],
-  properties: {
-    verdict: { type: 'string', enum: ['PASS', 'BLOCK', 'HUMAN_REVIEW_REQUIRED'] },
-    summary: { type: 'string' },
-    findings: { type: 'array', items: { type: 'string' } },
-  },
-} as const;
-
 export const MAX_REVIEW_DIFF_CHARS = 60_000;
 
 export function buildReviewPrompt(ctx: PromptContext, testEvidence: string, diffEvidence: string, headSha?: string): string {

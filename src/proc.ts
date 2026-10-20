@@ -191,7 +191,6 @@ const AGENT_ENV_ALLOW = [
   'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME',
   'LANG', 'LC_ALL', 'LC_CTYPE',
   'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
-  'CODEX_HOME', 'CODEX_CI',
 ];
 
 /** Shared empty dir used as GH_CONFIG_DIR — gh then finds no authenticated host. */

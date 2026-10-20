@@ -559,7 +559,7 @@ export class Engine {
       {
         workdir: extra.workdir,
         prompt,
-        sandbox: this.config.agent.sandbox,
+        model: this.config.agent.model,
         timeoutMs: this.config.server.max_task_minutes * 60_000,
         logPath: join(artifactsDir, `agent-${Date.now()}.jsonl`),
         lastMessagePath: join(artifactsDir, `coder-last-${Date.now()}.txt`),

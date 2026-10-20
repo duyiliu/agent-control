@@ -5,7 +5,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { pickRunner } from '../runners/dispatch.js';
 import { PI_REVIEW_TOOLS } from '../runners/pi.js';
 import type { AgentCallOpts, AgentCallResult } from '../runners/types.js';
-import { REVIEW_SCHEMA, buildReviewPrompt, MAX_REVIEW_DIFF_CHARS, type PromptContext } from '../scheduler/prompts.js';
+import { buildReviewPrompt, MAX_REVIEW_DIFF_CHARS, type PromptContext } from '../scheduler/prompts.js';
 import type { AppConfig, ReviewResult } from '../types.js';
 
 export class ReviewInfraError extends Error {
@@ -32,15 +32,11 @@ export async function runReview(
   runner: ReviewRunner = (opts, config) => pickRunner(config)(opts, config),
 ): Promise<{ result: ReviewResult; logPath: string }> {
   mkdirSync(deps.artifactsDir, { recursive: true });
-  const schemaPath = join(deps.artifactsDir, 'review-schema.json');
-  writeFileSync(schemaPath, JSON.stringify(REVIEW_SCHEMA), 'utf8');
   const agentConfig: AppConfig['agent'] = {
     ...deps.agentConfig,
-    provider: deps.agentConfig.review_provider ?? deps.agentConfig.provider,
     model: deps.agentConfig.review_model ?? deps.agentConfig.model,
     reasoning_effort: deps.agentConfig.review_reasoning_effort ?? deps.agentConfig.reasoning_effort,
   };
-  const isPi = agentConfig.provider === 'pi';
   const cancelled = (logPath: string) => ({
     result: { verdict: 'HUMAN_REVIEW_REQUIRED', summary: 'review cancelled', findings: [] } as ReviewResult,
     logPath,
@@ -59,12 +55,12 @@ export async function runReview(
     const proc = await runner({
       workdir: ctx.worktreePath,
       prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence, deps.headSha),
-      sandbox: agentConfig.review_sandbox,
       timeoutMs: deps.timeoutMs,
       logPath,
-      schemaPath: isPi ? undefined : schemaPath,
       lastMessagePath,
-      tools: isPi ? PI_REVIEW_TOOLS : undefined,
+      model: agentConfig.model,
+      thinking: agentConfig.reasoning_effort,
+      tools: PI_REVIEW_TOOLS,
       signal: deps.signal,
       onSpawn: deps.onSpawn,
     }, agentConfig);

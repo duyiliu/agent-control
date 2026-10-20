@@ -92,7 +92,7 @@ export function extractLastMessage(jsonl: string): string | null {
  * One isolated `pi -p` invocation. The prompt travels via an @file include
  * (argv would hit Windows limits); the JSONL event stream lands in logPath;
  * the last assistant message is written to lastMessagePath post-hoc.
- * pi has no sandbox flag: confinement is the tool allowlist + scrubbed env.
+ * Confinement is the tool allowlist + scrubbed environment.
  */
 export async function runPi(
   opts: AgentCallOpts,
@@ -104,7 +104,7 @@ export async function runPi(
   writeFileSync(promptPath, opts.prompt, 'utf8');
 
   const argv = buildPiArgv(
-    { tools: opts.tools, promptPath, model: opts.model ?? config.model, thinking: config.reasoning_effort },
+    { tools: opts.tools, promptPath, model: opts.model ?? config.model, thinking: opts.thinking ?? config.reasoning_effort },
     inv,
   );
   const env = scrubEnvForAgent(process.env, config.env_deny);
