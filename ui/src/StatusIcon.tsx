@@ -2,7 +2,7 @@ import type { Phase } from './api';
 import { isActivePhase, phaseHex } from './groups';
 
 /**
- * Linear-style 14px status glyphs: hollow ring (queued), rotating
+ * Linear-style 14px status glyphs: hollow ring (queued), breathing
  * three-quarter arc (in progress), filled check (done), slash (canceled),
  * exclamation (needs attention), cross (failed).
  */
@@ -15,7 +15,7 @@ export default function StatusIcon(props: { phase: Phase; size?: number; classNa
   if (isActivePhase(phase)) {
     glyph = (
       <>
-        <circle cx="8" cy="8" r="5.6" {...common} opacity={0.35} />
+        <circle cx="8" cy="8" r="5.6" {...common} opacity={0.25} />
         <circle
           cx="8"
           cy="8"
@@ -26,7 +26,7 @@ export default function StatusIcon(props: { phase: Phase; size?: number; classNa
           strokeLinecap="round"
           strokeDasharray="26 35.2"
           transform="rotate(-90 8 8)"
-          style={{ transformOrigin: '8px 8px', animation: 'spin-slow 1.6s linear infinite' }}
+          style={{ animation: 'breathe 2.4s ease-in-out infinite' }}
         />
       </>
     );
@@ -34,7 +34,7 @@ export default function StatusIcon(props: { phase: Phase; size?: number; classNa
     glyph = (
       <>
         <circle cx="8" cy="8" r="5.6" fill={color} opacity={0.9} />
-        <path d="M5.3 8.2l1.9 1.9 3.5-4" fill="none" stroke="#0d0e11" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M5.3 8.2l1.9 1.9 3.5-4" fill="none" stroke="var(--color-canvas)" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round" />
       </>
     );
   } else if (phase === 'AWAITING_MERGE') {

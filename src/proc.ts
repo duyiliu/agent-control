@@ -235,6 +235,11 @@ export function scrubEnvForAgent(
 }
 
 /** Kill a Windows process tree (best effort, fire and forget). */
+export function killTree(pid: number) {
+  if (process.platform === 'win32') { taskkillTree(pid); return; }
+  try { process.kill(pid, 'SIGKILL'); } catch { /* already dead */ }
+}
+
 function taskkillTree(pid: number) {
   try {
     const t = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {

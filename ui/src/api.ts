@@ -84,6 +84,14 @@ export interface Artifact {
   lines?: Record<string, unknown>[];
 }
 
+export interface TailChunk {
+  file: string;
+  size: number;
+  offset: number;
+  chunk: string;
+  pending: number;
+}
+
 async function get<T>(url: string): Promise<T> {
   const r = await fetch(url);
   if (!r.ok) throw new Error(((await r.json().catch(() => ({}))) as { error?: string }).error ?? `HTTP ${r.status}`);
@@ -95,6 +103,12 @@ export const fetchTask = (id: number) => get<TaskDetail>(`/api/tasks/${id}`);
 export const fetchHealth = () => get<HealthInfo>('/api/health');
 export const fetchArtifact = (path: string) =>
   get<Artifact>(`/api/artifact?path=${encodeURIComponent(path)}`);
+export const fetchTail = (runId: string, offset: number | null, file: string | null) => {
+  const params = new URLSearchParams();
+  if (offset !== null) params.set('offset', String(offset));
+  if (file) params.set('file', file);
+  return get<TailChunk>(`/api/runs/${encodeURIComponent(runId)}/tail?${params}`);
+};
 
 export async function postAction(id: number, action: 'stop' | 'retry'): Promise<string> {
   const r = await fetch(`/api/tasks/${id}/${action}`, { method: 'POST' });

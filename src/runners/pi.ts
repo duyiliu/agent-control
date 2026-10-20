@@ -32,7 +32,7 @@ export function resolvePiInvocation(envPath = process.env.PATH ?? ''): PiInvocat
 
 /** Reviewer runs read-only at the TOOL level — no shell, no write tools. */
 export const PI_REVIEW_TOOLS = ['read', 'grep', 'find', 'ls'];
-const PI_ALL_TOOLS = ['read', 'bash', 'powershell', 'edit', 'write', 'grep', 'find', 'ls'];
+export const PI_ALL_TOOLS = ['read', 'bash', 'powershell', 'edit', 'write', 'grep', 'find', 'ls'];
 
 /**
  * argv for one non-interactive `pi -p` call. Ambient project/user config is
@@ -62,6 +62,31 @@ export function buildPiArgv(
     ...(opts.thinking ? ['--thinking', opts.thinking] : []),
     '--',
     `@${opts.promptPath}`,
+  ];
+}
+
+/**
+ * argv for a long-lived `pi --mode rpc` session: same isolation flags as the
+ * one-shot form, but no prompt argument — prompts travel as JSONL commands on
+ * stdin, and the process keeps its conversation between phases.
+ */
+export function buildRpcArgv(
+  opts: { tools?: string[]; model?: string; thinking?: string },
+  inv: PiInvocation,
+): string[] {
+  return [
+    inv.argv0,
+    ...inv.prefix,
+    '--mode', 'rpc',
+    '--no-session',
+    '--no-extensions',
+    '--no-skills',
+    '--no-prompt-templates',
+    '--no-context-files',
+    '--no-approve',
+    '--tools', (opts.tools ?? PI_ALL_TOOLS).join(','),
+    ...(opts.model ? ['--model', opts.model] : []),
+    ...(opts.thinking ? ['--thinking', opts.thinking] : []),
   ];
 }
 

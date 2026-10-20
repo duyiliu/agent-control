@@ -38,7 +38,7 @@ export async function runReview(
     reasoning_effort: deps.agentConfig.review_reasoning_effort ?? deps.agentConfig.reasoning_effort,
   };
   const cancelled = (logPath: string) => ({
-    result: { verdict: 'HUMAN_REVIEW_REQUIRED', summary: 'review cancelled', findings: [] } as ReviewResult,
+    result: { verdict: 'HUMAN_REVIEW_REQUIRED', risk: 'high', summary: 'review cancelled', findings: [] } as ReviewResult,
     logPath,
   });
 
@@ -48,7 +48,7 @@ export async function runReview(
     const lastMessagePath = join(deps.artifactsDir, `review-last-${id}.txt`);
     if (deps.signal?.aborted) return cancelled(logPath);
     if (diffEvidence.length > MAX_REVIEW_DIFF_CHARS || /\.\.\.\[truncated \d+ (?:chars|bytes)\]/.test(diffEvidence)) {
-      const result: ReviewResult = { verdict: 'HUMAN_REVIEW_REQUIRED', summary: 'review diff is incomplete or too large; narrow the task or review manually', findings: [] };
+      const result: ReviewResult = { verdict: 'HUMAN_REVIEW_REQUIRED', risk: 'high', summary: 'review diff is incomplete or too large; narrow the task or review manually', findings: [] };
       writeFileSync(logPath, JSON.stringify({ result }) + '\n', 'utf8');
       return { result, logPath };
     }
@@ -94,13 +94,19 @@ function parseReviewResult(text: string): ReviewResult {
   const value = parseVerdictJson(text);
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('expected an object');
   const obj = value as Record<string, unknown>;
-  if (Object.keys(obj).some((key) => !['verdict', 'summary', 'findings'].includes(key))
+  if (Object.keys(obj).some((key) => !['verdict', 'risk', 'summary', 'findings'].includes(key))
     || typeof obj.verdict !== 'string' || !['PASS', 'BLOCK', 'HUMAN_REVIEW_REQUIRED'].includes(obj.verdict)
+    || typeof obj.risk !== 'string' || !['low', 'high'].includes(obj.risk)
     || typeof obj.summary !== 'string' || !obj.summary.trim()
     || !Array.isArray(obj.findings) || obj.findings.some((finding) => typeof finding !== 'string' || !finding.trim())) {
-    throw new Error('expected verdict, nonempty summary and string findings');
+    throw new Error('expected verdict, risk, nonempty summary and string findings');
   }
-  return { verdict: obj.verdict as ReviewResult['verdict'], summary: obj.summary, findings: obj.findings as string[] };
+  return {
+    verdict: obj.verdict as ReviewResult['verdict'],
+    risk: obj.risk as ReviewResult['risk'],
+    summary: obj.summary,
+    findings: obj.findings as string[],
+  };
 }
 
 function parseVerdictJson(text: string): unknown {

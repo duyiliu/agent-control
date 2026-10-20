@@ -5,13 +5,13 @@ import type { Store } from '../store/sqlite.js';
 import { RunLog, type AppLog } from '../telemetry/logging.js';
 import { approvalHash, GitHubTracker } from '../tracker/github.js';
 import { GitWorkspace } from '../workspace/git.js';
-import { pickRunner } from '../runners/dispatch.js';
-import type { AgentCallOpts, AgentCallResult } from '../runners/types.js';
+import { openPiCoderSession, type CoderSession, type CoderSessionOpts, type CoderTurn } from '../runners/session.js';
+import { PI_ALL_TOOLS } from '../runners/pi.js';
 import { runChecks, type ChecksSummary } from '../verify/checks.js';
 import { runReview, ReviewInfraError } from '../verify/review.js';
 import { publishDraftPr, PublishError } from '../publish/pr.js';
 import { buildCoderPrompt, buildFixPrompt, type PromptContext } from './prompts.js';
-import type { AppConfig, IssueData, Phase, ProjectConfig, RunRow, TaskRow } from '../types.js';
+import type { AppConfig, IssueData, Phase, ProjectConfig, ReviewResult, RunRow, TaskRow } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
 
 export interface EngineDeps {
@@ -22,7 +22,7 @@ export interface EngineDeps {
   appLog: AppLog;
   /** Install dir of agent-control (for WORKFLOW.md). */
   installDir: string;
-  runCoderFn?: (opts: AgentCallOpts, agentCfg: AppConfig['agent']) => Promise<AgentCallResult>;
+  openCoderSessionFn?: (opts: CoderSessionOpts) => CoderSession;
   runReviewFn?: typeof runReview;
   runChecksFn?: typeof runChecks;
 }
@@ -47,13 +47,13 @@ function fmtSpan(fromIso: string, toIso: string | null): string {
 export class Engine {
   private controllers = new Map<string, AbortController>();
   private inFlight = new Set<string>(); // run_ids currently executing in this process
-  private runCoderFn: NonNullable<EngineDeps['runCoderFn']>;
+  private openCoderSessionFn: NonNullable<EngineDeps['openCoderSessionFn']>;
   private runReviewFn: NonNullable<EngineDeps['runReviewFn']>;
   private runChecksFn: NonNullable<EngineDeps['runChecksFn']>;
   private ticking = false;
 
   constructor(private deps: EngineDeps) {
-    this.runCoderFn = deps.runCoderFn ?? ((o, cfg) => pickRunner(cfg)(o, cfg));
+    this.openCoderSessionFn = deps.openCoderSessionFn ?? openPiCoderSession;
     this.runReviewFn = deps.runReviewFn ?? runReview;
     this.runChecksFn = deps.runChecksFn ?? runChecks;
   }
@@ -221,14 +221,25 @@ export class Engine {
         this.appLog.event('dispatch_skip', { task: task.id, why: 'PR is closed; reopen it or create a new issue before retrying' });
         return;
       }
-      this.setTaskStatus(task.id, existingPr.state === 'MERGED' ? 'COMPLETED' : 'AWAITING_MERGE', { branch, pr_url: existingPr.url });
-      await this.labelQuietly(project.repo, issue.number, 'add', 'agent-pr');
-      this.appLog.event('dispatch_skip', { task: task.id, why: `PR already exists: ${existingPr.url}` });
-      return;
+      if (existingPr.state === 'MERGED') {
+        this.setTaskStatus(task.id, 'COMPLETED', { branch, pr_url: existingPr.url });
+        this.appLog.event('dispatch_skip', { task: task.id, why: `PR already merged: ${existingPr.url}` });
+        return;
+      }
+      if (this.store.hasReviewPass(task.id)) {
+        this.setTaskStatus(task.id, 'AWAITING_MERGE', { branch, pr_url: existingPr.url });
+        await this.labelQuietly(project.repo, issue.number, 'add', 'agent-pr');
+        this.appLog.event('dispatch_skip', { task: task.id, why: `PR already exists: ${existingPr.url}` });
+        return;
+      }
+      // PR exists but was never reviewed (e.g. retry after a crash): fall
+      // through and claim a run that goes PREPARING → VERIFYING → review.
+      this.store.setTaskStatus(task.id, 'DISCOVERED', { branch, pr_url: existingPr.url });
+      this.appLog.event('dispatch_skip', { task: task.id, why: `PR exists but has no review PASS; re-entering verification: ${existingPr.url}` });
     }
 
     const run = this.store.claimRun(task.id);
-    this.store.updateRunFields(run.run_id, { branch });
+    this.store.updateRunFields(run.run_id, { branch, pr_url: existingPr?.url ?? null });
     await this.labelQuietly(project.repo, issue.number, 'add', 'agent-running');
     await this.tracker.addComment(project.repo, issue.number,
       `agent-control: 已领取（\`${hostname()}\`）`).catch((err) => {
@@ -288,6 +299,10 @@ export class Engine {
 
     const aborted = () => signal.aborted || store.getRun(runId)?.cancel_requested === 1;
 
+    // One conversation per run: FIXING continues the turn that produced the
+    // failing diff instead of re-priming a cold process with the same facts.
+    const coderRef: { current: { session: CoderSession; logPath: string } | null } = { current: null };
+
     try {
       let phase: Phase = run.phase;
       // Lazily populated context shared by phases.
@@ -295,7 +310,26 @@ export class Engine {
       let worktreePath = run.workspace ?? '';
       let lastFailureEvidence = '';
       let verifiedHead: string | null = null;
-      let reviewedHead: string | null = null;
+
+      const ensureCoder = () => {
+        if (coderRef.current) return coderRef.current;
+        const artifactsDir = this.artifactsDirFor(run);
+        mkdirSync(artifactsDir, { recursive: true });
+        const stamp = Date.now();
+        const logPath = join(artifactsDir, `agent-${stamp}.jsonl`);
+        const session = this.openCoderSessionFn({
+          workdir: worktreePath,
+          agentConfig: this.config.agent,
+          model: this.config.agent.model,
+          thinking: this.config.agent.reasoning_effort,
+          tools: PI_ALL_TOOLS,
+          logPath,
+          lastMessagePath: join(artifactsDir, `coder-last-${stamp}.txt`),
+          onSpawn: (pid, identity) => this.store.updateRunFields(run.run_id, { pid, process_identity: identity }),
+        });
+        coderRef.current = { session, logPath };
+        return coderRef.current;
+      };
 
       while (RUN_ACTIVE_PHASES.includes(phase)) {
         if (aborted()) { this.finish(run, task, 'CANCELED', 'cancelled'); return; }
@@ -317,17 +351,22 @@ export class Engine {
             });
             worktreePath = wt.path;
             store.updateRunFields(runId, { workspace: wt.path, branch: run.branch ?? `${project.branch_prefix}${task.issue_number}` });
-            store.transition(runId, phase, (phase = 'RUNNING'));
+            // An existing PR with no review PASS skips coding and goes
+            // straight to verification: the code is already on the branch.
+            store.transition(runId, phase, (phase = task.pr_url ? 'VERIFYING' : 'RUNNING'));
             break;
           }
 
           case 'RUNNING': {
             const gate = await this.gateApproval(project, task);
             if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed during run'); return; }
-            const res = await this.callCoder(run, log, ctx, { workdir: worktreePath }, buildCoderPrompt(ctx), signal);
+            const turn = ensureCoder();
+            const res = await this.coderTurn(run, log, turn, buildCoderPrompt(ctx), 'RUNNING', signal);
             if (res.aborted) { this.finish(run, task, 'CANCELED', 'cancelled'); return; }
-            if (res.exitCode !== 0 || res.timedOut) {
-              this.finish(run, task, 'FAILED', `agent exited ${res.exitCode}${res.timedOut ? ' (timeout)' : ''}`);
+            if (!res.ok) {
+              this.finish(run, task, 'FAILED', res.timedOut
+                ? `agent timeout: exceeded ${this.config.server.max_task_minutes}m`
+                : `agent failed: ${res.error ?? `exit ${res.exitCode}`}`);
               return;
             }
             await this.commitLeftovers(run, log, worktreePath, task);
@@ -360,7 +399,7 @@ export class Engine {
             if (summary.infraError) { this.finish(run, task, 'FAILED', `checks infra: ${summary.infraError}`); return; }
             if (summary.ok) {
               verifiedHead = headBeforeChecks;
-              store.transition(runId, phase, (phase = 'REVIEWING'), { head_sha: verifiedHead });
+              store.transition(runId, phase, (phase = 'PUBLISHING_PR'), { head_sha: verifiedHead });
             } else {
               lastFailureEvidence = summary.failureEvidence;
               if (this.canFix(run)) {
@@ -375,12 +414,19 @@ export class Engine {
           }
 
           case 'REVIEWING': {
+            // run/task are snapshots taken at launch; PUBLISHING_PR writes the
+            // PR url to the DB mid-run, so re-read instead of trusting them.
+            const prUrl = store.getRun(runId)?.pr_url ?? run.pr_url ?? task.pr_url;
             if (!verifiedHead) {
               store.transition(runId, phase, (phase = 'VERIFYING'), { recovered: true, reason: 'revalidate before review after restart' });
               break;
             }
+            if (!prUrl) {
+              store.transition(runId, phase, (phase = 'PUBLISHING_PR'), { recovered: true, reason: 'publish before review' });
+              break;
+            }
             const gate = await this.gateApproval(project, task);
-            if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed during run'); return; }
+            if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed before review'); return; }
             let diffEvidence: string;
             try {
               diffEvidence = await this.workspace.diffVsBase(worktreePath, project.base_branch);
@@ -394,10 +440,12 @@ export class Engine {
             // commits/resets/ref moves by the unsandboxed reviewer.
             const headBefore = await this.workspace.head(worktreePath).catch(() => null);
             if (headBefore !== verifiedHead || await this.workspace.isDirty(worktreePath)) {
-              this.finish(run, task, 'BLOCKED', 'code changed since checks; refusing review on stale verification');
+              this.finish(run, task, 'BLOCKED', 'code changed after publish; refusing review on stale verification');
               return;
             }
-            store.transition(runId, phase, phase, { kind: 'review_started', head_sha: headBefore });
+            store.transition(runId, phase, phase, { kind: 'review_started', head_sha: headBefore, pr_url: prUrl });
+            const prNumber = prNumberFromUrl(prUrl);
+            if (prNumber) await this.setPrLabel(project.repo, prNumber, true);
             let reviewOutcome: Awaited<ReturnType<typeof runReview>> | undefined;
             let reviewError: unknown;
             try {
@@ -408,6 +456,7 @@ export class Engine {
                 onSpawn: (pid, identity) => store.updateRunFields(runId, { pid, process_identity: identity }),
               });
             } catch (err) { reviewError = err; }
+            if (prNumber) await this.setPrLabel(project.repo, prNumber, false);
             // A failed reviewer can still have tampered with the worktree.
             const headAfter = await this.workspace.head(worktreePath).catch(() => null);
             const headMoved = headBefore === null || headAfter === null || headAfter !== headBefore;
@@ -430,19 +479,34 @@ export class Engine {
             store.addCheck({ run_id: runId, kind: 'review', command: 'agent (review)', exit_code: null,
               artifact_path: logPath, verdict: result.verdict });
             store.transition(runId, phase, phase, { kind: 'review_completed', head_sha: headBefore,
-              head_sha_after: headAfter, verdict: result.verdict, summary: result.summary, artifact_path: logPath });
+              head_sha_after: headAfter, verdict: result.verdict, risk: result.risk,
+              summary: result.summary, artifact_path: logPath });
             if (result.verdict === 'PASS') {
-              reviewedHead = headAfter;
-              store.transition(runId, phase, (phase = 'PUBLISHING_PR'), { head_sha: reviewedHead });
+              const riskReasons = this.assessRisk(diffEvidence, result.risk);
+              if (riskReasons.length > 0) {
+                if (prNumber) {
+                  await this.tracker.commentPr(project.repo, prNumber, this.riskComment(result, riskReasons))
+                    .catch((err) => this.appLog.event('pr_comment_error', { run: run.run_id, error: String(err) }));
+                }
+                await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+                this.finish(run, task, 'AWAITING_MERGE', `review PASS but high risk: ${riskReasons.join('; ')}`, { pr_url: prUrl });
+                return;
+              }
+              if (prNumber && this.config.approvals.auto_merge.enabled) {
+                await this.autoMerge(run, task, project, prNumber, prUrl, headBefore);
+                return;
+              }
+              this.finish(run, task, 'AWAITING_MERGE', 'review PASS', { pr_url: prUrl });
+              return;
             } else if (result.verdict === 'HUMAN_REVIEW_REQUIRED' || !result.findings.some((finding) => finding.trim())) {
-              this.finish(run, task, 'BLOCKED', `review requires human: ${result.summary}; no automatic repair without concrete findings`);
+              this.finish(run, task, 'BLOCKED', `review requires human: ${result.summary}; no automatic repair without concrete findings`, { pr_url: prUrl });
               return;
             } else if (this.canFix(run)) {
               lastFailureEvidence = `Review BLOCK: ${result.summary}\n${result.findings.join('\n')}`;
-              store.transition(runId, phase, (phase = 'FIXING'), { return_to: 'VERIFYING', head_sha: headAfter, verdict: result });
+              store.transition(runId, phase, (phase = 'FIXING'), { return_to: 'VERIFYING', head_sha: headAfter, verdict: result, pr_url: prUrl });
               this.setReturnPhase(runId, 'VERIFYING');
             } else {
-              this.finish(run, task, 'BLOCKED', `review blocked, fix budget exhausted: ${result.summary}`);
+              this.finish(run, task, 'BLOCKED', `review blocked, fix budget exhausted: ${result.summary}`, { pr_url: prUrl });
               return;
             }
             break;
@@ -457,36 +521,37 @@ export class Engine {
             if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed before repair'); return; }
             this.store.bumpRunFixCount(runId);
             const evidence = lastFailureEvidence;
-            const res = await this.callCoder(run, log, ctx, { workdir: worktreePath }, buildFixPrompt(ctx, evidence), signal);
+            const turn = ensureCoder();
+            const res = await this.coderTurn(run, log, turn, buildFixPrompt(ctx, evidence), 'FIXING', signal);
             if (res.aborted) { this.finish(run, task, 'CANCELED', 'cancelled'); return; }
-            if (res.exitCode !== 0 || res.timedOut) {
-              this.finish(run, task, 'FAILED', `fix attempt exited ${res.exitCode}${res.timedOut ? ' (timeout)' : ''}`);
+            if (!res.ok) {
+              this.finish(run, task, 'FAILED', res.timedOut ? 'fix turn timed out' : `fix turn failed: ${res.error ?? `exit ${res.exitCode}`}`);
               return;
             }
             await this.commitLeftovers(run, log, worktreePath, task);
             verifiedHead = null;
-            reviewedHead = null;
             this.setReturnPhase(runId, null);
             store.transition(runId, phase, (phase = 'VERIFYING'));
             break;
           }
 
           case 'PUBLISHING_PR': {
-            if (!reviewedHead) {
+            if (!verifiedHead) {
               store.transition(runId, phase, (phase = 'VERIFYING'), { recovered: true, reason: 'revalidate before publishing after restart' });
               break;
             }
             const gate = await this.gateApproval(project, task);
             if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed before publish'); return; }
             const issue = (await this.tracker.getIssue(project.repo, task.issue_number))!;
-            const prBody = this.buildPrBody(run, task, issue, reviewedHead);
+            const prBody = this.buildPrBody(run, task, issue, verifiedHead);
             try {
               const pr = await publishDraftPr({
                 project, worktreePath, branch: run.branch ?? `${project.branch_prefix}${task.issue_number}`,
-                issue, prBody, workspace: this.workspace, tracker: this.tracker, expectedHead: reviewedHead,
+                issue, prBody, workspace: this.workspace, tracker: this.tracker, expectedHead: verifiedHead,
                 beforeCreate: async () => aborted() ? 'CANCELED' : this.gateApproval(project, task),
               });
               store.updateRunFields(runId, { pr_url: pr.url });
+              run.pr_url = pr.url;
               // Post-create check: no atomic approve+publish exists on
               // GitHub, so bound the residual window — if approval was
               // revoked during publish, close the PR we just created.
@@ -496,11 +561,10 @@ export class Engine {
                 this.finish(run, task, postGate, 'approval revoked just after PR create; PR closed');
                 return;
               }
-              store.transition(runId, phase, phase, { kind: 'pr_published', head_sha: reviewedHead, pr_url: pr.url });
-              this.finish(run, task, 'AWAITING_MERGE', undefined, { pr_url: pr.url });
+              store.transition(runId, phase, phase, { kind: 'pr_published', head_sha: verifiedHead, pr_url: pr.url });
               await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-pr');
-              await this.labelQuietly(project.repo, task.issue_number, 'remove', 'agent-running');
-              return;
+              store.transition(runId, phase, (phase = 'REVIEWING'), { head_sha: verifiedHead, pr_url: pr.url });
+              break;
             } catch (err) {
               if (err instanceof PublishError && err.reason === 'approval_revoked') {
                 if (aborted()) { this.finish(run, task, 'CANCELED', 'cancelled before PR create'); return; }
@@ -521,6 +585,7 @@ export class Engine {
       }
     } finally {
       clearInterval(heartbeat);
+      await coderRef.current?.session.close().catch(() => { /* run already terminal */ });
     }
   }
 
@@ -556,30 +621,28 @@ export class Engine {
     };
   }
 
-  private async callCoder(
+  private async coderTurn(
     run: RunRow,
     log: RunLog,
-    ctx: PromptContext,
-    extra: { workdir: string },
+    turn: { session: CoderSession; logPath: string },
     prompt: string,
+    label: 'RUNNING' | 'FIXING',
     signal: AbortSignal,
-  ): Promise<AgentCallResult> {
-    const artifactsDir = this.artifactsDirFor(run);
-    mkdirSync(artifactsDir, { recursive: true });
-    const res = await this.runCoderFn(
-      {
-        workdir: extra.workdir,
-        prompt,
-        model: this.config.agent.model,
-        timeoutMs: this.config.server.max_task_minutes * 60_000,
-        logPath: join(artifactsDir, `agent-${Date.now()}.jsonl`),
-        lastMessagePath: join(artifactsDir, `coder-last-${Date.now()}.txt`),
-        signal,
-        onSpawn: (pid, identity) => this.store.updateRunFields(run.run_id, { pid, process_identity: identity }),
-      },
-      this.config.agent,
-    );
-    log.event('coder_call', { run: run.run_id, exit: res.exitCode, timedOut: res.timedOut, ms: res.durationMs });
+  ): Promise<CoderTurn> {
+    const res = await turn.session.prompt(prompt, {
+      timeoutMs: this.config.server.max_task_minutes * 60_000,
+      signal,
+    });
+    log.event('coder_turn', {
+      run: run.run_id, phase: label, ok: res.ok,
+      timed_out: res.timedOut, aborted: res.aborted, ms: res.durationMs,
+    });
+    // Recorded as an artifact row so the UI can open the agent log per turn.
+    this.store.addCheck({
+      run_id: run.run_id, kind: 'agent', command: `agent (${label.toLowerCase()})`,
+      exit_code: res.exitCode, artifact_path: turn.logPath,
+      verdict: res.ok ? 'PASS' : res.aborted ? 'CANCELED' : 'FAIL',
+    });
     return res;
   }
 
@@ -654,7 +717,7 @@ export class Engine {
       `- 需求来源：${issue.url}`,
       `- 运行 ID：\`${run.run_id}\`（attempt ${run.attempt}）`,
       `- 提交：\`${headSha}\``,
-      `- Review 结论：${review ? review.verdict : '未执行'}`,
+      `- Review 结论：${review ? review.verdict : 'PR 创建后自动执行'}`,
       ``,
       `## 测试命令与结果`,
       checksMd,
@@ -662,6 +725,78 @@ export class Engine {
       `## 风险`,
       `- 首次人工审查请重点核对 diff 是否满足 Issue 验收标准、是否越界改动。`,
     ].join('\n');
+  }
+
+  /**
+   * Host-side risk escalation. Reviewer judgement alone is not enough: any
+   * touch on auth/deps/build/tests forces a human look before auto-merge.
+   */
+  private assessRisk(diff: string, reviewerRisk: ReviewResult['risk']): string[] {
+    const cfg = this.config.approvals.auto_merge;
+    const reasons: string[] = [];
+    if (reviewerRisk === 'high') reasons.push('reviewer marked risk=high');
+    const files = new Set<string>();
+    let changedLines = 0;
+    for (const line of diff.split('\n')) {
+      const header = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+      if (header) { files.add(header[2]!); continue; }
+      if ((line.startsWith('+') && !line.startsWith('+++')) || (line.startsWith('-') && !line.startsWith('---'))) {
+        changedLines++;
+      }
+    }
+    if (files.size > cfg.max_files) reasons.push(`${files.size} files changed > ${cfg.max_files}`);
+    if (changedLines > cfg.max_lines) reasons.push(`${changedLines} changed lines > ${cfg.max_lines}`);
+    const sensitive = /(^|\/)(auth|security|secrets?|crypto|permissions?)(\/|\.|$)|(^|\/)\.github\/workflows\//i;
+    const dependency = /(^|\/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|requirements\.txt|poetry\.lock|Pipfile\.lock|Cargo\.lock|go\.sum|composer\.lock)$/i;
+    const build = /(^|\/)(Dockerfile|docker-compose\.ya?ml|Makefile)$|(^|\/)(migrations?|schema)\//i;
+    const tests = /(^|\/)(tests?|__tests__|spec)\/|\.(test|spec)\.[cm]?[jt]sx?$/i;
+    for (const file of files) {
+      if (sensitive.test(file)) reasons.push(`sensitive path: ${file}`);
+      else if (dependency.test(file)) reasons.push(`dependency change: ${file}`);
+      else if (build.test(file)) reasons.push(`build or migration change: ${file}`);
+      else if (tests.test(file)) reasons.push(`test change: ${file}`);
+    }
+    return reasons;
+  }
+
+  private riskComment(result: ReviewResult, reasons: string[]): string {
+    return [
+      '## 自动审查：通过，但标记为高风险',
+      '',
+      `- 结论：${result.verdict}`,
+      `- 风险：${result.risk}`,
+      `- 摘要：${result.summary}`,
+      '',
+      '### 触发原因',
+      ...reasons.map((reason) => `- ${reason}`),
+      '',
+      '本 PR 不会自动合并，请人工审查后再合并。',
+    ].join('\n');
+  }
+
+  /** Ready + squash-merge pinned to the reviewed SHA; any doubt falls back to a human. */
+  private async autoMerge(
+    run: RunRow, task: TaskRow, project: ProjectConfig, prNumber: number, prUrl: string, headSha: string,
+  ) {
+    try {
+      const actual = await this.tracker.getPrHeadSha(project.repo, prNumber);
+      if (actual !== headSha) {
+        this.finish(run, task, 'BLOCKED', 'auto-merge aborted: PR head moved since review', { pr_url: prUrl });
+        return;
+      }
+      await this.tracker.markPrReady(project.repo, prNumber);
+      await this.tracker.mergePr(project.repo, prNumber, headSha);
+      const state = await this.tracker.getPrState(project.repo, prNumber);
+      if (state !== 'MERGED') {
+        this.finish(run, task, 'AWAITING_MERGE', 'auto-merge did not confirm MERGED; waiting for a human', { pr_url: prUrl });
+        return;
+      }
+      this.store.transition(run.run_id, 'REVIEWING', 'REVIEWING', { kind: 'auto_merged', head_sha: headSha, pr_url: prUrl });
+      this.finish(run, task, 'COMPLETED', 'auto-merged low-risk PR', { pr_url: prUrl });
+      await this.cleanupMerged(project, task);
+    } catch (err) {
+      this.finish(run, task, 'AWAITING_MERGE', `auto-merge failed: ${String(err).slice(0, 300)}`, { pr_url: prUrl });
+    }
   }
 
   private finish(run: RunRow, task: TaskRow, finalPhase: Phase, reason?: string, taskFields?: { pr_url?: string }) {
@@ -676,10 +811,8 @@ export class Engine {
         const project = this.projectFor(task.repo);
         if (project) void this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-blocked');
       }
-      if (finalPhase !== 'AWAITING_MERGE' && finalPhase !== 'COMPLETED') {
-        const project = this.projectFor(task.repo);
-        if (project) void this.labelQuietly(project.repo, task.issue_number, 'remove', 'agent-running');
-      }
+      const project = this.projectFor(task.repo);
+      if (project) void this.labelQuietly(project.repo, task.issue_number, 'remove', 'agent-running');
     } catch (err) {
       this.appLog.event('finish_error', { run: run.run_id, error: String(err) });
       this.recordError('finish_error', err);
@@ -811,6 +944,18 @@ export class Engine {
     } catch (err) {
       this.appLog.event('label_error', { repo, issue, op, label, error: String(err) });
       this.recordError('label_error', err);
+    }
+  }
+
+  /** Review visibility on GitHub: the only signal that a run reached REVIEWING. */
+  private async setPrLabel(repo: string, prNumber: number, add: boolean) {
+    try {
+      if (add) await this.tracker.addPrLabel(repo, prNumber, 'agent-reviewing');
+      else await this.tracker.removePrLabel(repo, prNumber, 'agent-reviewing');
+    } catch (err) {
+      this.appLog.event('label_error', {
+        repo, pr: prNumber, op: add ? 'add' : 'remove', label: 'agent-reviewing', error: String(err),
+      });
     }
   }
 }

@@ -7,7 +7,7 @@ import { buildReviewPrompt, type PromptContext } from '../src/scheduler/prompts.
 import type { AgentCallOpts, AgentCallResult } from '../src/runners/types.js';
 import { makeConfig, tmpDir, cleanup } from './helpers.js';
 
-const passed = { verdict: 'PASS', summary: 'acceptance checked', findings: [] };
+const passed = { verdict: 'PASS', risk: 'low', summary: 'acceptance checked', findings: [] };
 const ok = (): AgentCallResult => ({ exitCode: 0, signal: null, timedOut: false, aborted: false, durationMs: 1, stdoutTail: '', stderrTail: '', pid: null });
 
 function setup() {

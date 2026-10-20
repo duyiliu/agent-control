@@ -394,6 +394,16 @@ export class Store {
       .all(runId) as unknown as CheckResultRow[];
   }
 
+  /** True when any attempt for this task recorded a passing review. */
+  hasReviewPass(taskId: number): boolean {
+    return this.db
+      .prepare(
+        `SELECT 1 FROM check_results c JOIN runs r ON r.run_id = c.run_id
+         WHERE r.task_id = ? AND c.kind = 'review' AND c.verdict = 'PASS' LIMIT 1`,
+      )
+      .get(taskId) !== undefined;
+  }
+
   // ---------- meta ----------
 
   setMeta(key: string, value: string) {

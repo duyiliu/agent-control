@@ -8,7 +8,7 @@ import { resolvePiInvocation } from '../src/runners/pi.js';
 import type { PromptContext } from '../src/scheduler/prompts.js';
 import { makeConfig, cleanup, tmpDir } from './helpers.js';
 
-const passed = JSON.stringify({ verdict: 'PASS', summary: 'read-only review complete', findings: [] });
+const passed = JSON.stringify({ verdict: 'PASS', risk: 'low', summary: 'read-only review complete', findings: [] });
 
 test('configured GPT-6 Luna reviewer model reaches the runner with SHA evidence', async () => {
   const dir = tmpDir('ac-luna-review-config-');

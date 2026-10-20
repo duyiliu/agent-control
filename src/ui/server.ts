@@ -7,6 +7,7 @@ import { OpsError, retryTask, stopTask } from '../ops.js';
 import {
   artifactPayload,
   healthPayload,
+  tailPayload,
   taskPayload,
   tasksPayload,
   type UiDeps,
@@ -58,8 +59,8 @@ function notBuilt(res: ServerResponse) {
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(
     `<!doctype html><meta charset="utf-8"><body style="font:14px system-ui;background:#0b0d10;color:#d5d9e0;padding:40px">
-     <h2>web ui is not built yet</h2>
-     <p>Run <code>npm run ui:build</code> in the agent-control repo, then restart the scheduler.</p></body>`,
+     <h2>web ui 尚未构建</h2>
+     <p>在 agent-control 仓库执行 <code>npm run ui:build</code>，然后重启调度器。</p></body>`,
   );
 }
 
@@ -90,6 +91,19 @@ async function handle(deps: UiDeps, req: IncomingMessage, res: ServerResponse): 
     const p = url.searchParams.get('path');
     if (!p) { json(res, 400, { error: 'path query param required' }); return; }
     const out = artifactPayload(deps.config.server.logs_dir, p);
+    json(res, out.status, out.body);
+    return;
+  }
+
+  const tailApi = /^\/api\/runs\/([A-Za-z0-9_-]+)\/tail$/.exec(path);
+  if (method === 'GET' && tailApi) {
+    if (!deps.store.getRun(tailApi[1]!)) { json(res, 404, { error: 'no such run' }); return; }
+    const out = tailPayload(
+      deps.config.server.logs_dir,
+      tailApi[1]!,
+      url.searchParams.get('file'),
+      url.searchParams.get('offset'),
+    );
     json(res, out.status, out.body);
     return;
   }

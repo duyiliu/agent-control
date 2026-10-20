@@ -81,6 +81,12 @@ export interface AppConfig {
     require_design_approval: boolean;
     require_manual_merge: boolean;
     allow_auto_deploy: boolean;
+    /** Host-side auto-merge for low-risk PRs that pass review. */
+    auto_merge: {
+      enabled: boolean;
+      max_files: number;
+      max_lines: number;
+    };
   };
 }
 
@@ -162,8 +168,12 @@ export interface CheckResultRow {
 
 export type ReviewVerdict = 'PASS' | 'BLOCK' | 'HUMAN_REVIEW_REQUIRED';
 
+/** Reviewer's own risk assessment; host rules can escalate low to high. */
+export type ReviewRisk = 'low' | 'high';
+
 export interface ReviewResult {
   verdict: ReviewVerdict;
+  risk: ReviewRisk;
   summary: string;
   findings: string[];
 }

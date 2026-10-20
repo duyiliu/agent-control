@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import type { Store } from '../store/sqlite.js';
 import type { AppConfig, CheckResultRow, Phase, RunRow, TaskRow } from '../types.js';
@@ -114,6 +114,11 @@ export function healthPayload(deps: UiDeps): HealthInfo {
 }
 
 const MAX_ARTIFACT_BYTES = 256 * 1024;
+const MAX_TAIL_CHUNK = 128 * 1024;
+/** First poll may pull a wider window so the panel is not empty on open. */
+const INITIAL_TAIL_BYTES = 1024 * 1024;
+/** Upper bound for skipping one oversized JSONL record (pi's system prompt). */
+const MAX_LINE_SCAN = 16 * 1024 * 1024;
 
 /**
  * Artifact paths come from the DB; resolve them strictly inside logs_dir —
@@ -154,4 +159,114 @@ export function artifactPayload(
     return { status: 200, body: { name, kind: 'jsonl', truncated, lines } };
   }
   return { status: 200, body: { name, kind: 'text', truncated, content } };
+}
+
+/**
+ * Incremental read of a run's agent log for the live view. The client passes
+ * the byte offset it already consumed; we answer with whole lines only, so a
+ * half-written JSONL record is never handed out.
+ */
+export function tailPayload(
+  logsDir: string,
+  runId: string,
+  rawFile: string | null,
+  rawOffset: string | null,
+): { status: number; body: Record<string, unknown> } {
+  if (!/^[A-Za-z0-9_-]+$/.test(runId)) return { status: 400, body: { error: 'bad run id' } };
+  const root = resolve(logsDir);
+  const dir = resolve(join(root, 'artifacts', runId));
+  if (!dir.startsWith(root + sep)) return { status: 403, body: { error: 'path outside logs_dir' } };
+
+  let file: string;
+  if (rawFile) {
+    const base = rawFile.split(/[\\/]/).pop() ?? '';
+    if (!/^(?:agent|review-agent)-[\w.-]+\.jsonl$/.test(base)) {
+      return { status: 400, body: { error: 'not an agent log' } };
+    }
+    file = join(dir, base);
+  } else {
+    let names: string[];
+    try { names = readdirSync(dir); } catch { return { status: 404, body: { error: 'no artifacts for run' } }; }
+    const agentLogs = names
+      .filter((n) => /^agent-[\w.-]+\.jsonl$/.test(n))
+      .map((n) => ({ n, m: statSync(join(dir, n)).mtimeMs }))
+      .sort((a, b) => b.m - a.m);
+    if (agentLogs.length === 0) return { status: 404, body: { error: 'no agent log yet' } };
+    file = join(dir, agentLogs[0]!.n);
+  }
+
+  let size: number;
+  try {
+    const st = statSync(file);
+    if (!st.isFile()) return { status: 404, body: { error: 'not a file' } };
+    size = st.size;
+  } catch {
+    return { status: 404, body: { error: 'log disappeared' } };
+  }
+
+  let start: number;
+  const initial = rawOffset == null;
+  if (initial) {
+    // First poll: tail the file instead of replaying megabytes of history.
+    start = Math.max(0, size - INITIAL_TAIL_BYTES);
+    if (start > 0 && start < size) {
+      // Align to the next line boundary so the first record is not a fragment.
+      const fd = openSync(file, 'r');
+      try {
+        const probe = Buffer.alloc(Math.min(8192, size - start));
+        readSync(fd, probe, 0, probe.length, start);
+        const nl = probe.indexOf(0x0a);
+        if (nl >= 0) start += nl + 1;
+      } finally { closeSync(fd); }
+    }
+  } else {
+    const asked = Number(rawOffset);
+    start = Number.isFinite(asked) && asked > 0 ? Math.floor(asked) : 0;
+    if (start > size) start = 0; // rotated or truncated file
+  }
+  const window = initial ? INITIAL_TAIL_BYTES : MAX_TAIL_CHUNK;
+
+  const readAt = (from: number, len: number): Buffer => {
+    const buf = Buffer.alloc(Math.max(0, len));
+    const fd = openSync(file, 'r');
+    try { readSync(fd, buf, 0, buf.length, from); } finally { closeSync(fd); }
+    return buf;
+  };
+
+  let skipped = 0;
+  let buf = readAt(start, Math.min(window, size - start));
+  let lastLf = buf.lastIndexOf(0x0a);
+  // A single record can dwarf the window (pi echoes the whole system prompt in
+  // one message_start line, several MB). Skipping it beats stalling the view.
+  if (lastLf < 0 && start + buf.length < size) {
+    const scan = readAt(start, Math.min(MAX_LINE_SCAN, size - start));
+    const lf = scan.indexOf(0x0a);
+    if (lf >= 0) {
+      skipped = lf + 1;
+      start += skipped;
+      buf = readAt(start, Math.min(window, size - start));
+      lastLf = buf.lastIndexOf(0x0a);
+    } else {
+      skipped = scan.length;
+      start += skipped;
+      buf = Buffer.alloc(0);
+      lastLf = -1;
+    }
+  }
+  // Never return a partial trailing line: everything after the last LF waits
+  // for the next poll. (A caller that starts mid-record may receive one
+  // fragment; clients skip lines that fail to parse.)
+  const usable = lastLf >= 0 ? buf.subarray(0, lastLf + 1) : Buffer.alloc(0);
+  const consumed = start + usable.length;
+  return {
+    status: 200,
+    body: {
+      file: file.split(/[\\/]/).pop(),
+      size,
+      offset: consumed,
+      chunk: usable.toString('utf8'),
+      pending: size - consumed,
+      skipped,
+    },
+  };
 }

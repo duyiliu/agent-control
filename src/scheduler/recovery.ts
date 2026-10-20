@@ -89,8 +89,22 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
           const labelled = !!issue && issue.state === 'OPEN' && issue.labels.includes(project.ready_label);
           const hashOk = !!issue && (!task.approved_hash || approvalHash(issue) === task.approved_hash);
           if (labelled && hashOk) {
-            store.endRun(run.run_id, 'AWAITING_MERGE', 'recovered: PR already exists');
-            store.setTaskStatus(task.id, 'AWAITING_MERGE', { pr_url: existing.url });
+            // Review runs after publish now: an existing PR alone is not
+            // evidence that the change was reviewed. Resume the phase
+            // instead of declaring it ready for merge.
+            const reviewed = store.checksForRun(run.run_id)
+              .some((check) => check.kind === 'review' && check.verdict === 'PASS');
+            if (reviewed) {
+              store.endRun(run.run_id, 'AWAITING_MERGE', 'recovered: PR already exists');
+              store.setTaskStatus(task.id, 'AWAITING_MERGE', { pr_url: existing.url });
+            } else if (run.resume_count >= MAX_RESUMES) {
+              markRecoveryRequired(deps, task, run, 'review resume budget exhausted');
+              report.recoveryRequired.push({ run_id: run.run_id, why: 'review resume budget' });
+            } else {
+              resume(store, run, 'REVIEWING');
+              deps.engine.resumeRun(run.run_id);
+              report.resumed.push(run.run_id);
+            }
           } else {
             try { await deps.tracker.closePr(project.repo, existing.number); } catch { /* best effort */ }
             const phase: Phase = labelled ? 'BLOCKED_APPROVAL_CHANGED' : 'CANCELED';

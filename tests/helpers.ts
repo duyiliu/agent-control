@@ -47,6 +47,7 @@ export function makeConfig(dir: string, overrides?: Partial<AppConfig>): AppConf
       require_design_approval: true,
       require_manual_merge: true,
       allow_auto_deploy: false,
+      auto_merge: { enabled: false, max_files: 10, max_lines: 400 },
     },
     ...overrides,
   };
@@ -77,6 +78,8 @@ export interface FakeTracker {
   labelsAdded: [number, string][];
   labelsRemoved: [number, string][];
   comments: [number, string][];
+  prComments: [number, string][];
+  merged: number[];
   prCreated: number;
 }
 
@@ -87,6 +90,13 @@ export function makeFakeTracker(): FakeTracker & {
   removeLabel: (repo: string, n: number, l: string) => Promise<void>;
   findPrForBranch: (repo: string, b: string) => Promise<any>;
   getPrState: (repo: string, n: number) => Promise<any>;
+  getPrHeadSha: (repo: string, n: number) => Promise<string>;
+  markPrReady: (repo: string, n: number) => Promise<void>;
+  mergePr: (repo: string, n: number, sha: string) => Promise<void>;
+  addPrLabel: (repo: string, n: number, l: string) => Promise<void>;
+  removePrLabel: (repo: string, n: number, l: string) => Promise<void>;
+  commentPr: (repo: string, n: number, body: string) => Promise<void>;
+  closePr: (repo: string, n: number) => Promise<void>;
   createDraftPr: (repo: string, o: any) => Promise<any>;
   addComment: (repo: string, n: number, body: string) => Promise<void>;
 } {
@@ -97,6 +107,8 @@ export function makeFakeTracker(): FakeTracker & {
     labelsAdded: [],
     labelsRemoved: [],
     comments: [],
+    prComments: [],
+    merged: [],
     prCreated: 0,
   };
   return Object.assign(t, {
@@ -125,6 +137,22 @@ export function makeFakeTracker(): FakeTracker & {
     },
     async getPrState(_repo: string, n: number) {
       return t.prStates.get(n) ?? 'OPEN';
+    },
+    async getPrHeadSha(_repo: string, _n: number) {
+      return 'head-sha';
+    },
+    async markPrReady(_repo: string, _n: number) {},
+    async mergePr(_repo: string, n: number, _sha: string) {
+      t.merged.push(n);
+      t.prStates.set(n, 'MERGED');
+    },
+    async addPrLabel(_repo: string, _n: number, _l: string) {},
+    async removePrLabel(_repo: string, _n: number, _l: string) {},
+    async commentPr(_repo: string, n: number, body: string) {
+      t.prComments.push([n, body]);
+    },
+    async closePr(_repo: string, n: number) {
+      t.prStates.set(n, 'CLOSED');
     },
     async createDraftPr(_repo: string, o: { head: string; title: string }) {
       t.prCreated++;

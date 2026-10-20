@@ -1,35 +1,171 @@
 @import "tailwindcss";
 
+/*
+ * Semantic tokens only — components must not hardcode palette values,
+ * otherwise a theme switch leaves half the UI behind.
+ * Defaults below are the "ink" theme; [data-theme] blocks override them.
+ */
 @theme {
-  --color-bg: #0d0e11;
-  --color-panel: #131519;
-  --color-card: #17191f;
-  --color-edge: #22242b;
-  --color-edge-strong: #31343d;
-  --color-brand: #5e6ad2;
+  --color-canvas: #161616;
+  --color-panel: #191919;
+  --color-card: #1f1f1f;
+  --color-elevated: #272727;
+  --color-sunken: #101010;
+  --color-edge: #2a2a2a;
+  --color-edge-strong: #3d3d3d;
+  --color-fg: #fafafa;
+  --color-fg-muted: #a1a1a1;
+  --color-fg-dim: #6e6e6e;
+  --color-brand: #e5e5e5;
+  --color-ok: #34d399;
+  --color-info: #38bdf8;
+  --color-warn: #fbbf24;
+  --color-danger: #fb7185;
+  --color-tool: #a78bfa;
   --font-sans: "Inter Variable", Inter, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+/* void — near-black, maximum contrast, thinnest separators */
+[data-theme="void"] {
+  color-scheme: dark;
+  --color-canvas: #000000;
+  --color-panel: #09090a;
+  --color-card: #131316;
+  --color-elevated: #1c1c20;
+  --color-sunken: #000000;
+  --color-edge: #26262b;
+  --color-edge-strong: #3a3a42;
+  --color-fg: #ffffff;
+  --color-fg-muted: #a2a2ab;
+  --color-fg-dim: #6a6a73;
+  --color-brand: #fafafa;
+  --color-ok: #4ade80;
+  --color-info: #60a5fa;
+  --color-warn: #fcd34d;
+  --color-danger: #f87171;
+  --color-tool: #c4b5fd;
+}
+
+/* slate — cool blue-gray, closest to the previous Linear feel */
+[data-theme="slate"] {
+  color-scheme: dark;
+  --color-canvas: #0b1220;
+  --color-panel: #111a2b;
+  --color-card: #172235;
+  --color-elevated: #1f2c43;
+  --color-sunken: #070c15;
+  --color-edge: #26354d;
+  --color-edge-strong: #3a4e6e;
+  --color-fg: #e4ebf5;
+  --color-fg-muted: #93a4be;
+  --color-fg-dim: #63748f;
+  --color-brand: #6d8cf5;
+  --color-ok: #34d399;
+  --color-info: #38bdf8;
+  --color-warn: #fbbf24;
+  --color-danger: #fb7185;
+  --color-tool: #a78bfa;
+}
+
+/* zlight — neutral white, ZCode light equivalent */
+[data-theme="zlight"] {
+  color-scheme: light;
+  --color-canvas: #f2f2f3;
+  --color-panel: #ffffff;
+  --color-card: #ffffff;
+  --color-elevated: #f7f7f8;
+  --color-sunken: #f4f4f5;
+  --color-edge: #e2e2e5;
+  --color-edge-strong: #cfcfd4;
+  --color-fg: #18181b;
+  --color-fg-muted: #6b7280;
+  --color-fg-dim: #9ca3af;
+  --color-brand: #18181b;
+  --color-ok: #059669;
+  --color-info: #0284c7;
+  --color-warn: #b45309;
+  --color-danger: #dc2626;
+  --color-tool: #7c3aed;
+}
+
+/* paper — warm white, low-glare */
+[data-theme="paper"] {
+  color-scheme: light;
+  --color-canvas: #efe9df;
+  --color-panel: #faf6ef;
+  --color-card: #fffcf7;
+  --color-elevated: #f3ede3;
+  --color-sunken: #eae3d7;
+  --color-edge: #e0d7c7;
+  --color-edge-strong: #ccc0ac;
+  --color-fg: #241f18;
+  --color-fg-muted: #6e665a;
+  --color-fg-dim: #9a9083;
+  --color-brand: #2b2620;
+  --color-ok: #157f5b;
+  --color-info: #0e6fa8;
+  --color-warn: #a16207;
+  --color-danger: #c03534;
+  --color-tool: #6d28d9;
 }
 
 html, body, #root {
   height: 100%;
 }
 
+/* Native widgets (scrollbars, form controls) follow the theme mode; the
+   [data-theme] blocks below win by specificity because they are attributes. */
+html {
+  color-scheme: dark;
+}
+
 body {
-  background: var(--color-bg);
-  color: #d4d6dd;
-  font: 13.5px/1.55 var(--font-sans);
+  background: var(--color-canvas);
+  color: var(--color-fg);
+  font: 13px/1.55 var(--font-sans);
   letter-spacing: -0.006em;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  transition: background-color .15s ease, color .15s ease;
+}
+
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-edge-strong) transparent;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-edge-strong);
+  background-clip: content-box;
+  border: 3px solid transparent;
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-fg-dim);
+  background-clip: content-box;
 }
 
 @keyframes pulse-dot {
-  50% { opacity: 0.25; }
+  50% { opacity: 0.4; }
 }
 
-@keyframes spin-slow {
-  to { transform: rotate(360deg); }
+@keyframes breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
 }
 
 @keyframes drawer-in {

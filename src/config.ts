@@ -103,6 +103,7 @@ export function loadConfig(path: string): AppConfig {
   }
 
   const approvals = asObj(root['approvals'] ?? {}, 'approvals');
+  const autoMerge = asObj(approvals['auto_merge'] ?? {}, 'approvals.auto_merge');
 
   return {
     server: {
@@ -133,6 +134,11 @@ export function loadConfig(path: string): AppConfig {
       require_design_approval: asBool(approvals['require_design_approval'] ?? true, 'approvals.require_design_approval'),
       require_manual_merge: asBool(approvals['require_manual_merge'] ?? true, 'approvals.require_manual_merge'),
       allow_auto_deploy: asBool(approvals['allow_auto_deploy'] ?? false, 'approvals.allow_auto_deploy'),
+      auto_merge: {
+        enabled: asBool(autoMerge['enabled'] ?? false, 'approvals.auto_merge.enabled'),
+        max_files: asNum(autoMerge['max_files'] ?? 10, 'approvals.auto_merge.max_files', 1),
+        max_lines: asNum(autoMerge['max_lines'] ?? 400, 'approvals.auto_merge.max_lines', 1),
+      },
     },
   };
 }

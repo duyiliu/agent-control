@@ -3,8 +3,8 @@
 个人 AI 研发调度中心 MVP：人在 GitHub Issue 上加 `agent-ready` 标签后，常驻调度器自动完成
 
 ```
-领取 → git worktree 隔离 → Pi agent 实现 → 受信测试 → 独立只读 Pi Review →
-有界修复(≤3) → push + Draft PR → 等待人工合并
+领取 → git worktree 隔离 → Pi agent 实现 → 受信测试 → push + Draft PR →
+独立只读 Pi Review → 低危自动合并 / 高危与阻塞转人工
 ```
 
 设计来源：`LifeOS/work/agent-control-mvp-design.md`（借鉴 OpenAI Symphony 控制面）。

@@ -59,7 +59,7 @@ test('retry: rechecks task state after asynchronous tracker reads', async () => 
     };
     await assert.rejects(retryTask(env.store, env.config, env.tracker, env.task, {
       isPidAlive: () => false, findProcs: async () => [],
-    }), /task changed/);
+    }), /任务已变化/);
     assert.equal(env.store.getTaskById(env.task.id)!.status, 'COMPLETED');
   } finally { teardown(env.dir, [env.store]); }
 });

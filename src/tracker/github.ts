@@ -139,6 +139,41 @@ export class GitHubTracker {
     await this.gh(['pr', 'close', String(prNumber), '-R', repo]);
   }
 
+  async getPrHeadSha(repo: string, prNumber: number): Promise<string> {
+    const r = await this.ghJson<{ headRefOid: string }>([
+      'pr', 'view', String(prNumber), '-R', repo, '--json', 'headRefOid',
+    ]);
+    return r.headRefOid;
+  }
+
+  /** Draft → ready for review, required before `gh pr merge` accepts it. */
+  async markPrReady(repo: string, prNumber: number): Promise<void> {
+    await this.gh(['pr', 'ready', String(prNumber), '-R', repo]);
+  }
+
+  /**
+   * Squash-merge pinned to the reviewed commit. `--match-head-commit` makes
+   * GitHub reject the merge if the branch moved since review.
+   */
+  async mergePr(repo: string, prNumber: number, headSha: string): Promise<void> {
+    await this.gh([
+      'pr', 'merge', String(prNumber), '-R', repo,
+      '--squash', '--match-head-commit', headSha,
+    ]);
+  }
+
+  async addPrLabel(repo: string, prNumber: number, label: string): Promise<void> {
+    await this.gh(['pr', 'edit', String(prNumber), '-R', repo, '--add-label', label]);
+  }
+
+  async removePrLabel(repo: string, prNumber: number, label: string): Promise<void> {
+    await this.gh(['pr', 'edit', String(prNumber), '-R', repo, '--remove-label', label]);
+  }
+
+  async commentPr(repo: string, prNumber: number, body: string): Promise<void> {
+    await this.gh(['pr', 'comment', String(prNumber), '-R', repo, '--body', body]);
+  }
+
   /** Post a comment on an issue (used to surface attention states on GitHub). */
   async addComment(repo: string, issueNumber: number, body: string): Promise<void> {
     await this.gh(['issue', 'comment', String(issueNumber), '-R', repo, '--body', body]);

@@ -74,6 +74,46 @@ test('web ui', async (t) => {
     assert.match(d.content, /boom/);
   });
 
+  await t.test('GET /api/runs/:id/tail streams whole lines only', async () => {
+    const dir2 = join(config.server.logs_dir, 'artifacts', run.run_id);
+    mkdirSync(dir2, { recursive: true });
+    const file = join(dir2, 'agent-1.jsonl');
+    writeFileSync(file, '{"type":"agent_start"}\n{"type":"turn_start"}\n{"type":"partial"');
+
+    const first = await fetchJson(`${ui.url}/api/runs/${run.run_id}/tail?offset=0`);
+    assert.equal(first.file, 'agent-1.jsonl');
+    assert.equal(first.chunk.split('\n').filter(Boolean).length, 2);
+    assert.ok(first.pending > 0, 'half-written record stays buffered');
+
+    const again = await fetchJson(`${ui.url}/api/runs/${run.run_id}/tail?offset=${first.offset}`);
+    assert.equal(again.chunk, '');
+    assert.equal(again.offset, first.offset);
+
+    writeFileSync(file, '{"type":"agent_start"}\n{"type":"turn_start"}\n{"type":"partial"}\n');
+    const rest = await fetchJson(`${ui.url}/api/runs/${run.run_id}/tail?offset=${first.offset}`);
+    assert.match(rest.chunk, /partial/);
+    assert.equal(rest.pending, 0);
+  });
+
+  await t.test('GET /api/runs/:id/tail without offset starts from the end', async () => {
+    const dir3 = join(config.server.logs_dir, 'artifacts', run.run_id);
+    mkdirSync(dir3, { recursive: true });
+    const big = join(dir3, 'agent-big.jsonl');
+    const rows = Array.from({ length: 1600 }, (_, i) => JSON.stringify({ type: 'row', i, pad: 'x'.repeat(900) }));
+    writeFileSync(big, `${rows.join('\n')}\n`);
+
+    const tail = await fetchJson(`${ui.url}/api/runs/${run.run_id}/tail?file=agent-big.jsonl`);
+    assert.equal(tail.file, 'agent-big.jsonl');
+    assert.ok(tail.offset > 128 * 1024, 'starts near the end instead of replaying history');
+    assert.doesNotMatch(tail.chunk, /"i":0[,}]/);
+    assert.ok(tail.pending < 1024 * 1024);
+  });
+
+  await t.test('GET /api/runs/:id/tail rejects foreign file names', async () => {
+    const r = await fetch(`${ui.url}/api/runs/${run.run_id}/tail?file=${encodeURIComponent('../secrets.jsonl')}`);
+    assert.equal(r.status, 400);
+  });
+
   await t.test('GET /api/artifact parses jsonl line by line', async () => {
     const r = await fetch(`${ui.url}/api/artifact?path=${encodeURIComponent(`run-${run.run_id}.jsonl`)}`);
     assert.equal(r.status, 200);
@@ -98,7 +138,7 @@ test('web ui', async (t) => {
     assert.equal(r.status, 200);
     assert.match(r.headers.get('content-type') ?? '', /text\/html/);
     const body = await r.text();
-    assert.ok(body.includes('<div id="root">') || body.includes('not built'), 'index shell or not-built hint');
+    assert.ok(body.includes('<div id="root">') || body.includes('尚未构建'), 'index shell or not-built hint');
   });
 
   await t.test('GET /task/:404 and /api/tasks/:404', async () => {
@@ -116,7 +156,7 @@ test('web ui', async (t) => {
     const r = await fetch(`${ui.url}/api/tasks/${task.id}/retry`, { method: 'POST' });
     assert.equal(r.status, 400);
     const d = await r.json();
-    assert.match(d.error, /not retryable/);
+    assert.match(d.error, /不可重试/);
   });
 
   await t.test('POST retry re-queues a blocked task via the tracker', async () => {
