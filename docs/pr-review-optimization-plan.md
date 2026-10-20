@@ -2,6 +2,7 @@
 
 > 状态：设计提案（仅文档，未实施）  
 > 日期：2026-10-20  
+> 跟踪：原跟踪 issue #3 已关闭（2026-10-20），本文档为 P0/P1/P2 的权威设计来源；实施时须另立经人工授权的执行 Issue（见 [design-workflow.md](./design-workflow.md) 第 3 节）。修复预算以本文件"单次 run 口径"为准。  
 > 范围：`duyiliu/agent-control`，以当前 `main` 的 README、WORKFLOW.md、src/scheduler/engine.ts、src/verify/review.ts、src/scheduler/prompts.ts、src/tracker/github.ts、config.example.yaml 为依据。
 
 ## 1. 决策摘要
