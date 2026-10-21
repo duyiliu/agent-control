@@ -23,6 +23,8 @@ projects:
     checks:
       - argv: [node, --test]
         timeout_seconds: 300
+        # platforms: [win32]         # optional — omit to run on every host; a
+        #                            # check that excludes the host is SKIPped (never FAIL)
 
 agent:
   provider: pi

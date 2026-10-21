@@ -40,6 +40,40 @@ test('checks: cancellation propagates and prevents subsequent commands', async (
   assert.equal(summary.ok, false);
 });
 
+test('checks: a check that cannot run on this host is skipped, not failed', async () => {
+  const other: NodeJS.Platform = process.platform === 'win32' ? 'linux' : 'win32';
+  let calls = 0;
+  const summary = await runChecks(
+    [{ argv: ['node', '-v'], platforms: [other] }],
+    '.', () => 'log',
+    async () => { calls++; return ok(); },
+  );
+  assert.equal(calls, 0);
+  assert.equal(summary.ok, true);
+  assert.deepEqual(summary.outcomes, []);
+  assert.equal(summary.skipped.length, 1);
+  assert.equal(summary.skipped[0]!.command, 'node -v');
+  assert.match(summary.skipped[0]!.reason, new RegExp(other));
+});
+
+test('checks: a supported check still runs beside a skipped one', async () => {
+  const other: NodeJS.Platform = process.platform === 'win32' ? 'linux' : 'win32';
+  const seen: number[] = [];
+  const summary = await runChecks(
+    [
+      { argv: ['node', '-v'], platforms: [other] },
+      { argv: ['node', '-v'], platforms: [process.platform] },
+    ],
+    '.', (i) => { seen.push(i); return `log-${i}`; },
+    async () => ok(),
+  );
+  assert.equal(summary.outcomes.length, 1);
+  assert.equal(summary.skipped.length, 1);
+  // The surviving check keeps its original index so log names stay stable.
+  assert.deepEqual(seen, [1]);
+  assert.equal(summary.outcomes[0]!.logPath, 'log-1');
+});
+
 test('checks: trusted npm launcher runs without inheriting host credentials', { skip: process.platform !== 'win32' }, async () => {
   const dir = tmpDir('ac-check-npm-');
   try {

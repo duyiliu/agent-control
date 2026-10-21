@@ -60,13 +60,14 @@ function fakeCoderSession(get: () => Promise<AgentCallResult>): CoderSession {
 }
 
 function checksOk(): ChecksSummary {
-  return { ok: true, outcomes: [{ spec: { argv: ['x'] }, command: 'x', exitCode: 0, timedOut: false, tail: '', logPath: 'l' }], failureEvidence: '' };
+  return { ok: true, outcomes: [{ spec: { argv: ['x'] }, command: 'x', exitCode: 0, timedOut: false, tail: '', logPath: 'l' }], skipped: [], failureEvidence: '' };
 }
 
 function checksFail(): ChecksSummary {
   return {
     ok: false,
     outcomes: [{ spec: { argv: ['x'] }, command: 'x', exitCode: 1, timedOut: false, tail: 'boom', logPath: 'l' }],
+    skipped: [],
     failureEvidence: 'check x failed: boom',
   };
 }

@@ -48,3 +48,40 @@ test('config: legacy sandbox settings are rejected instead of ignored', () => {
     assert.throws(() => loadConfig(path), (err) => err instanceof ConfigError && /legacy sandbox settings are no longer supported/.test(err.message));
   });
 });
+
+function withCheck(checkLines: string[], run: (path: string) => void) {
+  const dir = tmpDir('ac-config-');
+  const path = join(dir, 'config.yaml');
+  writeFileSync(path, [
+    'server:',
+    `  database: '${join(dir, 'agent.db').replace(/\\/g, '/')}'`,
+    `  worktree_root: '${join(dir, 'worktrees').replace(/\\/g, '/')}'`,
+    'projects:',
+    '  - repo: owner/repo',
+    `    local_repo: '${dir.replace(/\\/g, '/')}'`,
+    '    checks:',
+    ...checkLines,
+    'agent:',
+    '  model: test/coder',
+  ].join('\n'), 'utf8');
+  try { run(path); } finally { cleanup(dir); }
+}
+
+test('config: check platforms are parsed and passed through', () => {
+  withCheck(['      - argv: [node, --test]', '        platforms: [win32, linux]'], (path) => {
+    const config = loadConfig(path);
+    assert.deepEqual(config.projects[0]!.checks[0]!.platforms, ['win32', 'linux']);
+  });
+});
+
+test('config: an unknown check platform is rejected', () => {
+  withCheck(['      - argv: [node, --test]', '        platforms: [windows]'], (path) => {
+    assert.throws(() => loadConfig(path), (err) => err instanceof ConfigError && /unknown platform windows/.test(err.message));
+  });
+});
+
+test('config: an empty platforms list is rejected', () => {
+  withCheck(['      - argv: [node, --test]', '        platforms: []'], (path) => {
+    assert.throws(() => loadConfig(path), (err) => err instanceof ConfigError && /platforms must be a non-empty array/.test(err.message));
+  });
+});

@@ -46,6 +46,10 @@ export const DISPATCHABLE_TASK_STATUS: readonly Phase[] = ['DISCOVERED'];
 export interface CheckSpec {
   argv: string[];
   timeout_seconds?: number;
+  /** Platforms this check can run on (`node` platform names). Unset = all.
+   *  A check whose list excludes the host is skipped: it never runs, never
+   *  consumes fix budget, and is recorded as SKIP rather than FAIL. */
+  platforms?: NodeJS.Platform[];
 }
 
 export interface ProjectConfig {

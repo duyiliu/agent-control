@@ -8,7 +8,7 @@ import { approvalHash, GitHubTracker, type OpenPr } from '../tracker/github.js';
 import { DiffTooLargeError, GitWorkspace } from '../workspace/git.js';
 import { openPiCoderSession, type CoderSession, type CoderSessionOpts, type CoderTurn } from '../runners/session.js';
 import { PI_ALL_TOOLS } from '../runners/pi.js';
-import { runChecks, type ChecksSummary } from '../verify/checks.js';
+import { checksForPlatform, runChecks, skippedChecks, type ChecksSummary } from '../verify/checks.js';
 import { runReview, ReviewInfraError } from '../verify/review.js';
 import { publishDraftPr, PublishError } from '../publish/pr.js';
 import { buildCoderPrompt, buildFixPrompt, type PromptContext } from './prompts.js';
@@ -727,7 +727,8 @@ export class Engine {
             const headBeforeChecks = await this.workspace.head(worktreePath);
             store.transition(runId, phase, phase, {
               kind: 'checks_started', head_sha: headBeforeChecks,
-              commands: project.checks.map((check) => check.argv.join(' ')),
+              commands: checksForPlatform(project.checks).map((check) => check.argv.join(' ')),
+              skipped: skippedChecks(project.checks),
             });
             const summary = await this.callChecks(run, log, worktreePath, signal, headBeforeChecks);
             const headAfterChecks = await this.workspace.head(worktreePath).catch(() => null);
@@ -737,6 +738,7 @@ export class Engine {
               worktree_clean: checksWorktreeClean, ok: summary.ok, aborted: summary.aborted,
               infra_error: summary.infraError,
               outcomes: summary.outcomes.map((outcome) => ({ command: outcome.command, exit_code: outcome.exitCode, timed_out: outcome.timedOut })),
+              skipped: summary.skipped.map((s) => ({ command: s.command, reason: s.reason })),
             });
             if (aborted() || summary.aborted) { this.finish(run, task, 'CANCELED', 'cancelled during checks'); return; }
             if (headAfterChecks !== headBeforeChecks || !checksWorktreeClean) {
@@ -1385,7 +1387,16 @@ export class Engine {
         head_sha: headSha,
       });
     });
-    log.event('checks', { run: run.run_id, ok: summary.ok, count: summary.outcomes.length });
+    // Skipped checks are recorded so the dashboard and the reviewer see that
+    // this host cannot attest them — silence would read as "verified".
+    summary.skipped.forEach((s) => {
+      this.store.addCheck({
+        run_id: run.run_id, kind: 'check',
+        command: `${s.command} (skipped: ${s.reason})`,
+        exit_code: null, artifact_path: undefined, verdict: 'SKIP', head_sha: headSha,
+      });
+    });
+    log.event('checks', { run: run.run_id, ok: summary.ok, count: summary.outcomes.length, skipped: summary.skipped.length });
     return summary;
   }
 

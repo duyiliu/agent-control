@@ -29,6 +29,8 @@ function asBool(v: unknown, name: string): boolean {
   return v;
 }
 
+const PLATFORMS: readonly NodeJS.Platform[] = ['aix', 'android', 'darwin', 'freebsd', 'haiku', 'linux', 'openbsd', 'sunos', 'win32', 'cygwin', 'netbsd'];
+
 function parseCheck(v: unknown, name: string): CheckSpec {
   const o = asObj(v, name);
   const argv = o['argv'];
@@ -38,6 +40,19 @@ function parseCheck(v: unknown, name: string): CheckSpec {
   const spec: CheckSpec = { argv: argv as string[] };
   if (o['timeout_seconds'] !== undefined) {
     spec.timeout_seconds = asNum(o['timeout_seconds'], `${name}.timeout_seconds`, 1);
+  }
+  if (o['platforms'] !== undefined) {
+    const raw = o['platforms'];
+    if (!Array.isArray(raw) || raw.length === 0) {
+      fail(`${name}.platforms must be a non-empty array of platform names`);
+    }
+    spec.platforms = raw.map((p, i) => {
+      const platform = asStr(p, `${name}.platforms[${i}]`) as NodeJS.Platform;
+      if (!PLATFORMS.includes(platform)) {
+        fail(`${name}.platforms[${i}]: unknown platform ${platform} (expected one of ${PLATFORMS.join(', ')})`);
+      }
+      return platform;
+    });
   }
   return spec;
 }

@@ -12,12 +12,37 @@ export interface CheckOutcome {
   logPath: string;
 }
 
+export interface SkippedCheck {
+  spec: CheckSpec;
+  command: string;
+  /** Why it did not run, e.g. "requires win32; host is linux". */
+  reason: string;
+}
+
 export interface ChecksSummary {
   ok: boolean;
   outcomes: CheckOutcome[];
+  skipped: SkippedCheck[];
   failureEvidence: string;
   aborted?: boolean;
   infraError?: string;
+}
+
+/** A check without `platforms` runs everywhere; otherwise the host must be
+ *  in the list. A non-matching check is skipped, never failed: its tooling
+ *  (e.g. pwsh-only manager probes) simply does not exist on this host. */
+export function checksForPlatform(checks: CheckSpec[], platform: NodeJS.Platform = process.platform): CheckSpec[] {
+  return checks.filter((c) => !c.platforms || c.platforms.includes(platform));
+}
+
+export function skipReason(spec: CheckSpec, platform: NodeJS.Platform = process.platform): string {
+  return `requires ${(spec.platforms ?? []).join('/')}; host is ${platform}`;
+}
+
+export function skippedChecks(checks: CheckSpec[], platform: NodeJS.Platform = process.platform): SkippedCheck[] {
+  return checks
+    .filter((c) => c.platforms && !c.platforms.includes(platform))
+    .map((spec) => ({ spec, command: spec.argv.join(' '), reason: skipReason(spec, platform) }));
 }
 
 export function resolveCheckArgv(argv: string[]): string[] {
@@ -44,10 +69,15 @@ export async function runChecks(
   onSpawn?: (pid: number | null) => void,
 ): Promise<ChecksSummary> {
   const outcomes: CheckOutcome[] = [];
+  const skipped: SkippedCheck[] = [];
   let infraError: string | undefined;
   let aborted = signal?.aborted ?? false;
   for (let i = 0; i < checks.length && !aborted; i++) {
     const spec = checks[i]!;
+    if (spec.platforms && !spec.platforms.includes(process.platform)) {
+      skipped.push({ spec, command: spec.argv.join(' '), reason: skipReason(spec) });
+      continue;
+    }
     const logPath = logPathFor(i);
     let argv: string[];
     try { argv = resolveCheckArgv(spec.argv); }
@@ -71,7 +101,7 @@ export async function runChecks(
   const failures = outcomes.filter((o) => o.exitCode !== 0 || o.timedOut);
   return {
     ok: !aborted && !infraError && failures.length === 0,
-    outcomes, aborted, infraError,
+    outcomes, skipped, aborted, infraError,
     failureEvidence: infraError ?? failures
       .map((f) => `命令: ${f.command}\n退出码: ${f.exitCode}${f.timedOut ? ' (超时)' : ''}\n输出尾部:\n${f.tail}`)
       .join('\n\n'),
