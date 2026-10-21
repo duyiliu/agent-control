@@ -18,7 +18,8 @@ projects:
     base_branch: main
     ready_label: agent-ready
     branch_prefix: agent/issue-
-    checks:                          # 每个发布的 PR head 都会自动派发独立评审 run（无开关）
+    review_mode: auto                # auto（默认）：每个 PR head 自动派独立评审 run；manual：不派评审，PR 停在 AWAITING_HUMAN 等人审人合
+    checks:
       - argv: [node, --test]
         timeout_seconds: 300
 
@@ -35,6 +36,5 @@ agent:
     - GITHUB_ENTERPRISE_TOKEN
 
 approvals:
-  require_design_approval: true
-  require_manual_merge: true
-  allow_auto_deploy: false
+  auto_merge:
+    enabled: false                   # 低危 PASS 自动合并（仅 review_mode: auto 的项目）；关闭则一律转人工处理

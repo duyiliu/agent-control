@@ -17,12 +17,12 @@
 
 ## 2. 当前实现（代码已可见，未在本次评审中执行测试）
 
-主流程：GitHub Issue `agent-ready` → 领取并校验已批准内容哈希 → worktree → Pi/Codex 编码 → `VERIFYING`（宿主执行白名单 checks）→ `REVIEWING`（独立 reviewer 返回 JSON）→ 修复/通过 → `PUBLISHING_PR`（宿主创建 Draft PR）→ `AWAITING_MERGE` → 人工合并 → `COMPLETED`。
+主流程：GitHub Issue `agent-ready` → 领取并校验已批准内容哈希 → worktree → Pi/Codex 编码 → `VERIFYING`（宿主执行白名单 checks）→ `REVIEWING`（独立 reviewer 返回 JSON）→ 修复/通过 → `PUBLISHING_PR`（宿主创建 Draft PR）→ `AWAITING_HUMAN` → 人工合并 → `COMPLETED`。
 
 - `REVIEW_SCHEMA`：`PASS | BLOCK | HUMAN_REVIEW_REQUIRED`，附 `summary` 和 `findings: string[]`。
 - `BLOCK` 交由编码 Agent 修复；检查失败也可修复，二者共用 `server.retry_limit`（示例值 3）。
 - Reviewer 在独立会话运行；Pi 使用只读工具白名单，Codex 使用配置沙箱；Review 前后检查 HEAD 和 worktree 清洁状态。
-- PR 当前是内部质量闸门通过后的交付物；`AWAITING_MERGE` 主要轮询合并/关闭状态，尚没有对 PR review comments 与 CI 的反馈调度。
+- PR 当前是内部质量闸门通过后的交付物；`AWAITING_HUMAN` 主要轮询合并/关闭状态，尚没有对 PR review comments 与 CI 的反馈调度。
 - 安全边界：子进程凭据与发布权限尽量剥离，但 Windows 下 coder 不一定获得 OS 级隔离；不得将 worktree 等同于沙箱。
 
 **已确认的缺口：** `engine.ts` 中 Review 失败进入 `FIXING` 时 `return_phase=REVIEWING`，`FIXING` 成功后直接回到 `REVIEWING`，没有重新执行 `VERIFYING`。修复可能使已有测试结果失效。
@@ -77,7 +77,7 @@ RUNNING → VERIFYING ──pass──→ REVIEWING ──PASS──→ PUBLISHI
 
 ## 5. P1：PR 后 CI 可观测闭环（只读）
 
-在 `AWAITING_MERGE` 增加可选子状态/字段，例如 `ci_status`（PENDING/PASS/FAIL/UNKNOWN），不必立即新增复杂顶层 Phase。调度器通过宿主 `gh pr checks` 或 GitHub Checks/Statuses API 读取：
+在 `AWAITING_HUMAN` 增加可选子状态/字段，例如 `ci_status`（PENDING/PASS/FAIL/UNKNOWN），不必立即新增复杂顶层 Phase。调度器通过宿主 `gh pr checks` 或 GitHub Checks/Statuses API 读取：
 
 - PR 编号、`head_sha`、check name、结论、链接、时间；
 - 明确区分 pending / failed / cancelled / timed out / skipped / unknown；
@@ -110,7 +110,7 @@ RUNNING → VERIFYING ──pass──→ REVIEWING ──PASS──→ PUBLISHI
 ### 推荐状态流
 
 ```text
-AWAITING_MERGE
+AWAITING_HUMAN
    ├─ CI pending / 无新增反馈 → 保持等待
    ├─ CI PASS + 外部 review 满足策略 → 等人工 merge
    ├─ 新可执行反馈 → PR_FEEDBACK_FIXING

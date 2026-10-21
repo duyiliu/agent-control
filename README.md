@@ -101,7 +101,11 @@ schtasks /delete /tn agent-control  # 卸载
    npm run ac -- runs <issue>  # 单任务事件时间线 + 证据路径
    ```
    原始证据在 `<数据目录>\logs\`：`agent-control.jsonl` 事件流 + 每轮 artifacts（agent 事件、测试日志、review 结论、diff.patch）。
-3. **收口**：checks 全过 → 自动 push 出 Draft PR + `agent-pr` 标签 → 编码 run 结束于 `AWAITING_MERGE`。调度器随后对该 PR head 自动派发**独立评审 run**（一次性只读 reviewer，所有 PR 统一自动评审、无开关）：PASS 低风险可自动合并，高风险转人工，BLOCK 派生修复 run。GitHub 上打开 PR → Ready for review → 审完 Merge。调度器检测到 merged → `COMPLETED` → 自动删 worktree/分支。
+3. **收口**：checks 全过 → 自动 push 出 Draft PR + `agent-pr` 标签。项目可选两种审核模式（`projects[].review_mode`，默认 `auto`）：
+   - `auto`：编码 run 结束于 **`AWAITING_REVIEW`**（Human Review：PR 已开、等评审），调度器对该 PR head 自动派发**独立评审 run**（一次性只读 reviewer）。PASS 低风险 → 任务进 `MERGING`，由宿主侧合并 sweep 钉住被审 sha 落地（瞬时失败有界重试、冲突派生修复 run、超限转人工）；高风险/非 PASS/BLOCK → 转 `AWAITING_HUMAN`（等人工处理）或派生修复 run。
+   - `manual`：不派评审，PR 直接停 `AWAITING_HUMAN` 由人审人合。
+
+   GitHub 上打开 PR → Ready for review → 审完 Merge。调度器检测到 merged → `COMPLETED` → 自动删 worktree/分支。
 4. **异常**：
 
    | 情况 | 表现 | 处理 |
@@ -115,7 +119,8 @@ schtasks /delete /tn agent-control  # 卸载
 
 - 任意代码修复后均重新执行 checks；评审是独立 run（`kind='review'`），评审对象是 PR 的 head sha——评审现场为该 sha 的本地物化（复用编码 worktree 或 detached worktree），评审后校验 HEAD 与干净状态，被改动即拒绝结论。
 - 每次检查开始/完成、评审开始/完成、进入修复和发布 PR 时，`run_events.detail_json` 记录关联提交 SHA；checks 与 review 结论行也写入 `check_results.head_sha`，同 sha 已有任何评审结论即不再重复派发；PR head 移动则放弃当轮不写结论、按新 sha 重派。
-- 评审基础设施不可用（现场物化失败、diff 不可得、reviewer 异常）记 `ERROR` 结论并降级人工（`AWAITING_MERGE` + `agent-high-risk`），不消耗修复预算、不惩罚编码成果。
+- 评审基础设施不可用（现场物化失败、diff 不可得、reviewer 异常）记 `ERROR` 结论并降级人工（`AWAITING_HUMAN` + `agent-high-risk`），不消耗修复预算、不惩罚编码成果。
+- **人工批准合并**：任务停在 `AWAITING_HUMAN` 时，给 PR 打 `agent-merge` 标签即表示"批准合并"。调度器**一次性消费**该标签（立即删除）→ 任务转 `MERGING` → 钉住最近一次评审结论的 sha 合并。若 PR head 已越过被审 sha，批准作废（删标签 + PR 评论说明），绝不合未经评审的版本；`manual` 模式没有评审结论时，批准的是打标签时的当前 head。合并失败/冲突走修复回路，产生新 head 后需重新批准。
 - Review 仅对有证据的正确性、验收或越界问题返回 `BLOCK`；BLOCK 且有 findings 且任务级修复预算未耗尽时写入 `pending_fix` 派生冷启动修复 run，否则 `BLOCKED` 转人工。修复 run 若未产生新提交（与评审 sha 相同）判死端 `BLOCKED`，不会无声卡住。
 - checks 的命令启动失败、超时或异常终止记为基础设施错误，不自动修改业务代码。Windows 上 `npm`/`npx` 使用 Node 入口启动，未知 `.cmd`/`.bat` 需显式配置可执行入口，不启用通用 shell。
 - Stop 独立按 `cancel_poll_seconds`（默认 5 秒）检查，取消信号传递到测试进程。调度 tick 不重叠，慢速 GitHub 请求不阻挡本地取消。
@@ -137,7 +142,15 @@ schtasks /delete /tn agent-control  # 卸载
 
 ## 状态机
 
-编码 run：`DISCOVERED → CLAIMED → PREPARING → RUNNING → VERIFYING ↔ FIXING → PUBLISHING_PR → AWAITING_MERGE → COMPLETED`（checks 失败的 FIXING 环路保留）。评审 run（`kind='review'`）：`CLAIMED → REVIEWING → 终态`，绑定 PR head sha；BLOCK 且预算内时经 `pending_fix` 派生新的编码 run（冷启动修复，计任务级 `fix_rounds` 预算）。任意运行相位可落入 `BLOCKED / FAILED / CANCELED / RECOVERY_REQUIRED`。所有迁移写入 `run_events`，测试与评审证据写入 `check_results`（含 `head_sha`）。
+编码 run：`DISCOVERED → CLAIMED → PREPARING → RUNNING → VERIFYING ↔ FIXING → PUBLISHING_PR → AWAITING_REVIEW`（auto 模式）或 `→ AWAITING_HUMAN`（manual 模式）；checks 失败的 FIXING 环路保留。评审 run（`kind='review'`）：`CLAIMED → REVIEWING → 终态`，绑定 PR head sha。任务状态语义：
+
+| 状态 | 含义 |
+|---|---|
+| `AWAITING_REVIEW` | PR 已开，评审待派/在途（Symphony 的 Human Review）；head 移动或被取消时回到这里重派 |
+| `AWAITING_HUMAN` | 评审已完成但不能自动落地（高风险/非 PASS/ERROR/无自动合并/修复预算耗尽），等人工处理：评审判断 + 合并 |
+| `MERGING` | 评审 PASS+低风险，宿主 sweep 正在钉 sha 落地：失败按 `merge_attempts`（上限 20）重试，冲突经 `pending_fix` 派生修复 run，超限转人工 |
+
+PASS 低风险且自动合并开启时任务进 `MERGING`（评审 run 自身 `COMPLETED`）。BLOCK 且预算内时经 `pending_fix` 派生新的编码 run（冷启动修复，计任务级 `fix_rounds` 预算）。`stop` 可让 `AWAITING_REVIEW`/`MERGING` 任务退回 `AWAITING_HUMAN`。任意运行相位可落入 `BLOCKED / FAILED / CANCELED / RECOVERY_REQUIRED`。所有迁移写入 `run_events`，测试与评审证据写入 `check_results`（含 `head_sha`）。
 
 ## 与设计的偏差（已记录）
 

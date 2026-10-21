@@ -9,7 +9,7 @@
 > 实现审查模式：independent（subagent_explore）
 > 实现审查轮次：3/3（R1 FAIL 1C/2H/9M → R2 FAIL 1H/1M → R3 PASS）
 > Reviewer：subagent_explore（独立上下文，同一 agent 增量复审 agent_id=9e3d3bd8）
-> 环境验收：未执行（需真实 GitHub PR + pi review 实跑；确定性证据已齐）
+> 环境验收：已执行（2026-10-21 真实 E2E，见文末记录）
 > 最后核验：完成
 
 ## 完成闸门
@@ -135,7 +135,26 @@
 
 - `npx tsc --noEmit`：0 错。
 - `npm test`：146 通过 / 0 失败。
-- 未执行：真实环境端到端（需活 GitHub repo + pi 实跑）——属环境验收层，非本次确定性验证范围。
+
+## 真实环境 E2E 记录（2026-10-21，本机 LAPTOP-JJJ4RATK）
+
+- 靶仓：`duyiliu/agent-control-sandbox`（私有），服务以 `npm run ac -- start` 实跑（schema v4 实迁）。
+- **全链路成功样本 issue #15 → PR #16**（JSDoc 注释任务）：
+  - `kind=code` run `b9b5d043`：CLAIMED 22:37:34 → PREPARING → RUNNING（pi RPC 实进程）→ VERIFYING（`node --test` PASS，check 行带 `head_sha=83036a0b`）→ PUBLISHING_PR → 终局 AWAITING_MERGE（编码 run 无 REVIEWING ✓）。
+  - `kind=review` run `eda34ec8`：CLAIMED 22:39:10（sha 绑定 `83036a0b`）→ 复用编码 worktree（HEAD==sha 且干净）→ `pi -p` 只读评审实进程 → verdict `PASS + risk=low` → **sha 钉住自动合并**（`auto_merged` 事件 22:39:44；GitHub `state=MERGED`，mergeCommit `b4ce25f5`，merged head == 被审 sha）→ task COMPLETED，worktree 已清，issue 关闭并贴完成评论。
+- **高风险分支实跑**：issue #13 → PR #14（新增 `src/fraction.js` + 测试）评审 `PASS+low`，但风险启发式 `test change: tests/*` → 高风险 → AWAITING_MERGE + `agent-high-risk` + 人工评论，不自动合并（按设计）。
+- **评审质量实据**：PR14 评审评论逐条核验了 parseFraction 语义并引用 `node --test 6/0` sha 证据；新代码产出的 check 行均带 head_sha。
+- **发现的实战问题与已落地修复**（2026-10-21 修复，154/154 测试 + tsc 全绿）：
+  1. 存量 PR 评审 7/7 全 HRR：两类原因——旧 check 行 `head_sha=NULL` 使评审看不到测试证据（迁移缺口）；glm-5.3-flash 两次 JSON 协议不纯。
+     - 修：`testEvidenceFor` 在 sha 证据为空时回退 task 最近一次 check 证据并显式标注"未绑定此 SHA"（`Store.latestCheckEvidence`）。
+     - 修：verdict 解析容错——叙述中恰好一个且过 shape 校验的 `{...}` 恢复为真实 verdict，强制 `risk=high` + `[protocol-recovered]` 标记（不获 auto-merge 资格，BLOCK findings 仍能喂修复回路）；0/多对象或校验失败仍 HRR；解析失败后重试的 prompt 追加严格 JSON-only 提醒。
+  2. `assessReviewRisk` 将任何 tests/ 改动判高风险——几乎让所有带测试的 PR 无法自动合并。
+     - 修：按 diff 中 `new file mode`/`deleted file mode` 区分；仅**修改/删除既有测试文件**判高风险（覆盖削弱方向），新增测试文件不再触发。
+  3. 跨实例竞态实锤：`DESKTOP-5KN6M93` 实例同 repo 轮询，issue #15 双 claim（间隔 2s，非原子标签抢占）。
+     - 修：claim 后回读仲裁——`已领取` comment 现带 run id；claim 后等 settle 窗（默认 4s，`EngineDeps.claimArbitrationMs` 可注入）重读 issue comments，近 10 分钟内最早 claim comment 赢，输方 `endRun(CANCELED)` 不 launch、不动 agent-running（归赢家）。同 host 评论视为 ghost 不算对手；同 host 兄弟实例不可区分（已记录为接受缺口）。tracker 新增 `listIssueComments`。
+     - 残留：评审 run 的 dispatchReviews 路径未做仲裁（sha 幂等 + merge 前复核使损失有界）；DESKTOP 旧代码实例不受新代码仲裁影响，需人工停/升。
+  4. `agent-blocked` 标签在他实例标记后残留。
+     - 修：claim 成功后即移除残留 `agent-blocked`（与 retryTask 对称）。
 
 ## 交付后范围调整（v2.3）
 
