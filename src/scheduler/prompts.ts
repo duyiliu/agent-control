@@ -99,7 +99,7 @@ export function buildFixPrompt(ctx: PromptContext, evidence: string): string {
 
 export const MAX_REVIEW_DIFF_CHARS = 120_000;
 
-export function buildReviewPrompt(ctx: PromptContext, testEvidence: string, diffEvidence: string, headSha?: string): string {
+export function buildReviewPrompt(ctx: PromptContext, testEvidence: string, diffEvidence: string, headSha?: string, strictReminder = false): string {
   return [
     '# 角色',
     '你是 agent-control 调度器启动的独立只读审查器。不要修改任何文件。',
@@ -139,6 +139,9 @@ export function buildReviewPrompt(ctx: PromptContext, testEvidence: string, diff
     '',
     '# 输出格式（硬性要求）',
     '只输出一个 JSON 对象 {"verdict":"PASS|BLOCK|HUMAN_REVIEW_REQUIRED","risk":"low|high","summary":"...","findings":["..."]}；不要输出 JSON 之外的任何内容，不要用代码块包裹。',
+    ...(strictReminder
+      ? ['上次输出违反了 JSON-only 协议（JSON 对象外还输出了叙述文字）。本次整个回复只能是这一个 JSON 对象，第一个字符是 {，最后一个字符是 }。']
+      : []),
   ].join('\n');
 }
 

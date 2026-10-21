@@ -239,7 +239,7 @@ export async function runDoctor(config: AppConfig | null, configError?: string):
       ? { name: `project:${p.repo}`, status: 'PASS', detail: `local repo ${p.local_repo}` }
       : { name: `project:${p.repo}`, status: 'FAIL', detail: `${p.local_repo} is not a git repo` });
     try {
-      const labels = await tracker.ensureLabels(p.repo, ['agent-ready', 'agent-running', 'agent-blocked', 'agent-pr', 'agent-reviewing', 'agent-high-risk']);
+      const labels = await tracker.ensureLabels(p.repo, ['agent-ready', 'agent-running', 'agent-blocked', 'agent-pr', 'agent-reviewing', 'agent-high-risk', 'agent-merge']);
       items.push(labels.ok
         ? { name: `labels:${p.repo}`, status: 'PASS', detail: 'required labels exist' }
         : { name: `labels:${p.repo}`, status: 'UNVERIFIED', detail: `missing: ${labels.missing.join(', ')}` });

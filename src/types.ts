@@ -7,7 +7,9 @@ export type Phase =
   | 'REVIEWING'
   | 'FIXING'
   | 'PUBLISHING_PR'
-  | 'AWAITING_MERGE'
+  | 'AWAITING_REVIEW'
+  | 'AWAITING_HUMAN'
+  | 'MERGING'
   | 'COMPLETED'
   | 'BLOCKED'
   | 'BLOCKED_APPROVAL_CHANGED'
@@ -28,7 +30,8 @@ export const RUN_ACTIVE_PHASES: readonly Phase[] = [
 
 /** Run phases where the attempt has ended (waiting on human counts as ended). */
 export const RUN_INACTIVE_PHASES: readonly Phase[] = [
-  'AWAITING_MERGE',
+  'AWAITING_REVIEW',
+  'AWAITING_HUMAN',
   'COMPLETED',
   'BLOCKED',
   'BLOCKED_APPROVAL_CHANGED',
@@ -52,6 +55,10 @@ export interface ProjectConfig {
   ready_label: string;
   branch_prefix: string;
   checks: CheckSpec[];
+  /** 'auto': every published PR head gets an independent review run.
+   *  'manual': no review run — the PR parks in AWAITING_HUMAN (Human Review)
+   *  for a human to review and merge. */
+  review_mode: 'auto' | 'manual';
 }
 
 export interface AppConfig {
@@ -78,9 +85,6 @@ export interface AppConfig {
     env_deny: string[];
   };
   approvals: {
-    require_design_approval: boolean;
-    require_manual_merge: boolean;
-    allow_auto_deploy: boolean;
     /** Host-side auto-merge for low-risk PRs that pass review. */
     auto_merge: {
       enabled: boolean;
@@ -126,11 +130,13 @@ export interface PrInfo {
  *  separately-dispatched verdict on one PR head sha. */
 export type RunKind = 'code' | 'review';
 
-/** tasks.pending_fix JSON payload: a review BLOCK that spawned a fix run. */
+/** tasks.pending_fix JSON payload: a review BLOCK or merge failure that
+ *  spawned a fix run. `title` labels the fix prompt section. */
 export interface PendingFix {
   head_sha: string;
   summary: string;
   findings: string[];
+  title?: string;
 }
 
 export interface TaskRow {
@@ -145,6 +151,11 @@ export interface TaskRow {
   pr_url: string | null;
   fix_rounds: number;
   pending_fix: string | null;
+  merge_attempts: number;
+  /** The exact sha cleared to land; set when the task enters MERGING. */
+  approved_sha: string | null;
+  /** Who cleared it: 'review' (PASS+low) or 'human' (agent-merge label). */
+  approved_by: 'review' | 'human' | null;
   updated_at: string;
   created_at: string;
 }

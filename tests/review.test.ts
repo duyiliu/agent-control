@@ -53,7 +53,7 @@ test('review: malformed output retries reviewer once, then accepts valid output'
   } finally { cleanup(env.dir); }
 });
 
-test('review: narration around the verdict JSON breaks protocol, goes to human review', async () => {
+test('review: narration around one valid verdict is recovered but forced high-risk', async () => {
   const env = setup();
   try {
     let calls = 0;
@@ -63,11 +63,13 @@ test('review: narration around the verdict JSON breaks protocol, goes to human r
       return ok();
     });
     assert.equal(calls, 1);
-    assert.equal(out.result.verdict, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(out.result.verdict, 'PASS');
+    assert.equal(out.result.risk, 'high'); // protocol break never earns auto-merge
+    assert.match(out.result.summary, /^\[protocol-recovered\]/);
   } finally { cleanup(env.dir); }
 });
 
-test('review: stray JSON in narration does not rescue a protocol violation', async () => {
+test('review: two objects in narration stay ambiguous → human review', async () => {
   const env = setup();
   try {
     let calls = 0;
@@ -81,14 +83,15 @@ test('review: stray JSON in narration does not rescue a protocol violation', asy
   } finally { cleanup(env.dir); }
 });
 
-test('review: trailing prose after the verdict JSON also breaks protocol', async () => {
+test('review: trailing prose after the verdict JSON is recovered', async () => {
   const env = setup();
   try {
     const out = await runReview(env.ctx, 'tests pass', 'diff', env.deps, async (opts) => {
       writeFileSync(opts.lastMessagePath, `${JSON.stringify(passed)}\n混杂文本 } 不影响`);
       return ok();
     });
-    assert.equal(out.result.verdict, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(out.result.verdict, 'PASS');
+    assert.equal(out.result.risk, 'high');
   } finally { cleanup(env.dir); }
 });
 
@@ -116,7 +119,7 @@ test('review: protocol break points the artifact at the raw narration', async ()
       writeFileSync(opts.lastMessagePath, `先分析一下改动。\n\n${JSON.stringify(passed)}`);
       return ok();
     });
-    assert.equal(out.result.verdict, 'HUMAN_REVIEW_REQUIRED');
+    assert.equal(out.result.verdict, 'PASS'); // recovered, but evidence stays the narration
     assert.equal(out.logPath, written);
     assert.match(readFileSync(out.logPath, 'utf8'), /先分析一下改动/);
   } finally { cleanup(env.dir); }
@@ -152,7 +155,7 @@ test('review: model override keeps Pi runner and read-only tool allowlist', asyn
   } finally { cleanup(env.dir); }
 });
 
-test('review: prose containing an example PASS is not accepted as a verdict', async () => {
+test('review: one shape-valid object is recovered even amid example-ish prose (forced high-risk)', async () => {
   const env = setup();
   try {
     let calls = 0;
@@ -162,7 +165,37 @@ test('review: prose containing an example PASS is not accepted as a verdict', as
       return ok();
     });
     assert.equal(calls, 1);
+    assert.equal(out.result.verdict, 'PASS');
+    // Recovery is deliberately lossy: marker + forced high risk keep it off auto-merge.
+    assert.equal(out.result.risk, 'high');
+    assert.match(out.result.summary, /^\[protocol-recovered\]/);
+  } finally { cleanup(env.dir); }
+});
+
+test('review: malformed-shape single object still falls through to human review', async () => {
+  const env = setup();
+  try {
+    const out = await runReview(env.ctx, 'pass', 'diff', env.deps, async (opts) => {
+      writeFileSync(opts.lastMessagePath, `结论如下 {"verdict":"MAYBE","x":1}`);
+      return ok();
+    });
     assert.equal(out.result.verdict, 'HUMAN_REVIEW_REQUIRED');
+  } finally { cleanup(env.dir); }
+});
+
+test('review: parse failure retries with a strict-JSON reminder in the prompt', async () => {
+  const env = setup();
+  try {
+    const prompts: string[] = [];
+    const out = await runReview(env.ctx, 'pass', 'diff', env.deps, async (opts) => {
+      prompts.push(opts.prompt);
+      writeFileSync(opts.lastMessagePath, prompts.length === 1 ? 'totally unstructured' : JSON.stringify(passed));
+      return ok();
+    });
+    assert.equal(prompts.length, 2);
+    assert.doesNotMatch(prompts[0]!, /上次输出违反了 JSON-only 协议/);
+    assert.match(prompts[1]!, /上次输出违反了 JSON-only 协议/);
+    assert.equal(out.result.verdict, 'PASS');
   } finally { cleanup(env.dir); }
 });
 

@@ -10,7 +10,7 @@ import type {
 } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 8;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -148,6 +148,64 @@ export class Store {
           .run(4, now());
       });
     }
+    if (current < 5) {
+      // v5: MERGING is a real task status whose host-side merge attempts are
+      // bounded and crash-resumable — the counter must persist.
+      this.tx(() => {
+        this.db.exec('ALTER TABLE tasks ADD COLUMN merge_attempts INTEGER NOT NULL DEFAULT 0');
+        this.db
+          .prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)')
+          .run(5, now());
+      });
+    }
+    if (current < 6) {
+      // v6: review gets its own wait state. AWAITING_REVIEW = PR published,
+      // review pending/in flight (Symphony's "Human Review"); AWAITING_MERGE
+      // now means strictly "reviewed, waiting for a human to merge".
+      // Tasks never reviewed (no verdict row at all) move to AWAITING_REVIEW;
+      // tasks with any verdict stay on the human path.
+      this.tx(() => {
+        this.db.exec(`
+          UPDATE tasks SET status = 'AWAITING_REVIEW'
+          WHERE status = 'AWAITING_MERGE' AND pr_url IS NOT NULL AND pending_fix IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM check_results c JOIN runs r ON r.run_id = c.run_id
+              WHERE r.task_id = tasks.id AND c.kind = 'review'
+            )
+        `);
+        this.db
+          .prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)')
+          .run(6, now());
+      });
+    }
+    if (current < 7) {
+      // v7: AWAITING_MERGE → AWAITING_HUMAN. The state covers human judgement
+      // (high-risk PASS / HRR / ERROR / manual review), not only merging —
+      // the old name was a misnomer. Historical event rows are rewritten so
+      // the UI keeps one vocabulary.
+      this.tx(() => {
+        this.db.exec(`
+          UPDATE tasks SET status = 'AWAITING_HUMAN' WHERE status = 'AWAITING_MERGE';
+          UPDATE runs SET phase = 'AWAITING_HUMAN' WHERE phase = 'AWAITING_MERGE';
+          UPDATE run_events SET from_phase = 'AWAITING_HUMAN' WHERE from_phase = 'AWAITING_MERGE';
+          UPDATE run_events SET to_phase = 'AWAITING_HUMAN' WHERE to_phase = 'AWAITING_MERGE';
+        `);
+        this.db
+          .prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)')
+          .run(7, now());
+      });
+    }
+    if (current < 8) {
+      // v8: the sha cleared to land is recorded on the task when it enters
+      // MERGING. Human approvals can rest on a non-PASS verdict (or none at
+      // all in manual mode), so the merge sweep must not infer it.
+      this.tx(() => {
+        this.db.exec('ALTER TABLE tasks ADD COLUMN approved_sha TEXT; ALTER TABLE tasks ADD COLUMN approved_by TEXT');
+        this.db
+          .prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)')
+          .run(8, now());
+      });
+    }
   }
 
   private txDepth = 0;
@@ -226,13 +284,16 @@ export class Store {
     return this.db.prepare('SELECT * FROM tasks ORDER BY id').all() as unknown as TaskRow[];
   }
 
-  setTaskStatus(id: number, status: Phase, fields?: { approved_hash?: string | null; branch?: string | null; pr_url?: string | null; pending_fix?: string | null }) {
+  setTaskStatus(id: number, status: Phase, fields?: { approved_hash?: string | null; branch?: string | null; pr_url?: string | null; pending_fix?: string | null; merge_attempts?: number; approved_sha?: string | null; approved_by?: 'review' | 'human' | null }) {
     const sets = ['status = ?', 'updated_at = ?'];
     const vals: (string | number | null)[] = [status, now()];
     if (fields?.approved_hash !== undefined) { sets.push('approved_hash = ?'); vals.push(fields.approved_hash); }
     if (fields?.branch !== undefined) { sets.push('branch = ?'); vals.push(fields.branch); }
     if (fields?.pr_url !== undefined) { sets.push('pr_url = ?'); vals.push(fields.pr_url); }
     if (fields?.pending_fix !== undefined) { sets.push('pending_fix = ?'); vals.push(fields.pending_fix); }
+    if (fields?.merge_attempts !== undefined) { sets.push('merge_attempts = ?'); vals.push(fields.merge_attempts); }
+    if (fields?.approved_sha !== undefined) { sets.push('approved_sha = ?'); vals.push(fields.approved_sha); }
+    if (fields?.approved_by !== undefined) { sets.push('approved_by = ?'); vals.push(fields.approved_by); }
     vals.push(id);
     this.db.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
   }
@@ -244,6 +305,11 @@ export class Store {
   bumpFixRounds(id: number): number {
     this.db.prepare('UPDATE tasks SET fix_rounds = fix_rounds + 1, updated_at = ? WHERE id = ?').run(now(), id);
     return (this.getTaskById(id)?.fix_rounds ?? 0);
+  }
+
+  bumpMergeAttempts(id: number): number {
+    this.db.prepare('UPDATE tasks SET merge_attempts = merge_attempts + 1, updated_at = ? WHERE id = ?').run(now(), id);
+    return (this.getTaskById(id)?.merge_attempts ?? 0);
   }
 
   /** Per-attempt fix counter — the budget lives on the run, not the task. */
@@ -422,6 +488,33 @@ export class Store {
       .get(taskId, headSha) !== undefined;
   }
 
+  /** The sha of the task's latest review verdict row (any verdict). */
+  latestReviewVerdictSha(taskId: number): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT c.head_sha FROM check_results c JOIN runs r ON r.run_id = c.run_id
+         WHERE r.task_id = ? AND c.kind = 'review' AND c.head_sha IS NOT NULL
+         ORDER BY c.id DESC LIMIT 1`,
+      )
+      .get(taskId) as { head_sha: string | null } | undefined;
+    return row?.head_sha ?? null;
+  }
+
+  /**
+   * The sha a MERGING task is cleared to land: the head_sha of the task's
+   * latest PASS review verdict. A merge must be pinned to exactly this.
+   */
+  latestPassReviewSha(taskId: number): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT c.head_sha FROM check_results c JOIN runs r ON r.run_id = c.run_id
+         WHERE r.task_id = ? AND c.kind = 'review' AND c.verdict = 'PASS' AND c.head_sha IS NOT NULL
+         ORDER BY c.id DESC LIMIT 1`,
+      )
+      .get(taskId) as { head_sha: string | null } | undefined;
+    return row?.head_sha ?? null;
+  }
+
   /**
    * Check evidence for one head sha across all runs of a task — latest row
    * per command wins. Review runs consume this to build testEvidence.
@@ -433,6 +526,21 @@ export class Store {
          WHERE r.task_id = ? AND c.kind = 'check' AND c.head_sha = ? ORDER BY c.id`,
       )
       .all(taskId, headSha) as unknown as CheckResultRow[];
+    return [...new Map(rows.map((c) => [c.command, c])).values()];
+  }
+
+  /**
+   * Fallback check evidence: the task's latest check row per command across
+   * all runs, regardless of head_sha. Used when sha-scoped evidence is absent
+   * (legacy rows predate the head_sha column).
+   */
+  latestCheckEvidence(taskId: number): CheckResultRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT c.* FROM check_results c JOIN runs r ON r.run_id = c.run_id
+         WHERE r.task_id = ? AND c.kind = 'check' ORDER BY c.id`,
+      )
+      .all(taskId) as unknown as CheckResultRow[];
     return [...new Map(rows.map((c) => [c.command, c])).values()];
   }
 

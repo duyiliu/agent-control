@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { Store } from '../store/sqlite.js';
 import { RunLog, type AppLog } from '../telemetry/logging.js';
 import { approvalHash, GitHubTracker } from '../tracker/github.js';
@@ -25,11 +26,17 @@ export interface EngineDeps {
   openCoderSessionFn?: (opts: CoderSessionOpts) => CoderSession;
   runReviewFn?: typeof runReview;
   runChecksFn?: typeof runChecks;
+  /** Settle window before re-reading claim comments for race arbitration. */
+  claimArbitrationMs?: number;
 }
 
 const TERMINAL_FOR_TASK: Phase[] = [
-  'AWAITING_MERGE', 'COMPLETED', 'BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'CANCELED', 'RECOVERY_REQUIRED',
+  'AWAITING_REVIEW', 'AWAITING_HUMAN', 'COMPLETED', 'BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'CANCELED',
+  'RECOVERY_REQUIRED',
 ];
+
+/** Failed `gh pr merge` retries before a MERGING task gives up to a human. */
+const MAX_MERGE_ATTEMPTS = 20;
 
 /** Task states a human must look at — surfaced as a GitHub issue comment. */
 const ATTENTION_PHASES: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED'];
@@ -80,7 +87,7 @@ export class Engine {
     if (this.ticking) return;
     this.ticking = true;
     try {
-      await this.mergeReconcile();
+      await this.reconcileMergeStates();
       await this.discover();
       await this.dispatch();
       await this.dispatchReviews();
@@ -89,30 +96,208 @@ export class Engine {
     }
   }
 
-  /** AWAITING_MERGE tasks: human merge/close state is written back by tracker. */
-  private async mergeReconcile() {
-    for (const task of this.store.listTasks('AWAITING_MERGE')) {
+  /**
+   * Merge sweep, every tick:
+   * - AWAITING_REVIEW / AWAITING_HUMAN tasks: external merge/close is
+   *   written back (a human may land the PR while review is still pending).
+   * - MERGING tasks: the host actively lands the PR — retries transient
+   *   failures within a bounded budget, hands conflicts to a fix run, and
+   *   parks for a human only after the budget is gone.
+   */
+  private async reconcileMergeStates() {
+    for (const task of [
+      ...this.store.listTasks('AWAITING_REVIEW'),
+      ...this.store.listTasks('AWAITING_HUMAN'),
+      ...this.store.listTasks('MERGING'),
+    ]) {
       try {
         const project = this.projectFor(task.repo);
         if (!project) continue;
         const prNum = prNumberFromUrl(task.pr_url) ?? undefined;
+        if (task.status === 'MERGING') {
+          // A conflict-repair run is part of landing: the task stays MERGING
+          // while that run works, and the sweep must not merge mid-repair.
+          if (this.store.activeRunForTask(task.id)) continue;
+          await this.driveMerge(task, project, prNum);
+          continue;
+        }
         const state = prNum
           ? await this.tracker.getPrState(project.repo, prNum)
           : await this.tracker.findPrForBranch(project.repo, task.branch ?? '').then((p) => p?.state ?? 'OPEN');
         if (state === 'MERGED') {
-          this.setTaskStatus(task.id, 'COMPLETED');
-          this.appLog.event('task_completed', { task: task.id, repo: task.repo, issue: task.issue_number });
-          await this.notifyTaskCompleted(task);
-          await this.cleanupMerged(project, task);
+          await this.completeMergedTask(task, project);
         } else if (state === 'CLOSED') {
           this.setTaskStatus(task.id, 'BLOCKED');
           this.appLog.event('task_blocked_pr_closed', { task: task.id });
+        } else if (task.status === 'AWAITING_HUMAN') {
+          await this.maybeHumanMergeApproval(task, project, prNum);
         }
       } catch (err) {
         this.appLog.event('reconcile_error', { task: task.id, error: String(err) });
         this.recordError('reconcile_error', err);
       }
     }
+  }
+
+  /**
+   * Human merge approval: a human adds `agent-merge` to the PR, and the
+   * host lands it. The label is one-shot — consumed before the transition —
+   * and the approval binds to the last reviewed sha: if the PR moved past
+   * it, the approval is voided (label removed, comment posted) rather than
+   * silently merging an unreviewed head. Manual-review projects have no
+   * verdict sha; there the label approves whatever head is current.
+   */
+  private async maybeHumanMergeApproval(task: TaskRow, project: ProjectConfig, prNumber: number | undefined) {
+    if (!prNumber) return;
+    let pr: Awaited<ReturnType<GitHubTracker['getPrDetails']>>;
+    try {
+      pr = await this.tracker.getPrDetails(project.repo, prNumber);
+    } catch (err) {
+      this.appLog.event('human_merge_preflight_error', { task: task.id, error: String(err) });
+      return;
+    }
+    if (pr.state !== 'OPEN') return;
+    // Self-heal: an AWAITING_HUMAN task whose current head was never reviewed
+    // (e.g. a repair pushed a new head while the task was parked) must go back
+    // to the review queue — otherwise the new head can never be approved.
+    if (project.review_mode === 'auto' && !this.store.hasReviewVerdictForSha(task.id, pr.headSha)) {
+      // Any pending approval covers the old head only — drop it, re-review.
+      await this.prLabelQuietly(project.repo, prNumber, 'agent-merge', false);
+      this.setTaskStatus(task.id, 'AWAITING_REVIEW');
+      this.appLog.event('human_head_unreviewed', { task: task.id, head_sha: pr.headSha });
+      return;
+    }
+    if (!pr.labels.includes('agent-merge')) return;
+    const reviewedSha = this.store.latestReviewVerdictSha(task.id);
+    if (reviewedSha && pr.headSha !== reviewedSha) {
+      await this.prLabelQuietly(project.repo, prNumber, 'agent-merge', false);
+      await this.tracker.commentPr(project.repo, prNumber,
+        `## 人工批准已作废\n\nPR head 已从被审版本 \`${reviewedSha.slice(0, 12)}\` 变为 \`${pr.headSha.slice(0, 12)}\`——批准只对被审版本有效，已移除 \`agent-merge\` 标签。请等新一轮评审完成后重新打标签。`)
+        .catch((err) => this.appLog.event('pr_comment_error', { task: task.id, error: String(err) }));
+      this.appLog.event('human_merge_stale', { task: task.id, reviewed_sha: reviewedSha, head_sha: pr.headSha });
+      return;
+    }
+    // Consume the label first: a crash between the CAS and the removal would
+    // otherwise leave a one-shot approval armed for a future, unreviewed head.
+    await this.prLabelQuietly(project.repo, prNumber, 'agent-merge', false);
+    const moved = this.store.tx(() => {
+      const now = this.store.getTaskById(task.id);
+      if (!now || now.status !== 'AWAITING_HUMAN') return false;
+      this.store.setTaskStatus(task.id, 'MERGING', { merge_attempts: 0, approved_sha: pr.headSha, approved_by: 'human' });
+      return true;
+    });
+    if (!moved) return;
+    await this.tracker.commentPr(project.repo, prNumber,
+      `## 人工批准，排队自动合并\n\n合并将钉在 \`${pr.headSha.slice(0, 12)}\`；失败/冲突会走修复回路，需重新批准。`)
+      .catch((err) => this.appLog.event('pr_comment_error', { task: task.id, error: String(err) }));
+    this.appLog.event('human_merge_approved', { task: task.id, head_sha: pr.headSha });
+  }
+
+  /**
+   * One merge-drive step for a MERGING task. Idempotent by construction:
+   * every exit leaves the task in MERGING (retry next tick), a terminal
+   * state, or a dispatched fix run — a crash mid-step loses nothing.
+   */
+  private async driveMerge(task: TaskRow, project: ProjectConfig, prNumber: number | undefined) {
+    const store = this.store;
+    // A manual-review project only disables REVIEW-driven auto-merge: a task
+    // cleared by a human (agent-merge label) still lands.
+    if (project.review_mode !== 'auto' && store.getTaskById(task.id)?.approved_by !== 'human') {
+      this.setTaskStatus(task.id, 'AWAITING_HUMAN');
+      this.appLog.event('merge_mode_manual', { task: task.id });
+      return;
+    }
+    if (!prNumber) {
+      this.setTaskStatus(task.id, 'AWAITING_HUMAN');
+      this.appLog.event('merge_no_pr', { task: task.id });
+      return;
+    }
+    // The cleared sha is recorded on entry to MERGING (review PASS or human
+    // approval). The verdict fallback covers rows written before v8.
+    const approvedSha = store.getTaskById(task.id)?.approved_sha ?? store.latestReviewVerdictSha(task.id);
+    if (!approvedSha) {
+      // MERGING without a cleared sha breaks the invariant — park for a human.
+      this.setTaskStatus(task.id, 'AWAITING_HUMAN');
+      this.appLog.event('merge_no_verdict', { task: task.id });
+      return;
+    }
+    let pr: Awaited<ReturnType<GitHubTracker['getPrDetails']>>;
+    try {
+      pr = await this.tracker.getPrDetails(project.repo, prNumber);
+    } catch (err) {
+      // Tracker flake is not a merge refusal — burn no attempt, retry next tick.
+      this.appLog.event('merge_preflight_error', { task: task.id, error: String(err) });
+      return;
+    }
+    if (pr.state === 'MERGED') { await this.completeMergedTask(task, project); return; }
+    if (pr.state !== 'OPEN') {
+      this.setTaskStatus(task.id, 'BLOCKED');
+      this.appLog.event('task_blocked_pr_closed', { task: task.id });
+      return;
+    }
+    if (pr.headSha !== approvedSha) {
+      // Someone pushed past the reviewed head: the verdict covers the old
+      // sha only. Back to AWAITING_REVIEW — a fresh review (or, if a verdict
+      // already exists for the new head, the human path) decides next.
+      this.setTaskStatus(task.id, 'AWAITING_REVIEW');
+      this.appLog.event('merge_head_moved', { task: task.id, approved_sha: approvedSha, head_sha: pr.headSha });
+      return;
+    }
+    if (pr.mergeable === 'CONFLICTING') {
+      if (await this.spawnMergeFix(task, project, prNumber, approvedSha, `PR conflicts with ${project.base_branch}`)) return;
+      if (store.getTaskById(task.id)?.status !== 'MERGING') return;
+      this.setTaskStatus(task.id, 'AWAITING_HUMAN');
+      await this.tracker.commentPr(project.repo, prNumber,
+        `## 自动合并受阻\n\n分支与 ${project.base_branch} 存在合并冲突且修复预算已耗尽，转人工处理。`)
+        .catch((err) => this.appLog.event('pr_comment_error', { task: task.id, error: String(err) }));
+      return;
+    }
+    try {
+      await this.tracker.markPrReady(project.repo, prNumber);
+      await this.tracker.mergePr(project.repo, prNumber, approvedSha);
+    } catch (err) {
+      // A conflict can appear between the pre-check and the merge call —
+      // that is fixable work, not a retry-budget hit.
+      if (await this.spawnMergeFix(task, project, prNumber, approvedSha, String(err))) return;
+      await this.mergeAttemptFailed(task, project, prNumber, String(err));
+      return;
+    }
+    const state = await this.tracker.getPrState(project.repo, prNumber).catch(() => 'UNKNOWN');
+    if (state === 'MERGED') {
+      // CAS: a concurrent stop/close must not be overridden by completion.
+      const landed = store.tx(() => {
+        if (store.getTaskById(task.id)?.status !== 'MERGING') return false;
+        store.setTaskStatus(task.id, 'COMPLETED');
+        return true;
+      });
+      if (!landed) return;
+      this.appLog.event('task_completed', { task: task.id, repo: task.repo, issue: task.issue_number });
+      await this.notifyTaskCompleted(task);
+      await this.cleanupMerged(project, task);
+      return;
+    }
+    await this.mergeAttemptFailed(task, project, prNumber, 'merge call returned but PR did not reach MERGED');
+  }
+
+  /** A failed merge attempt burns budget; exhaustion parks for a human. */
+  private async mergeAttemptFailed(task: TaskRow, project: ProjectConfig, prNumber: number, why: string) {
+    if (this.store.getTaskById(task.id)?.status !== 'MERGING') return;
+    const attempts = this.store.bumpMergeAttempts(task.id);
+    this.appLog.event('merge_attempt_failed', { task: task.id, attempts, why: why.slice(0, 200) });
+    if (attempts < MAX_MERGE_ATTEMPTS) return;
+    this.setTaskStatus(task.id, 'AWAITING_HUMAN');
+    await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+    await this.tracker.commentPr(project.repo, prNumber,
+      `## 自动合并重试失败\n\n已连续 ${attempts} 次未能合并（最后：${why.slice(0, 200)}），转人工合并。`)
+      .catch((err) => this.appLog.event('pr_comment_error', { task: task.id, error: String(err) }));
+  }
+
+  /** Task-level completion shared by the reconcile path and driveMerge. */
+  private async completeMergedTask(task: TaskRow, project: ProjectConfig) {
+    this.setTaskStatus(task.id, 'COMPLETED');
+    this.appLog.event('task_completed', { task: task.id, repo: task.repo, issue: task.issue_number });
+    await this.notifyTaskCompleted(task);
+    await this.cleanupMerged(project, task);
   }
 
   /** Register newly agent-ready issues; detect approval drift on waiting tasks. */
@@ -230,7 +415,9 @@ export class Engine {
       if (!task.pending_fix) {
         // OPEN PR with nothing to fix: the PR is the product now. Reviews are
         // dispatched separately against the PR head sha.
-        this.setTaskStatus(task.id, 'AWAITING_MERGE', { branch, pr_url: existingPr.url });
+        this.setTaskStatus(task.id,
+          project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN',
+          { branch, pr_url: existingPr.url });
         await this.labelQuietly(project.repo, issue.number, 'add', 'agent-pr');
         this.appLog.event('dispatch_skip', { task: task.id, why: `PR already exists: ${existingPr.url}` });
         return;
@@ -244,10 +431,21 @@ export class Engine {
     const run = this.store.claimRun(task.id);
     this.store.updateRunFields(run.run_id, { branch, pr_url: existingPr?.url ?? null });
     await this.labelQuietly(project.repo, issue.number, 'add', 'agent-running');
+    // A stale agent-blocked (e.g. left by a failed attempt on another
+    // instance) is meaningless once this task is claimed — remove it.
+    await this.labelQuietly(project.repo, issue.number, 'remove', 'agent-blocked');
     await this.tracker.addComment(project.repo, issue.number,
-      `agent-control: 已领取（\`${hostname()}\`）`).catch((err) => {
+      `agent-control: 已领取（\`${hostname()}\`）（run \`${run.run_id}\`）`).catch((err) => {
       this.appLog.event('comment_error', { task: task.id, error: String(err) });
     });
+    // Label claiming is not atomic — a simultaneous foreign instance can pass
+    // the agent-running check and claim too. The first claim comment wins;
+    // losers back out before launching so only one process burns tokens.
+    if (await this.lostClaimRace(project, task, run.run_id)) {
+      this.store.endRun(run.run_id, 'CANCELED', 'lost claim race to another instance');
+      this.appLog.event('claim_race_lost', { run: run.run_id, task: task.id });
+      return;
+    }
     this.appLog.event('run_claimed', { run: run.run_id, task: task.id, attempt: run.attempt });
     this.launch(run.run_id);
   }
@@ -280,7 +478,7 @@ export class Engine {
               }
               this.store.endRun(runId, 'FAILED', `engine crash: ${String(err).slice(0, 500)}`);
               const task = this.store.getTaskById(run.task_id);
-              if (task && task.status === 'REVIEWING') this.setTaskStatus(task.id, 'AWAITING_MERGE');
+              if (task && task.status === 'REVIEWING') this.setTaskStatus(task.id, 'AWAITING_HUMAN');
             } else {
               this.store.endRun(runId, 'FAILED', `engine crash: ${String(err).slice(0, 500)}`);
               const task = this.store.getTaskById(run.task_id);
@@ -337,6 +535,11 @@ export class Engine {
       let worktreePath = run.workspace ?? '';
       let lastFailureEvidence = '';
       let verifiedHead: string | null = null;
+      // A merge-conflict repair is part of landing: its published head goes
+      // straight back to MERGING (no re-review), carrying the original
+      // approval source so a manual-mode human approval is not lost.
+      let mergeRepair = false;
+      let mergeRepairApprovedBy: 'review' | 'human' = 'review';
 
       const ensureCoder = () => {
         if (coderRef.current) return coderRef.current;
@@ -398,9 +601,17 @@ export class Engine {
                 kind: 'pending_fix_consumed', head_sha: pendingFix.head_sha,
                 summary: pendingFix.summary, findings: pendingFix.findings,
               });
-              store.setTaskStatus(task.id, 'RUNNING', { pending_fix: null });
+              // A merge-conflict repair keeps the task in MERGING (landing is
+              // still in progress); review-driven fixes read as RUNNING.
+              mergeRepair = pendingFix.title === '自动合并受阻';
+              mergeRepairApprovedBy = store.getTaskById(task.id)?.approved_by ?? 'review';
+              store.setTaskStatus(task.id, mergeRepair ? 'MERGING' : 'RUNNING', { pending_fix: null });
               task = { ...task, pending_fix: null };
-              prompt = buildFixPrompt(ctx, `Review BLOCK：${pendingFix.summary}\n${pendingFix.findings.join('\n')}`);
+              // Fix runs may need `git merge origin/<base>` — the child's
+              // scrubbed env cannot fetch, so the host refreshes the ref.
+              await this.workspace.fetchBranch(project.local_repo, project.base_branch)
+                .catch((err) => this.appLog.event('fetch_error', { run: runId, error: String(err) }));
+              prompt = buildFixPrompt(ctx, `${pendingFix.title ?? 'Review BLOCK'}：${pendingFix.summary}\n${pendingFix.findings.join('\n')}`);
             }
             const turn = ensureCoder();
             const res = await this.coderTurn(run, log, turn, prompt, 'RUNNING', signal);
@@ -520,9 +731,19 @@ export class Engine {
               }
               store.transition(runId, phase, phase, { kind: 'pr_published', head_sha: verifiedHead, pr_url: pr.url });
               await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-pr');
-              // Coding ends here. Review — if enabled — is a separate run
-              // dispatched against this PR head sha.
-              this.finish(run, task, 'AWAITING_MERGE', `PR published: ${pr.url}`, { pr_url: pr.url });
+              // Coding ends here. A merge-conflict repair lands directly
+              // (Symphony-style: landing owns the repair); otherwise an
+              // auto-review project enters its review wait state and a manual
+              // one parks on the human path.
+              if (mergeRepair) {
+                this.finish(run, task, 'COMPLETED', `merge repair published: ${pr.url}`, {
+                  pr_url: pr.url, merge_attempts: 0, approved_sha: verifiedHead, approved_by: mergeRepairApprovedBy,
+                }, 'MERGING');
+                return;
+              }
+              this.finish(run, task,
+                project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN',
+                `PR published: ${pr.url}`, { pr_url: pr.url });
               return;
             } catch (err) {
               if (err instanceof PublishError && err.reason === 'approval_revoked') {
@@ -551,17 +772,20 @@ export class Engine {
   // ---------------- review runs (kind='review') ----------------
 
   /**
-   * Dispatch a review run per AWAITING_MERGE task — every published PR head
-   * is auto-reviewed. Verdict rows are sha-idempotent: any existing review
-   * row for the current PR head (PASS/BLOCK/HUMAN_REVIEW_REQUIRED/ERROR)
-   * suppresses re-dispatch.
+   * Dispatch a review run per AWAITING_REVIEW task — every published PR head
+   * of an auto-review project is reviewed. Verdict rows are sha-idempotent:
+   * any existing review row for the current PR head (PASS/BLOCK/
+   * HUMAN_REVIEW_REQUIRED/ERROR) suppresses re-dispatch.
    */
   private async dispatchReviews() {
     const max = this.config.server.max_concurrent;
-    for (const task of this.store.listTasks('AWAITING_MERGE')) {
+    for (const task of this.store.listTasks('AWAITING_REVIEW')) {
       if (this.activeCount() >= max) return;
       const project = this.projectFor(task.repo);
       if (!project) continue;
+      // Manual-review projects never enter AWAITING_REVIEW — the PR parks
+      // in AWAITING_HUMAN and a human reviews and merges, no run is spent.
+      if (project.review_mode !== 'auto') continue;
       if (this.store.activeRunForTask(task.id)) continue;
       try {
         const prNum = prNumberFromUrl(task.pr_url)
@@ -570,7 +794,14 @@ export class Engine {
         if (!prNum) continue;
         const pr = await this.tracker.getPrDetails(project.repo, prNum);
         if (pr.state !== 'OPEN') continue;
-        if (pr.labels.includes('agent-reviewing')) continue;
+        if (pr.labels.includes('agent-reviewing')) {
+          // Zombie lock: no active run for this task means the reviewing run
+          // died without clearing its label. Clearing it lets the head be
+          // reviewed again instead of stalling the task forever. (A review
+          // run on another instance would look the same — accepted gap.)
+          await this.setPrLabel(project.repo, prNum, false);
+          this.appLog.event('stale_review_label_cleared', { task: task.id, pr: prNum });
+        }
         if (this.store.hasReviewVerdictForSha(task.id, pr.headSha)) continue;
 
         // Claim + pin fields + task status in one transaction so a crash
@@ -636,7 +867,7 @@ export class Engine {
       if (gate !== 'ok') { this.finishReview(run, task, gate, 'approval gate failed before review'); return; }
       if (currentHead !== reviewedSha) {
         // Head moved since dispatch: abandon this round without a verdict.
-        // Task stays AWAITING_MERGE so the next tick re-dispatches on the
+        // Task stays AWAITING_HUMAN so the next tick re-dispatches on the
         // new sha; the run itself is dead.
         this.finishReview(run, task, 'CANCELED', `PR head moved ${reviewedSha} -> ${currentHead}; abandoning round`, this.cancelTaskPhase(runId));
         return;
@@ -673,7 +904,7 @@ export class Engine {
           // Cannot build a review site: infrastructure failure, not a code
           // verdict. ERROR counts as a verdict for this sha (no re-dispatch).
           this.writeReviewVerdict(runId, reviewedSha, 'ERROR');
-          this.finishReview(run, task, 'AWAITING_MERGE', `review site unavailable: ${String(err).slice(0, 300)}`);
+          this.finishReview(run, task, 'AWAITING_HUMAN', `review site unavailable: ${String(err).slice(0, 300)}`);
           await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
           void this.notifyReviewInfra(task, run, '自动评审现场搭建失败，转人工评审');
           return;
@@ -694,12 +925,12 @@ export class Engine {
         if (aborted()) { this.finishReview(run, task, 'CANCELED', 'cancelled during diff', this.cancelTaskPhase(runId)); return; }
         if (err instanceof DiffTooLargeError) {
           this.writeReviewVerdict(runId, reviewedSha, 'HUMAN_REVIEW_REQUIRED');
-          this.finishReview(run, task, 'AWAITING_MERGE', 'review diff too large; human review required');
+          this.finishReview(run, task, 'AWAITING_HUMAN', 'review diff too large; human review required');
           await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
           return;
         }
         this.writeReviewVerdict(runId, reviewedSha, 'ERROR');
-        this.finishReview(run, task, 'AWAITING_MERGE', `review diff unavailable: ${String(err).slice(0, 300)}`);
+        this.finishReview(run, task, 'AWAITING_HUMAN', `review diff unavailable: ${String(err).slice(0, 300)}`);
         await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
         return;
       }
@@ -724,7 +955,7 @@ export class Engine {
       const siteDirty = await this.workspace.isDirty(sitePath).catch(() => true);
       if (headAfter !== reviewedSha || siteDirty) {
         this.writeReviewVerdict(runId, reviewedSha, 'ERROR');
-        this.finishReview(run, task, 'AWAITING_MERGE', headAfter !== reviewedSha
+        this.finishReview(run, task, 'AWAITING_HUMAN', headAfter !== reviewedSha
           ? 'review site HEAD moved during review; refusing verdict'
           : 'review site modified during review; refusing verdict');
         await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
@@ -735,7 +966,7 @@ export class Engine {
         this.writeReviewVerdict(runId, reviewedSha, 'ERROR',
           reviewError instanceof ReviewInfraError ? reviewError.logPath : undefined);
         store.transition(runId, 'REVIEWING', 'REVIEWING', { kind: 'review_completed', head_sha: reviewedSha, verdict: 'ERROR', error: String(reviewError) });
-        this.finishReview(run, task, 'AWAITING_MERGE', `review infra: ${String(reviewError).slice(0, 400)}`);
+        this.finishReview(run, task, 'AWAITING_HUMAN', `review infra: ${String(reviewError).slice(0, 400)}`);
         await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
         void this.notifyReviewInfra(task, run, '自动评审不可用，转人工评审');
         return;
@@ -756,14 +987,22 @@ export class Engine {
               .catch((err) => this.appLog.event('pr_comment_error', { run: runId, error: String(err) }));
           }
           await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
-          this.finishReview(run, task, 'AWAITING_MERGE', `review PASS but high risk: ${riskReasons.join('; ')}`);
+          this.finishReview(run, task, 'AWAITING_HUMAN', `review PASS but high risk: ${riskReasons.join('; ')}`);
           return;
         }
         if (prNum && this.config.approvals.auto_merge.enabled) {
-          await this.autoMergeReview(run, task, project, prNum, reviewedSha);
+          // A cancel that landed while the reviewer worked wins over the
+          // merge handoff — never push a cancelled task into MERGING.
+          if (aborted() || store.getRun(runId)?.cancel_requested === 1) {
+            this.finishReview(run, task, 'CANCELED', 'cancelled at merge handoff', this.cancelTaskPhase(runId));
+            return;
+          }
+          // The review run's job is the verdict; landing is the host-side
+          // MERGING sweep's job — retried and crash-resumable there.
+          this.finishReview(run, task, 'COMPLETED', 'review PASS; auto-merge queued', 'MERGING', { merge_attempts: 0, approved_sha: reviewedSha, approved_by: 'review' });
           return;
         }
-        this.finishReview(run, task, 'AWAITING_MERGE', 'review PASS');
+        this.finishReview(run, task, 'AWAITING_HUMAN', 'review PASS');
         return;
       }
 
@@ -773,7 +1012,7 @@ export class Engine {
           await this.tracker.commentPr(project.repo, prNum, this.riskComment(result, ['reviewer requires human judgement']))
             .catch((err) => this.appLog.event('pr_comment_error', { run: runId, error: String(err) }));
         }
-        this.finishReview(run, task, 'AWAITING_MERGE', `review requires human: ${result.summary}`);
+        this.finishReview(run, task, 'AWAITING_HUMAN', `review requires human: ${result.summary}`);
         return;
       }
 
@@ -820,17 +1059,17 @@ export class Engine {
 
   /**
    * Terminal write for review runs. Unlike finish() it never overrides a
-   * task status already moved past REVIEWING (e.g. mergeReconcile COMPLETED
+   * task status already moved past REVIEWING (e.g. reconcileMergeStates COMPLETED
    * while the verdict was being written).
    */
-  private finishReview(run: RunRow, task: TaskRow, finalPhase: Phase, reason?: string, taskPhase: Phase = finalPhase) {
+  private finishReview(run: RunRow, task: TaskRow, finalPhase: Phase, reason?: string, taskPhase: Phase = finalPhase, taskFields?: { merge_attempts?: number; approved_sha?: string; approved_by?: 'review' | 'human' }) {
     if (!TERMINAL_FOR_TASK.includes(finalPhase)) throw new Error(`finishReview() requires terminal phase, got ${finalPhase}`);
     try {
       this.store.tx(() => {
         this.store.endRun(run.run_id, finalPhase, reason);
         const current = this.store.getTaskById(task.id);
         if (current && current.status === 'REVIEWING') {
-          this.store.setTaskStatus(task.id, taskPhase);
+          this.store.setTaskStatus(task.id, taskPhase, taskFields);
         }
       });
       if (ATTENTION_PHASES.includes(finalPhase)) void this.notifyTaskAttention(task, finalPhase, reason);
@@ -844,36 +1083,58 @@ export class Engine {
     }
   }
 
-  /** Review-run auto-merge: ready + squash pinned to the reviewed sha. */
-  private async autoMergeReview(run: RunRow, task: TaskRow, project: ProjectConfig, prNumber: number, headSha: string) {
+  /**
+   * Land-style recovery for a MERGING task: GitHub refusing the merge
+   * because the branch conflicts with base is fixable work — hand it to a
+   * cold-start code run via pending_fix (shares the review-BLOCK fix
+   * budget). The fix pushes a new head, which is a fresh sha and therefore
+   * gets a fresh review before any merge. Non-conflict refusals stay on
+   * the retry/human path.
+   */
+  private async spawnMergeFix(task: TaskRow, project: ProjectConfig, prNumber: number, headSha: string, mergeError: string): Promise<boolean> {
+    const store = this.store;
+    let mergeable: string = 'UNKNOWN';
     try {
-      const actual = await this.tracker.getPrHeadSha(project.repo, prNumber);
-      if (actual !== headSha) {
-        this.finishReview(run, task, 'CANCELED', `PR head moved before merge; re-dispatch on new sha`, this.cancelTaskPhase(run.run_id));
-        return;
-      }
-      await this.tracker.markPrReady(project.repo, prNumber);
-      await this.tracker.mergePr(project.repo, prNumber, headSha);
-      const state = await this.tracker.getPrState(project.repo, prNumber);
-      if (state !== 'MERGED') {
-        this.finishReview(run, task, 'AWAITING_MERGE', 'auto-merge did not confirm MERGED; waiting for a human');
-        return;
-      }
-      this.store.transition(run.run_id, 'REVIEWING', 'REVIEWING', { kind: 'auto_merged', head_sha: headSha });
-      this.finishReview(run, task, 'COMPLETED', 'auto-merged low-risk PR');
-      await this.notifyTaskCompleted(task);
-      await this.cleanupMerged(project, task);
+      mergeable = (await this.tracker.getPrDetails(project.repo, prNumber)).mergeable;
     } catch (err) {
-      this.finishReview(run, task, 'AWAITING_MERGE', `auto-merge failed: ${String(err).slice(0, 300)}`);
+      this.appLog.event('mergeable_check_error', { task: task.id, error: String(err) });
     }
+    if (mergeable !== 'CONFLICTING') return false;
+    if (store.getTaskById(task.id)!.fix_rounds >= this.config.server.retry_limit) {
+      await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+      return false;
+    }
+    const baseRef = `origin/${project.base_branch}`;
+    const payload: PendingFix = {
+      head_sha: headSha,
+      title: '自动合并受阻',
+      summary: `auto-merge failed: PR conflicts with ${project.base_branch}`,
+      findings: [
+        `GitHub 拒绝合并（${mergeError.slice(0, 200)}）：分支与 ${project.base_branch} 存在合并冲突。`,
+        `执行 git merge ${baseRef}（base 引用已由宿主刷新，无需联网），逐个解决冲突文件，跑通项目 checks，正常收尾提交即可——宿主会自动推送同一 PR 分支并重新走一轮评审。`,
+      ],
+    };
+    const spawned = store.tx(() => {
+      const now = store.getTaskById(task.id);
+      if (!now || now.status !== 'MERGING') return false;
+      store.bumpFixRounds(task.id);
+      store.setTaskStatus(task.id, 'DISCOVERED', { pending_fix: JSON.stringify(payload) });
+      return true;
+    });
+    if (!spawned) return false;
+    await this.tracker.commentPr(project.repo, prNumber,
+      `## 自动合并受阻\n\n分支与 ${project.base_branch} 存在合并冲突，已派生修复任务：解冲突后将推送新 head 并自动重新评审。`)
+      .catch((err) => this.appLog.event('pr_comment_error', { task: task.id, error: String(err) }));
+    this.appLog.event('merge_fix_spawned', { task: task.id, head_sha: headSha });
+    return true;
   }
 
   /**
    * User-requested cancel ends the task; a bare signal abort (shutdown) just
-   * parks it back at AWAITING_MERGE so the review can re-dispatch later.
+   * parks it back at AWAITING_REVIEW so the review can re-dispatch later.
    */
   private cancelTaskPhase(runId: string): Phase {
-    return this.store.getRun(runId)?.cancel_requested === 1 ? 'CANCELED' : 'AWAITING_MERGE';
+    return this.store.getRun(runId)?.cancel_requested === 1 ? 'CANCELED' : 'AWAITING_REVIEW';
   }
 
   /** Verdict row shared by all review exit paths that reach a conclusion. */
@@ -972,12 +1233,19 @@ export class Engine {
   }
 
   private testEvidenceFor(task: TaskRow, headSha: string): string {
-    const latest = this.store.checkEvidenceForSha(task.id, headSha);
+    const render = (rows: ReturnType<Store['checkEvidenceForSha']>) =>
+      rows
+        .map((c) => `命令: ${c.command}\n结果: ${c.verdict} (exit ${c.exit_code ?? 'n/a'})\n日志: ${c.artifact_path ?? '-'}\n日志尾部:\n${this.checkLogTail(c.artifact_path)}`)
+        .join('\n\n');
     const prefix = `提交 SHA: ${headSha}\n`;
-    if (latest.length === 0) return `${prefix}(no checks recorded)`;
-    return prefix + latest
-      .map((c) => `命令: ${c.command}\n结果: ${c.verdict} (exit ${c.exit_code ?? 'n/a'})\n日志: ${c.artifact_path ?? '-'}\n日志尾部:\n${this.checkLogTail(c.artifact_path)}`)
-      .join('\n\n');
+    const scoped = this.store.checkEvidenceForSha(task.id, headSha);
+    if (scoped.length > 0) return prefix + render(scoped);
+    // Legacy rows predate head_sha binding: the evidence is still real
+    // (usually produced by the run that authored this very head), but the
+    // reviewer must be told it is not sha-scoped rather than given nothing.
+    const fallback = this.store.latestCheckEvidence(task.id);
+    if (fallback.length === 0) return `${prefix}(no checks recorded)`;
+    return `${prefix}注意：以下检查证据来自更早的 run，未绑定此 SHA（历史数据无 head_sha 列）。通常它验证的正是本次被审提交，但请以 <diff> 自行核对，证据可信度按弱一等对待。\n` + render(fallback);
   }
 
   /**
@@ -1055,11 +1323,14 @@ export class Engine {
     const cfg = this.config.approvals.auto_merge;
     const reasons: string[] = [];
     if (reviewerRisk === 'high') reasons.push('reviewer marked risk=high');
-    const files = new Set<string>();
+    const files = new Map<string, 'new' | 'deleted' | 'modified'>();
     let changedLines = 0;
+    let current: string | null = null;
     for (const line of diff.split('\n')) {
       const header = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
-      if (header) { files.add(header[2]!); continue; }
+      if (header) { current = header[2]!; if (!files.has(current)) files.set(current, 'modified'); continue; }
+      if (current && line.startsWith('new file mode')) files.set(current, 'new');
+      else if (current && line.startsWith('deleted file mode')) files.set(current, 'deleted');
       if ((line.startsWith('+') && !line.startsWith('+++')) || (line.startsWith('-') && !line.startsWith('---'))) {
         changedLines++;
       }
@@ -1070,11 +1341,13 @@ export class Engine {
     const dependency = /(^|\/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|requirements\.txt|poetry\.lock|Pipfile\.lock|Cargo\.lock|go\.sum|composer\.lock)$/i;
     const build = /(^|\/)(Dockerfile|docker-compose\.ya?ml|Makefile)$|(^|\/)(migrations?|schema)\//i;
     const tests = /(^|\/)(tests?|__tests__|spec)\/|\.(test|spec)\.[cm]?[jt]sx?$/i;
-    for (const file of files) {
+    for (const [file, status] of files) {
       if (sensitive.test(file)) reasons.push(`sensitive path: ${file}`);
       else if (dependency.test(file)) reasons.push(`dependency change: ${file}`);
       else if (build.test(file)) reasons.push(`build or migration change: ${file}`);
-      else if (tests.test(file)) reasons.push(`test change: ${file}`);
+      // Weakened coverage is the risk — deleting or editing existing tests —
+      // not a newly added test file accompanying the change it covers.
+      else if (tests.test(file) && status !== 'new') reasons.push(`test change (${status}): ${file}`);
     }
     return reasons;
   }
@@ -1094,12 +1367,12 @@ export class Engine {
     ].join('\n');
   }
 
-  private finish(run: RunRow, task: TaskRow, finalPhase: Phase, reason?: string, taskFields?: { pr_url?: string }) {
+  private finish(run: RunRow, task: TaskRow, finalPhase: Phase, reason?: string, taskFields?: { pr_url?: string; merge_attempts?: number; approved_sha?: string; approved_by?: 'review' | 'human' }, taskPhase: Phase = finalPhase) {
     if (!TERMINAL_FOR_TASK.includes(finalPhase)) throw new Error(`finish() requires terminal phase, got ${finalPhase}`);
     try {
       this.store.tx(() => {
         this.store.endRun(run.run_id, finalPhase, reason);
-        this.store.setTaskStatus(task.id, finalPhase, { pr_url: taskFields?.pr_url });
+        this.store.setTaskStatus(task.id, taskPhase, taskFields);
       });
       if (ATTENTION_PHASES.includes(finalPhase)) void this.notifyTaskAttention(task, finalPhase, reason);
       if (finalPhase === 'BLOCKED' || finalPhase === 'BLOCKED_APPROVAL_CHANGED') {
@@ -1233,6 +1506,34 @@ export class Engine {
     return this.config.projects.find((p) => p.repo === repo);
   }
 
+  /**
+   * Post-claim arbitration for the documented non-atomic label race: after
+   * posting our own claim comment, wait a settle window then re-read issue
+   * comments. Among recent "已领取" comments the earliest (createdAt, body)
+   * wins. A rival is any claim comment whose hostname is not ours — our own
+   * earlier attempts' comments are ghosts, not rivals. Unknown same-hostname
+   * siblings cannot be told apart from ghosts and are an accepted gap.
+   * Losing leaves `agent-running` in place: it belongs to the winner.
+   */
+  private async lostClaimRace(project: ProjectConfig, task: TaskRow, runId: string): Promise<boolean> {
+    await sleep(this.deps.claimArbitrationMs ?? 4000);
+    const comments = await this.tracker.listIssueComments(project.repo, task.issue_number).catch((err) => {
+      this.appLog.event('claim_arbiter_error', { task: task.id, error: String(err) });
+      return null;
+    });
+    if (comments === null) return false; // arbiter is best-effort; never stall dispatch on API failure
+    const cutoff = Date.now() - 10 * 60_000;
+    const claims = comments.filter(
+      (c) => c.body.startsWith('agent-control: 已领取') && Date.parse(c.createdAt) >= cutoff,
+    );
+    const key = (c: { body: string; createdAt: string }) => `${c.createdAt}${c.body}`;
+    const rivals = claims.filter((c) => !c.body.includes(runId) && !c.body.includes(hostname()));
+    if (rivals.length === 0) return false;
+    const mine = claims.filter((c) => c.body.includes(runId)).map(key).sort()[0];
+    const earliestRival = rivals.map(key).sort()[0]!;
+    return mine === undefined || earliestRival < mine;
+  }
+
   private async labelQuietly(repo: string, issue: number, op: 'add' | 'remove', label: string) {
     try {
       if (op === 'add') await this.tracker.addLabel(repo, issue, label);
@@ -1240,6 +1541,18 @@ export class Engine {
     } catch (err) {
       this.appLog.event('label_error', { repo, issue, op, label, error: String(err) });
       this.recordError('label_error', err);
+    }
+  }
+
+  /** Best-effort PR label write — never throws into the sweep. */
+  private async prLabelQuietly(repo: string, prNumber: number, label: string, add: boolean) {
+    try {
+      if (add) await this.tracker.addPrLabel(repo, prNumber, label);
+      else await this.tracker.removePrLabel(repo, prNumber, label);
+    } catch (err) {
+      this.appLog.event('label_error', {
+        repo, pr: prNumber, op: add ? 'add' : 'remove', label, error: String(err),
+      });
     }
   }
 

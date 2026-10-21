@@ -99,7 +99,7 @@ test('pid alive but identity mismatch (reuse) → treated as dead, resumed', asy
   } finally { env.done(); }
 });
 
-test('crash after PR create with review PASS → AWAITING_MERGE, no second PR', async () => {
+test('crash after PR create with review PASS → AWAITING_REVIEW, no second PR', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(1, { title: 't', body: 'b', labels: ['agent-ready'], state: 'OPEN', url: 'u' });
@@ -112,13 +112,13 @@ test('crash after PR create with review PASS → AWAITING_MERGE, no second PR', 
       isPidAlive: () => false,
     });
     assert.deepEqual(report.finalized, [run.run_id]);
-    assert.equal(env.store.getRun(run.run_id)!.phase, 'AWAITING_MERGE');
-    assert.equal(env.store.getTaskById(task.id)!.status, 'AWAITING_MERGE');
+    assert.equal(env.store.getRun(run.run_id)!.phase, 'AWAITING_REVIEW');
+    assert.equal(env.store.getTaskById(task.id)!.status, 'AWAITING_REVIEW');
     assert.equal(env.store.getTaskById(task.id)!.pr_url, 'https://x/pull/9');
   } finally { env.done(); }
 });
 
-test('crash after PR create → AWAITING_MERGE; review dispatches separately', async () => {
+test('crash after PR create → AWAITING_REVIEW; review dispatches separately', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(1, { title: 't', body: 'b', labels: ['agent-ready'], state: 'OPEN', url: 'u' });
@@ -130,8 +130,8 @@ test('crash after PR create → AWAITING_MERGE; review dispatches separately', a
       isPidAlive: () => false,
     });
     assert.deepEqual(report.finalized, [run.run_id]);
-    assert.equal(env.store.getRun(run.run_id)!.phase, 'AWAITING_MERGE');
-    assert.equal(env.store.getTaskById(task.id)!.status, 'AWAITING_MERGE');
+    assert.equal(env.store.getRun(run.run_id)!.phase, 'AWAITING_REVIEW');
+    assert.equal(env.store.getTaskById(task.id)!.status, 'AWAITING_REVIEW');
   } finally { env.done(); }
 });
 

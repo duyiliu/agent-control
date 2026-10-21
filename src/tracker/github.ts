@@ -126,9 +126,10 @@ export class GitHubTracker {
     labels: string[];
     isDraft: boolean;
     url: string;
+    mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   }> {
-    const r = await this.ghJson<{ state: string; headRefOid: string; labels: { name: string }[]; isDraft: boolean; url: string }>([
-      'pr', 'view', String(prNumber), '-R', repo, '--json', 'state,headRefOid,labels,isDraft,url',
+    const r = await this.ghJson<{ state: string; headRefOid: string; labels: { name: string }[]; isDraft: boolean; url: string; mergeable: string }>([
+      'pr', 'view', String(prNumber), '-R', repo, '--json', 'state,headRefOid,labels,isDraft,url,mergeable',
     ]);
     return {
       state: r.state === 'MERGED' ? 'MERGED' : r.state === 'CLOSED' ? 'CLOSED' : 'OPEN',
@@ -136,6 +137,7 @@ export class GitHubTracker {
       labels: (r.labels ?? []).map((l) => l.name),
       isDraft: r.isDraft,
       url: r.url,
+      mergeable: r.mergeable === 'CONFLICTING' ? 'CONFLICTING' : r.mergeable === 'MERGEABLE' ? 'MERGEABLE' : 'UNKNOWN',
     };
   }
 
@@ -197,6 +199,14 @@ export class GitHubTracker {
   /** Post a comment on an issue (used to surface attention states on GitHub). */
   async addComment(repo: string, issueNumber: number, body: string): Promise<void> {
     await this.gh(['issue', 'comment', String(issueNumber), '-R', repo, '--body', body]);
+  }
+
+  /** Issue comments for post-claim race arbitration. */
+  async listIssueComments(repo: string, issueNumber: number): Promise<{ body: string; createdAt: string }[]> {
+    return this.ghJson<{ body: string; createdAt: string }[]>([
+      'issue', 'view', String(issueNumber), '-R', repo,
+      '--json', 'comments', '--jq', '[.comments[] | {body, createdAt}]',
+    ]);
   }
 
   async ensureLabels(repo: string, labels: string[]): Promise<{ ok: boolean; missing: string[] }> {

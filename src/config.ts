@@ -47,7 +47,9 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
   const o = asObj(v, name);
   const checksRaw = o['checks'] ?? [];
   if (!Array.isArray(checksRaw)) fail(`${name}.checks must be an array`);
-  if (o['review'] !== undefined) fail(`${name}.review was removed — every published PR head is auto-reviewed`);
+  if (o['review'] !== undefined) fail(`${name}.review was removed — use review_mode: auto | manual`);
+  const mode = o['review_mode'] ?? 'auto';
+  if (mode !== 'auto' && mode !== 'manual') fail(`${name}.review_mode: expected auto or manual`);
   return {
     repo: asStr(o['repo'], `${name}.repo`),
     local_repo: resolve(asStr(o['local_repo'], `${name}.local_repo`)),
@@ -55,6 +57,7 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
     ready_label: asStr(o['ready_label'] ?? 'agent-ready', `${name}.ready_label`),
     branch_prefix: asStr(o['branch_prefix'] ?? 'agent/issue-', `${name}.branch_prefix`),
     checks: checksRaw.map((c, i) => parseCheck(c, `${name}.checks[${i}]`)),
+    review_mode: mode,
   };
 }
 
@@ -105,6 +108,17 @@ export function loadConfig(path: string): AppConfig {
 
   const approvals = asObj(root['approvals'] ?? {}, 'approvals');
   const autoMerge = asObj(approvals['auto_merge'] ?? {}, 'approvals.auto_merge');
+  // These three were parsed but never enforced — approval is always the ready
+  // label + issue hash, and merging is governed by review_mode + auto_merge.
+  if (approvals['require_design_approval'] !== undefined) {
+    fail('approvals.require_design_approval was removed — approval is always enforced by the ready label and the issue hash');
+  }
+  if (approvals['require_manual_merge'] !== undefined) {
+    fail('approvals.require_manual_merge was removed — use projects[].review_mode (auto|manual) and approvals.auto_merge');
+  }
+  if (approvals['allow_auto_deploy'] !== undefined) {
+    fail('approvals.allow_auto_deploy was removed — agent-control never deploys');
+  }
 
   return {
     server: {
@@ -133,9 +147,6 @@ export function loadConfig(path: string): AppConfig {
       env_deny: envDeny as string[],
     },
     approvals: {
-      require_design_approval: asBool(approvals['require_design_approval'] ?? true, 'approvals.require_design_approval'),
-      require_manual_merge: asBool(approvals['require_manual_merge'] ?? true, 'approvals.require_manual_merge'),
-      allow_auto_deploy: asBool(approvals['allow_auto_deploy'] ?? false, 'approvals.allow_auto_deploy'),
       auto_merge: {
         enabled: asBool(autoMerge['enabled'] ?? false, 'approvals.auto_merge.enabled'),
         max_files: asNum(autoMerge['max_files'] ?? 10, 'approvals.auto_merge.max_files', 1),

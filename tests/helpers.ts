@@ -36,6 +36,7 @@ export function makeConfig(dir: string, overrides?: Partial<AppConfig>): AppConf
         ready_label: 'agent-ready',
         branch_prefix: 'agent/issue-',
         checks: [{ argv: [process.execPath, '-e', 'process.exit(0)'] }],
+        review_mode: 'auto',
       },
     ],
     agent: {
@@ -44,9 +45,6 @@ export function makeConfig(dir: string, overrides?: Partial<AppConfig>): AppConf
       env_deny: [],
     },
     approvals: {
-      require_design_approval: true,
-      require_manual_merge: true,
-      allow_auto_deploy: false,
       auto_merge: { enabled: false, max_files: 10, max_lines: 400 },
     },
     ...overrides,
@@ -78,10 +76,14 @@ export interface FakeTracker {
   labelsAdded: [number, string][];
   labelsRemoved: [number, string][];
   comments: [number, string][];
+  issueComments: Map<number, { body: string; createdAt: string }[]>;
   prComments: [number, string][];
   merged: number[];
   prCreated: number;
   headSha: string;
+  mergeable: Map<number, 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN'>;
+  mergeErrors: Map<number, Error>;
+  prLabels: Map<number, string[]>;
 }
 
 export function makeFakeTracker(): FakeTracker & {
@@ -100,6 +102,7 @@ export function makeFakeTracker(): FakeTracker & {
   closePr: (repo: string, n: number) => Promise<void>;
   createDraftPr: (repo: string, o: any) => Promise<any>;
   addComment: (repo: string, n: number, body: string) => Promise<void>;
+  listIssueComments: (repo: string, n: number) => Promise<{ body: string; createdAt: string }[]>;
 } {
   const t: FakeTracker = {
     issues: new Map(),
@@ -108,10 +111,14 @@ export function makeFakeTracker(): FakeTracker & {
     labelsAdded: [],
     labelsRemoved: [],
     comments: [],
+    issueComments: new Map(),
     prComments: [],
     merged: [],
     prCreated: 0,
     headSha: 'head-sha',
+    mergeable: new Map(),
+    mergeErrors: new Map(),
+    prLabels: new Map(),
   };
   return Object.assign(t, {
     async listReadyIssues(_repo: string, label: string) {
@@ -148,18 +155,25 @@ export function makeFakeTracker(): FakeTracker & {
       return {
         state: (t.prStates.get(n) ?? pr?.state ?? 'OPEN') as 'OPEN' | 'CLOSED' | 'MERGED',
         headSha: t.headSha,
-        labels: [] as string[],
+        labels: t.prLabels.get(n) ?? [],
         isDraft: pr?.isDraft ?? true,
         url: pr?.url ?? `https://github.com/x/y/pull/${n}`,
+        mergeable: t.mergeable.get(n) ?? 'MERGEABLE',
       };
     },
     async markPrReady(_repo: string, _n: number) {},
     async mergePr(_repo: string, n: number, _sha: string) {
+      const err = t.mergeErrors.get(n);
+      if (err) throw err;
       t.merged.push(n);
       t.prStates.set(n, 'MERGED');
     },
-    async addPrLabel(_repo: string, _n: number, _l: string) {},
-    async removePrLabel(_repo: string, _n: number, _l: string) {},
+    async addPrLabel(_repo: string, n: number, l: string) {
+      t.prLabels.set(n, [...(t.prLabels.get(n) ?? []), l]);
+    },
+    async removePrLabel(_repo: string, n: number, l: string) {
+      t.prLabels.set(n, (t.prLabels.get(n) ?? []).filter((x) => x !== l));
+    },
     async commentPr(_repo: string, n: number, body: string) {
       t.prComments.push([n, body]);
     },
@@ -174,6 +188,12 @@ export function makeFakeTracker(): FakeTracker & {
     },
     async addComment(_repo: string, n: number, body: string) {
       t.comments.push([n, body]);
+      const list = t.issueComments.get(n) ?? [];
+      list.push({ body, createdAt: new Date().toISOString() });
+      t.issueComments.set(n, list);
+    },
+    async listIssueComments(_repo: string, n: number) {
+      return t.issueComments.get(n) ?? [];
     },
   });
 }

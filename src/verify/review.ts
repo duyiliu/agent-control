@@ -42,6 +42,7 @@ export async function runReview(
     logPath,
   });
 
+  let strictReminder = false;
   for (let attempt = 0; attempt < 2; attempt++) {
     const id = randomUUID();
     const logPath = join(deps.artifactsDir, `review-agent-${id}.jsonl`);
@@ -54,7 +55,7 @@ export async function runReview(
     }
     const proc = await runner({
       workdir: ctx.worktreePath,
-      prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence, deps.headSha),
+      prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence, deps.headSha, strictReminder),
       timeoutMs: deps.timeoutMs,
       logPath,
       lastMessagePath,
@@ -86,6 +87,7 @@ export async function runReview(
         return { result: parsed.result, logPath: parsed.protocolBroken ? lastMessagePath : logPath };
       } catch (err) {
         failure = `invalid review output: ${String(err)}`;
+        strictReminder = true;
       }
     }
     if (attempt === 1) throw new ReviewInfraError(failure, logPath);
@@ -102,11 +104,27 @@ function parseReviewResult(text: string): { result: ReviewResult; protocolBroken
   } catch (err) {
     if (!(err instanceof SyntaxError)) throw err;
   }
-  // Not JSON as a whole: a narrating reviewer sometimes emits a balanced
-  // {...} amid prose. The protocol is broken, so no verdict inside is
-  // trustworthy — even a well-formed one ("example only: PASS") — and a
-  // human must look instead.
-  if (hasBalancedObject(stripped)) {
+  // Not JSON as a whole: a narrating reviewer wrapped its verdict in prose.
+  // Exactly one balanced object that passes full shape validation is almost
+  // certainly the real verdict — recover it and keep the narration as the
+  // artifact of record (protocolBroken) so the shortcut is auditable. Zero
+  // or multiple objects, or a malformed one, is genuinely ambiguous ("is
+  // this the verdict or an example?") and must stay on the human path.
+  const objects = balancedObjects(stripped);
+  if (objects.length === 1) {
+    try {
+      const checked = checkReviewShape(JSON.parse(objects[0]!));
+      if (checked) {
+        // A protocol-breaking model does not get auto-merge rights: force
+        // risk=high so a recovered PASS still lands on the human path, while
+        // recovered BLOCK findings keep feeding the fix loop.
+        checked.risk = 'high';
+        checked.summary = `[protocol-recovered] ${checked.summary}`;
+        return { result: checked, protocolBroken: true };
+      }
+    } catch { /* fall through to the ambiguous-output verdict */ }
+  }
+  if (objects.length > 0) {
     return {
       result: {
         verdict: 'HUMAN_REVIEW_REQUIRED',
@@ -138,9 +156,11 @@ function checkReviewShape(value: unknown): ReviewResult | null {
   };
 }
 
-/** True when the text contains at least one balanced `{...}` block. */
-function hasBalancedObject(text: string): boolean {
+/** Extract top-level balanced `{...}` blocks (string-aware). */
+function balancedObjects(text: string): string[] {
+  const out: string[] = [];
   let depth = 0;
+  let start = -1;
   let inStr = false;
   let esc = false;
   for (let i = 0; i < text.length; i++) {
@@ -152,11 +172,11 @@ function hasBalancedObject(text: string): boolean {
       continue;
     }
     if (ch === '"') { inStr = true; continue; }
-    if (ch === '{') depth++;
+    if (ch === '{') { if (depth === 0) start = i; depth++; }
     else if (ch === '}' && depth > 0) {
       depth--;
-      if (depth === 0) return true;
+      if (depth === 0) out.push(text.slice(start, i + 1));
     }
   }
-  return false;
+  return out;
 }

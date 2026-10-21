@@ -9,14 +9,14 @@ test('migrations are idempotent and schema_version recorded', () => {
     s1.close();
     const s2 = makeStore(dir); // reopen same db
     const v = s2.db.prepare('SELECT MAX(version) v FROM schema_version').get() as { v: number };
-    assert.equal(v.v, 4);
+    assert.equal(v.v, 8);
     // v4 columns exist with sane defaults
     const runCols = s2.db.prepare("PRAGMA table_info(runs)").all() as { name: string }[];
     assert.ok(runCols.some((c) => c.name === 'kind') && runCols.some((c) => c.name === 'head_sha'));
     const checkCols = s2.db.prepare("PRAGMA table_info(check_results)").all() as { name: string }[];
     assert.ok(checkCols.some((c) => c.name === 'head_sha'));
     const taskCols = s2.db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[];
-    assert.ok(taskCols.some((c) => c.name === 'pending_fix'));
+    assert.ok(taskCols.some((c) => c.name === 'pending_fix') && taskCols.some((c) => c.name === 'merge_attempts') && taskCols.some((c) => c.name === 'approved_sha'));
     s2.close();
   } finally {
     cleanup(dir);

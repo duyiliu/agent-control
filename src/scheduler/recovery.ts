@@ -33,7 +33,7 @@ const MAX_RESUMES = 2;
  *   (never spawn a duplicate, never kill by PID alone)
  * - child gone -> resume idempotently from the saved phase
  * - PUBLISHING_PR -> check GitHub first: existing PR means the side effect
- *   already happened -> AWAITING_MERGE; otherwise re-run the idempotent publish.
+ *   already happened -> AWAITING_HUMAN; otherwise re-run the idempotent publish.
  */
 export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
   const { store, appLog } = deps;
@@ -109,10 +109,12 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
           const labelled = !!issue && issue.state === 'OPEN' && issue.labels.includes(project.ready_label);
           const hashOk = !!issue && (!task.approved_hash || approvalHash(issue) === task.approved_hash);
           if (labelled && hashOk) {
-            // Publish already happened. Reviews are separate runs now — the
-            // PR goes to AWAITING_MERGE and dispatchReviews picks it up.
-            store.endRun(run.run_id, 'AWAITING_MERGE', 'recovered: PR already exists');
-            store.setTaskStatus(task.id, 'AWAITING_MERGE', { pr_url: existing.url, branch });
+            // Publish already happened. Reviews are separate runs now — an
+            // auto-review project lands in AWAITING_REVIEW for dispatch; a
+            // manual-review project parks straight on the human merge path.
+            const afterPublish: Phase = project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN';
+            store.endRun(run.run_id, afterPublish, 'recovered: PR already exists');
+            store.setTaskStatus(task.id, afterPublish, { pr_url: existing.url, branch });
           } else {
             try { await deps.tracker.closePr(project.repo, existing.number); } catch { /* best effort */ }
             const phase: Phase = labelled ? 'BLOCKED_APPROVAL_CHANGED' : 'CANCELED';
