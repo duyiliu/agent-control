@@ -1,0 +1,15 @@
+# Normalize everything to LF in the working tree so Windows and Linux
+# checkouts produce byte-identical text (tests compare script/expect output).
+* text=auto eol=lf
+
+# Windows batch/cmd scripts are still interpreted line-by-line; keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binaries must never be normalized.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.db binary

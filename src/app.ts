@@ -182,6 +182,13 @@ export async function startService(app: App): Promise<void> {
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  // Windows never delivers SIGTERM (no CTRL_SHUTDOWN mapping), so a scheduled
+  // task stop kills the process outright. SIGBREAK is the only graceful entry
+  // point there; without it the lock self-heals only after its heartbeat
+  // expires (see InstanceLock.holderState).
+  if (process.platform === 'win32') {
+    process.on('SIGBREAK', () => void shutdown('SIGBREAK'));
+  }
 }
 
 // ---------------- doctor ----------------
@@ -190,8 +197,11 @@ export interface DoctorItem { name: string; status: 'PASS' | 'FAIL' | 'UNVERIFIE
 
 export async function runDoctor(config: AppConfig | null, configError?: string): Promise<DoctorItem[]> {
   const items: DoctorItem[] = [];
-  const nodeMajor = Number(process.versions.node.split('.')[0]);
-  items.push(nodeMajor >= 22
+  // node:sqlite shipped without a build flag only from 22.13; 22.5-22.12
+  // would fail at import, so the minor matters as much as the major.
+  const [nodeMajor = 0, nodeMinor = 0] = process.versions.node.split('.').map(Number);
+  const nodeOk = nodeMajor > 22 || (nodeMajor === 22 && nodeMinor >= 13);
+  items.push(nodeOk
     ? { name: 'node', status: 'PASS', detail: `v${process.versions.node}` }
     : { name: 'node', status: 'FAIL', detail: `v${process.versions.node} — need >=22.13 (node:sqlite)` });
 

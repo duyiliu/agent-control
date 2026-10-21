@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync, type WriteStream } from 'node:fs';
+import { accessSync, constants, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, type WriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 
@@ -127,9 +127,9 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
       } catch {
         /* already dead */
       }
-      // Windows: child.kill only terminates the direct process. Kill the
-      // whole tree so grandchildren spawned by the agent cannot linger.
-      if (process.platform === 'win32' && child.pid != null) taskkillTree(child.pid);
+      // child.kill only terminates the direct process. Kill the whole tree so
+      // grandchildren spawned by the agent cannot linger.
+      if (child.pid != null) killTree(child.pid, sig);
       // Escalate if still alive after grace period.
       killTimer = setTimeout(() => {
         try {
@@ -137,7 +137,7 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
         } catch {
           /* noop */
         }
-        if (process.platform === 'win32' && child.pid != null) taskkillTree(child.pid);
+        if (child.pid != null) killTree(child.pid, 'SIGKILL');
       }, 5000);
     };
 
@@ -237,10 +237,43 @@ export function scrubEnvForAgent(
   return out;
 }
 
-/** Kill a Windows process tree (best effort, fire and forget). */
-export function killTree(pid: number) {
+/**
+ * Descendant PIDs, deepest first, so a tree kill removes leaves before the
+ * process that would reparent them. Linux-only (/proc); other POSIX
+ * platforms get an empty list and fall back to the leader alone.
+ */
+function descendants(pid: number): number[] {
+  const order: number[] = [];
+  const seen = new Set<number>([pid]);
+  const walk = (cur: number) => {
+    const taskDir = `/proc/${cur}/task`;
+    let tids: string[];
+    try { tids = readdirSync(taskDir); } catch { return; }
+    for (const tid of tids) {
+      let raw: string;
+      try { raw = readFileSync(`${taskDir}/${tid}/children`, 'utf8'); } catch { continue; }
+      for (const part of raw.trim().split(/\s+/)) {
+        const n = Number(part);
+        if (!Number.isFinite(n) || n <= 0 || seen.has(n)) continue;
+        seen.add(n);
+        walk(n);
+        order.push(n);
+      }
+    }
+  };
+  walk(pid);
+  return order;
+}
+
+/** Kill a process tree (best effort, fire and forget). */
+export function killTree(pid: number, sig: NodeJS.Signals = 'SIGKILL') {
   if (process.platform === 'win32') { taskkillTree(pid); return; }
-  try { process.kill(pid, 'SIGKILL'); } catch { /* already dead */ }
+  // A direct kill leaves grandchildren behind; they keep the worktree busy
+  // and later scans see them as orphaned agent processes.
+  for (const child of descendants(pid)) {
+    try { process.kill(child, sig); } catch { /* already dead */ }
+  }
+  try { process.kill(pid, sig); } catch { /* already dead */ }
 }
 
 function taskkillTree(pid: number) {
@@ -296,7 +329,7 @@ export async function findProcessesReferencing(needle: string): Promise<number[]
         '-NonInteractive',
         '-Command',
         // Exclude $PID: the scanner's own command line contains the needle.
-        `(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*${esc}*' }).ProcessId -join ','`,
+        `(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains('${esc}') }).ProcessId -join ','`,
       ],
       timeoutMs: 20_000,
     });
@@ -311,7 +344,10 @@ export async function findProcessesReferencing(needle: string): Promise<number[]
     if (!out) return [];
     return out.split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
   }
-  const res = await runProc({ argv: ['pgrep', '-f', needle], timeoutMs: 10_000 });
+  // pgrep -f takes an ERE; escape so a path metacharacter cannot widen the
+  // match ('.' in particular would match unrelated processes).
+  const ere = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const res = await runProc({ argv: ['pgrep', '-f', ere], timeoutMs: 10_000 });
   if (res.exitCode == null || res.exitCode > 1) return null;
   return res.stdoutTail
     .split('\n')
@@ -356,7 +392,12 @@ export function which(command: string, envPath = process.env.PATH ?? ''): string
     if (!dir) continue;
     for (const ext of exts) {
       const p = join(dir, command + (isWin && !command.toUpperCase().endsWith(ext) ? ext : ''));
-      if (existsSync(p)) return p;
+      if (!existsSync(p)) continue;
+      // POSIX: a non-executable file with the right name would fail at spawn.
+      if (!isWin) {
+        try { accessSync(p, constants.X_OK); } catch { continue; }
+      }
+      return p;
     }
   }
   return null;
@@ -386,6 +427,9 @@ export async function processStartedAt(pid: number): Promise<number | null> {
   }
   const res = await runProc({
     argv: ['ps', '-o', 'lstart=', '-p', String(pid)],
+    // ps renders the date through LC_TIME; a localized month name makes
+    // Date.parse fail, which would leave a dead holder's lock unstealable.
+    env: { ...process.env, LC_ALL: 'C' },
     timeoutMs: 10_000,
   });
   if (res.exitCode !== 0) return null;
