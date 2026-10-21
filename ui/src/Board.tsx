@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Clock, GitPullRequest, Search } from 'lucide-react';
 import type { TaskSummary } from './api';
-import { fmtDur, GROUPS, groupOf, isActivePhase, phaseLabel, phaseTextClass, type GroupKey } from './groups';
+import { fmtDur, fmtTime, GROUPS, groupOf, isActivePhase, phaseLabel, phaseTextClass, type GroupKey } from './groups';
 import StatusIcon from './StatusIcon';
 
 const EMPTY_HINT: Partial<Record<GroupKey, string>> = {
@@ -256,10 +256,20 @@ function TaskCard(props: {
           {phaseLabel(phase)}
         </span>
         <span className="flex shrink-0 items-center gap-3">
-          {active && (
+          {active ? (
             <span className="flex items-center gap-1 whitespace-nowrap tabular-nums text-ok">
               <Clock className="size-3" />
               {fmtDur(active.started_at)}
+            </span>
+          ) : (
+            // How long the task has sat without a state change — the fastest
+            // way to spot something that quietly stalled.
+            <span
+              className="flex items-center gap-1 whitespace-nowrap tabular-nums text-fg-dim"
+              title={`最后处理：${fmtTime(task.updated_at)}`}
+            >
+              <Clock className="size-3" />
+              {fmtDur(task.updated_at)}前
             </span>
           )}
           {task.pr_url && (
