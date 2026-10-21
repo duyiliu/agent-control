@@ -8,6 +8,7 @@ import { RUN_ACTIVE_PHASES } from './types.js';
 export interface OpsTracker {
   getIssue(repo: string, issueNumber: number): Promise<IssueData | null>;
   removeLabel(repo: string, issueNumber: number, label: string): Promise<void>;
+  addPrLabel(repo: string, prNumber: number, label: string): Promise<void>;
 }
 
 const RETRYABLE: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'RECOVERY_REQUIRED', 'CANCELED', 'FAILED'];
@@ -24,6 +25,18 @@ export function stopTask(store: Store, task: TaskRow): string {
     store.setTaskStatus(task.id, 'CANCELED');
     return `任务 ${task.repo}#${task.issue_number} 已取消`;
   }
+  // MERGING has no run — stopping opts the task out of the auto-merge
+  // sweep and parks it on the human merge path.
+  if (task.status === 'MERGING') {
+    store.setTaskStatus(task.id, 'AWAITING_HUMAN');
+    return `任务 ${task.repo}#${task.issue_number} 已退出自动合并，等待人工处理`;
+  }
+  // AWAITING_REVIEW has no run either — stopping opts out of the automatic
+  // review and hands the PR to a human as-is.
+  if (task.status === 'AWAITING_REVIEW') {
+    store.setTaskStatus(task.id, 'AWAITING_HUMAN');
+    return `任务 ${task.repo}#${task.issue_number} 已退出自动评审，等待人工处理`;
+  }
   // DISCOVERED + pending_fix is a queued fix run — stoppable, and the fix
   // intent dies with the cancellation.
   if (task.status === 'DISCOVERED' && task.pending_fix) {
@@ -31,6 +44,23 @@ export function stopTask(store: Store, task: TaskRow): string {
     return `任务 ${task.repo}#${task.issue_number} 已取消（含待执行修复）`;
   }
   return `任务 ${task.repo}#${task.issue_number} 没有活动的运行（状态=${task.status}）`;
+}
+
+/**
+ * Panel action: approve merging the PR under human review. The approval is
+ * the `agent-merge` label — the same signal a human would add by hand — so
+ * the merge sweep keeps its sha check, one-shot consumption and retry loop.
+ */
+export async function approveMergeTask(store: Store, tracker: OpsTracker, task: TaskRow): Promise<string> {
+  const current = store.getTaskById(task.id);
+  if (!current) throw new OpsError('任务不存在');
+  if (current.status !== 'AWAITING_HUMAN') {
+    throw new OpsError(`只有待人工处理（AWAITING_HUMAN）的任务可以批准合并，当前状态 ${current.status}`);
+  }
+  const prNum = current.pr_url?.match(/\/pull\/(\d+)/)?.[1];
+  if (!prNum) throw new OpsError('任务没有关联 PR，无法批准合并');
+  await tracker.addPrLabel(current.repo, Number(prNum), 'agent-merge');
+  return `已提交批准：PR #${prNum} 标记为 agent-merge；调度器将在下个 tick 校验被审 sha 后自动合并`;
 }
 
 export async function retryTask(
@@ -49,7 +79,7 @@ export async function retryTask(
 
   const previous = store.runsForTask(task.id);
   for (const run of previous) {
-    if (run.phase === 'AWAITING_MERGE' || run.phase === 'COMPLETED') continue;
+    if (run.phase === 'AWAITING_REVIEW' || run.phase === 'AWAITING_HUMAN' || run.phase === 'COMPLETED') continue;
     const risk = await runProcessRisk(run, processDeps);
     if (risk) throw new OpsError(`无法重试：${risk}`);
   }

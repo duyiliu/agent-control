@@ -7,7 +7,9 @@ export type Phase =
   | 'REVIEWING'
   | 'FIXING'
   | 'PUBLISHING_PR'
-  | 'AWAITING_MERGE'
+  | 'AWAITING_REVIEW'
+  | 'AWAITING_HUMAN'
+  | 'MERGING'
   | 'COMPLETED'
   | 'BLOCKED'
   | 'BLOCKED_APPROVAL_CHANGED'
@@ -110,7 +112,7 @@ export const fetchTail = (runId: string, offset: number | null, file: string | n
   return get<TailChunk>(`/api/runs/${encodeURIComponent(runId)}/tail?${params}`);
 };
 
-export async function postAction(id: number, action: 'stop' | 'retry'): Promise<string> {
+export async function postAction(id: number, action: 'stop' | 'retry' | 'approve-merge'): Promise<string> {
   const r = await fetch(`/api/tasks/${id}/${action}`, { method: 'POST' });
   const d = (await r.json().catch(() => ({}))) as { message?: string; error?: string };
   if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);

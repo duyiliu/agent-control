@@ -37,7 +37,7 @@ export default function StatusIcon(props: { phase: Phase; size?: number; classNa
         <path d="M5.3 8.2l1.9 1.9 3.5-4" fill="none" stroke="var(--color-canvas)" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round" />
       </>
     );
-  } else if (phase === 'AWAITING_MERGE') {
+  } else if (phase === 'AWAITING_REVIEW' || phase === 'AWAITING_HUMAN' || phase === 'MERGING') {
     glyph = (
       <>
         <circle cx="8" cy="8" r="5.6" fill={color} opacity={0.18} />

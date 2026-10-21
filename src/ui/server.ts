@@ -4,7 +4,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppLog } from '../telemetry/logging.js';
-import { OpsError, retryTask, stopTask } from '../ops.js';
+import { approveMergeTask, OpsError, retryTask, stopTask } from '../ops.js';
 import {
   artifactPayload,
   healthPayload,
@@ -184,14 +184,16 @@ async function handle(deps: UiDeps, req: IncomingMessage, res: ServerResponse): 
     return;
   }
 
-  const action = /^\/api\/tasks\/(\d+)\/(stop|retry)$/.exec(path);
+  const action = /^\/api\/tasks\/(\d+)\/(stop|retry|approve-merge)$/.exec(path);
   if (action && method === 'POST') {
     const task = deps.store.getTaskById(Number(action[1]));
     if (!task) { json(res, 404, { error: 'no such task' }); return; }
     try {
       const message = action[2] === 'stop'
         ? stopTask(deps.store, task)
-        : await retryTask(deps.store, deps.config, deps.tracker, task);
+        : action[2] === 'retry'
+          ? await retryTask(deps.store, deps.config, deps.tracker, task)
+          : await approveMergeTask(deps.store, deps.tracker, task);
       json(res, 200, { message });
     } catch (err) {
       const status = err instanceof OpsError ? 400 : 500;

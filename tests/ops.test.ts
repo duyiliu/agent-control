@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { retryTask, OpsError } from '../src/ops.js';
+import { approveMergeTask, retryTask, OpsError } from '../src/ops.js';
 import { makeConfig, makeStore, makeFakeTracker, tmpDir, teardown } from './helpers.js';
 
 function setup() {
@@ -14,6 +14,28 @@ function setup() {
   store.endRun(run.run_id, 'RECOVERY_REQUIRED', 'child may live'); store.setTaskStatus(task.id, 'RECOVERY_REQUIRED');
   return { dir, store, config, tracker, task: store.getTaskById(task.id)! };
 }
+
+test('approve-merge: only AWAITING_HUMAN tasks can be approved', async () => {
+  const env = setup();
+  try {
+    await assert.rejects(approveMergeTask(env.store, env.tracker, env.task), OpsError);
+    assert.deepEqual([...(env.tracker.prLabels.get(1) ?? [])], []);
+  } finally { teardown(env.dir, [env.store]); }
+});
+
+test('approve-merge: adds the agent-merge label to the task PR', async () => {
+  const dir = tmpDir('ac-approve-');
+  const store = makeStore(dir);
+  const tracker = makeFakeTracker();
+  try {
+    const { task } = store.upsertDiscovered({ repo: 'me/sandbox', issue_number: 9, issue_title: 't', issue_url: 'u' });
+    store.setTaskStatus(task.id, 'AWAITING_HUMAN', { pr_url: 'https://x/pull/42' });
+    const msg = await approveMergeTask(store, tracker, store.getTaskById(task.id)!);
+    assert.match(msg, /agent-merge/);
+    assert.deepEqual(tracker.prLabels.get(42), ['agent-merge']);
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN'); // the sweep owns the transition
+  } finally { teardown(dir, [store]); }
+});
 
 test('retry: refuses a live child without changing approval or labels', async () => {
   const env = setup();

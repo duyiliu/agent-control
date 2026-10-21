@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { ChevronLeft, ExternalLink, FileText, RotateCw, Square } from 'lucide-react';
+import { Check, ChevronLeft, ExternalLink, FileText, RotateCw, Square } from 'lucide-react';
 import {
   fetchArtifact,
   fetchTask,
@@ -52,11 +52,13 @@ export default function DetailDrawer(props: {
     return () => window.removeEventListener('keydown', h);
   }, [artifact, onClose]);
 
-  const act = async (action: 'stop' | 'retry') => {
+  const act = async (action: 'stop' | 'retry' | 'approve-merge') => {
     const verb =
       action === 'stop'
         ? '停止这个任务？调度器会在一个轮询周期内中止当前运行。'
-        : '重试这个任务？当前 issue 内容将成为新的已批准内容。';
+        : action === 'retry'
+          ? '重试这个任务？当前 issue 内容将成为新的已批准内容。'
+          : '批准合并？调度器会校验 PR head 仍是被审版本，然后钉 sha 自动合并。';
     if (!confirm(verb)) return;
     try {
       onToast({ msg: await postAction(taskId, action) });
@@ -120,6 +122,15 @@ export default function DetailDrawer(props: {
           </div>
           {t && (
             <div className="flex shrink-0 items-center gap-2 pt-0.5">
+              {t.status === 'AWAITING_HUMAN' && t.pr_url && (
+                <button
+                  onClick={() => act('approve-merge')}
+                  className="flex items-center gap-1.5 rounded-md border border-ok/30 px-2.5 py-1.5 text-[11px] font-medium text-ok hover:bg-ok/10"
+                >
+                  <Check className="size-3" />
+                  批准合并
+                </button>
+              )}
               {showStop && (
                 <button
                   onClick={() => act('stop')}

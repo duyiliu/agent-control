@@ -7,8 +7,9 @@ import StatusIcon from './StatusIcon';
 const EMPTY_HINT: Partial<Record<GroupKey, string>> = {
   queued: '给 issue 打上 agent-ready 标签即可入队',
   active: '暂无运行中的任务',
-  reviewing: '暂无机器审查中的 PR',
-  awaiting: '暂无需要人工合并的 PR',
+  reviewing: '暂无等待或正在审查的 PR',
+  merging: '暂无自动合并中的 PR',
+  human: '暂无需要人工处理（评审判断 / 合并）的 PR',
 };
 
 const FILTER_KEY = 'ac-repo-filter';
@@ -69,7 +70,8 @@ export default function Board(props: {
 
   const byGroup = new Map<GroupKey, TaskSummary[]>();
   for (const g of GROUPS) byGroup.set(g.key, []);
-  const phaseOf = (t: TaskSummary) => t.active_run?.phase ?? t.status;
+  // MERGING owns the card even while a repair run works: landing is in progress.
+  const phaseOf = (t: TaskSummary) => (t.status === 'MERGING' ? 'MERGING' : (t.active_run?.phase ?? t.status));
   for (const t of visible) byGroup.get(groupOf(phaseOf(t)))!.push(t);
   for (const list of byGroup.values()) {
     list.sort((a, b) => b.updated_at.localeCompare(a.updated_at));

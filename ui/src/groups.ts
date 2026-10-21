@@ -1,16 +1,19 @@
 import type { Phase } from './api';
 
-export type GroupKey = 'queued' | 'active' | 'reviewing' | 'awaiting' | 'done' | 'blocked';
+export type GroupKey = 'queued' | 'active' | 'reviewing' | 'merging' | 'human' | 'done' | 'blocked';
 
 const ACTIVE: Phase[] = ['CLAIMED', 'PREPARING', 'RUNNING', 'VERIFYING', 'FIXING', 'PUBLISHING_PR'];
 /** PR exists and is being reviewed: the run is alive, but coding is done. */
 const REVIEW_PHASES: Phase[] = ['REVIEWING'];
+/** PR published and waiting for (or in the middle of) its review run. */
+const REVIEW_WAIT_PHASES: Phase[] = ['AWAITING_REVIEW'];
 const BLOCKED: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED'];
 
 export function groupOf(status: Phase): GroupKey {
   if (ACTIVE.includes(status)) return 'active';
-  if (REVIEW_PHASES.includes(status)) return 'reviewing';
-  if (status === 'AWAITING_MERGE') return 'awaiting';
+  if (REVIEW_PHASES.includes(status) || REVIEW_WAIT_PHASES.includes(status)) return 'reviewing';
+  if (status === 'MERGING') return 'merging';
+  if (status === 'AWAITING_HUMAN') return 'human';
   if (status === 'COMPLETED' || status === 'CANCELED') return 'done';
   if (BLOCKED.includes(status)) return 'blocked';
   return 'queued';
@@ -20,9 +23,10 @@ export const GROUPS: { key: GroupKey; label: string; dot: string }[] = [
   { key: 'queued', label: '排队中', dot: 'bg-fg-dim' },
   { key: 'active', label: '进行中', dot: 'bg-ok' },
   { key: 'reviewing', label: '审查中', dot: 'bg-info' },
-  { key: 'awaiting', label: '待人工合并', dot: 'bg-warn' },
+  { key: 'merging', label: '合并中', dot: 'bg-ok' },
+  { key: 'human', label: '待人工处理', dot: 'bg-warn' },
   { key: 'done', label: '已完成', dot: 'bg-fg-dim' },
-  { key: 'blocked', label: '需要处理', dot: 'bg-danger' },
+  { key: 'blocked', label: '异常需介入', dot: 'bg-danger' },
 ];
 
 type Tone = 'emerald' | 'sky' | 'zinc' | 'rose' | 'amber';
@@ -36,7 +40,9 @@ const PHASE_TONE: Record<Phase, Tone> = {
   FIXING: 'emerald',
   REVIEWING: 'emerald',
   PUBLISHING_PR: 'emerald',
-  AWAITING_MERGE: 'sky',
+  AWAITING_REVIEW: 'sky',
+  AWAITING_HUMAN: 'sky',
+  MERGING: 'emerald',
   COMPLETED: 'zinc',
   BLOCKED: 'rose',
   BLOCKED_APPROVAL_CHANGED: 'rose',
@@ -71,7 +77,9 @@ const PHASE_LABEL: Record<Phase, string> = {
   REVIEWING: '审查中',
   FIXING: '修复中',
   PUBLISHING_PR: '创建 PR',
-  AWAITING_MERGE: '待合并',
+  AWAITING_REVIEW: '待审查',
+  AWAITING_HUMAN: '待人工处理',
+  MERGING: '合并中',
   COMPLETED: '已完成',
   BLOCKED: '已阻塞',
   BLOCKED_APPROVAL_CHANGED: '批准已变更',
