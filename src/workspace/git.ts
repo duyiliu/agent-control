@@ -121,9 +121,13 @@ export class GitWorkspace {
     await this.git(args, worktreePath, 180_000);
   }
 
-  /** Fetch a branch so a remote head sha resolves locally. */
+  /**
+   * Fetch a branch so a remote head sha resolves locally. The explicit
+   * destination refspec materializes refs/remotes/origin/<branch> even on
+   * clones whose configured fetch refspec only covers the default branch.
+   */
   async fetchBranch(repoDir: string, branch: string): Promise<void> {
-    await this.git(['fetch', 'origin', branch], repoDir, 120_000);
+    await this.git(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], repoDir, 120_000);
   }
 
   /** Hard-reset a worktree to a ref (fix runs sync to the remote PR head). */
