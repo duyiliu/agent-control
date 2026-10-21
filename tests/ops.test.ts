@@ -93,3 +93,23 @@ test('retry: dead child and clean orphan scan can requeue', async () => {
     assert.equal(env.store.getTaskById(env.task.id)!.status, 'DISCOVERED');
   } finally { teardown(env.dir, [env.store]); }
 });
+
+test('retry: drops review verdicts so an unchanged PR head is judged again', async () => {
+  const env = setup();
+  try {
+    const run = env.store.claimRun(env.task.id, { kind: 'review', headSha: 'sha-a' });
+    env.store.endRun(run.run_id, 'BLOCKED', 'block');
+    env.store.addCheck({
+      run_id: run.run_id, kind: 'review', command: 'agent (review)',
+      exit_code: null, verdict: 'BLOCK', head_sha: 'sha-a',
+    });
+    assert.equal(env.store.hasReviewVerdictForSha(env.task.id, 'sha-a'), true);
+
+    await retryTask(env.store, env.config, env.tracker, env.task, { isPidAlive: () => false, findProcs: async () => [] });
+
+    // Without this the task would requeue into AWAITING_REVIEW and the sha
+    // idempotency would skip the unchanged head forever.
+    assert.equal(env.store.hasReviewVerdictForSha(env.task.id, 'sha-a'), false);
+    assert.equal(env.store.getTaskById(env.task.id)!.status, 'DISCOVERED');
+  } finally { teardown(env.dir, [env.store]); }
+});

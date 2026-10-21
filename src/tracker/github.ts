@@ -14,6 +14,19 @@ export class TrackerError extends Error {
 const TRANSIENT = /429|rate limit|timed? ?out|timeout|ECONN|ENET|EAI_AGAIN|temporarily|connection (reset|refused)|502|503|504/i;
 const MAX_TRIES = 4;
 
+/** One entry of `gh pr list --state open`, for PR-first discovery. */
+export interface OpenPr {
+  number: number;
+  title: string;
+  url: string;
+  isDraft: boolean;
+  headRefName: string;
+  baseRefName: string;
+  createdAt: string;
+  labels: string[];
+  isCrossRepository: boolean;
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -72,6 +85,37 @@ export class GitHubTracker {
     })).filter((r) => !r.labels.includes('agent-running'));
   }
 
+  /**
+   * Open PRs for the PR-first discovery path. Drafts and cross-repo (fork)
+   * PRs are returned rather than filtered here so the caller owns the rules;
+   * `isCrossRepository` matters because a fork head cannot be fetched from
+   * the local repo's remote.
+   */
+  async listOpenPrs(repo: string): Promise<OpenPr[]> {
+    const rows = await this.ghJson<
+      {
+        number: number; title: string; url: string; isDraft: boolean;
+        headRefName: string; baseRefName: string; createdAt: string;
+        labels: { name: string }[]; isCrossRepository: boolean;
+      }[]
+    >([
+      'pr', 'list', '-R', repo, '--state', 'open',
+      '--json', 'number,title,url,isDraft,headRefName,baseRefName,createdAt,labels,isCrossRepository',
+      '--limit', '100',
+    ]);
+    return rows.map((r) => ({
+      number: r.number,
+      title: r.title,
+      url: r.url,
+      isDraft: r.isDraft,
+      headRefName: r.headRefName,
+      baseRefName: r.baseRefName,
+      createdAt: r.createdAt,
+      labels: (r.labels ?? []).map((l) => l.name),
+      isCrossRepository: r.isCrossRepository,
+    }));
+  }
+
   async getIssue(repo: string, issueNumber: number): Promise<IssueData | null> {
     const res = await this.gh([
       'issue', 'view', String(issueNumber), '-R', repo,
@@ -126,10 +170,11 @@ export class GitHubTracker {
     labels: string[];
     isDraft: boolean;
     url: string;
+    body: string;
     mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   }> {
-    const r = await this.ghJson<{ state: string; headRefOid: string; labels: { name: string }[]; isDraft: boolean; url: string; mergeable: string }>([
-      'pr', 'view', String(prNumber), '-R', repo, '--json', 'state,headRefOid,labels,isDraft,url,mergeable',
+    const r = await this.ghJson<{ state: string; headRefOid: string; labels: { name: string }[]; isDraft: boolean; url: string; body: string; mergeable: string }>([
+      'pr', 'view', String(prNumber), '-R', repo, '--json', 'state,headRefOid,labels,isDraft,url,body,mergeable',
     ]);
     return {
       state: r.state === 'MERGED' ? 'MERGED' : r.state === 'CLOSED' ? 'CLOSED' : 'OPEN',
@@ -137,6 +182,7 @@ export class GitHubTracker {
       labels: (r.labels ?? []).map((l) => l.name),
       isDraft: r.isDraft,
       url: r.url,
+      body: r.body ?? '',
       mergeable: r.mergeable === 'CONFLICTING' ? 'CONFLICTING' : r.mergeable === 'MERGEABLE' ? 'MERGEABLE' : 'UNKNOWN',
     };
   }

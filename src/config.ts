@@ -50,6 +50,8 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
   if (o['review'] !== undefined) fail(`${name}.review was removed — use review_mode: auto | manual`);
   const mode = o['review_mode'] ?? 'auto';
   if (mode !== 'auto' && mode !== 'manual') fail(`${name}.review_mode: expected auto or manual`);
+  const prReview = o['pr_review'] ?? 'auto';
+  if (prReview !== 'auto' && prReview !== 'manual') fail(`${name}.pr_review: expected auto or manual`);
   return {
     repo: asStr(o['repo'], `${name}.repo`),
     local_repo: resolve(asStr(o['local_repo'], `${name}.local_repo`)),
@@ -58,6 +60,7 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
     branch_prefix: asStr(o['branch_prefix'] ?? 'agent/issue-', `${name}.branch_prefix`),
     checks: checksRaw.map((c, i) => parseCheck(c, `${name}.checks[${i}]`)),
     review_mode: mode,
+    pr_review: prReview,
   };
 }
 

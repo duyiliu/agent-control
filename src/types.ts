@@ -59,6 +59,10 @@ export interface ProjectConfig {
    *  'manual': no review run — the PR parks in AWAITING_HUMAN (Human Review)
    *  for a human to review and merge. */
   review_mode: 'auto' | 'manual';
+  /** 'auto': PRs opened in this repo are reviewed without an issue backing
+   *  them (the PR is the whole input). 'manual': only PRs a human summons
+   *  with the agent-review label are reviewed. */
+  pr_review: 'auto' | 'manual';
 }
 
 export interface AppConfig {
@@ -126,6 +130,9 @@ export interface PrInfo {
   isDraft: boolean;
 }
 
+/** What a task was discovered from. See TaskRow.issue_number. */
+export type TaskSource = 'issue' | 'pr';
+
 /** Run kind: 'code' drives the coding state machine; 'review' is a
  *  separately-dispatched verdict on one PR head sha. */
 export type RunKind = 'code' | 'review';
@@ -142,9 +149,15 @@ export interface PendingFix {
 export interface TaskRow {
   id: number;
   repo: string;
+  /** GitHub numbers issues and PRs from one sequence, so a PR-only task
+   *  stores its PR number here; `source` says which one it is. */
   issue_number: number;
   issue_title: string;
   issue_url: string;
+  /** 'issue': the task drives a coding run and owns its published PR.
+   *  'pr': an external PR reviewed in place — never coded against, never
+   *  auto-merged. */
+  source: TaskSource;
   approved_hash: string | null;
   status: Phase;
   branch: string | null;

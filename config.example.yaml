@@ -19,6 +19,7 @@ projects:
     ready_label: agent-ready
     branch_prefix: agent/issue-
     review_mode: auto                # auto（默认）：每个 PR head 自动派独立评审 run；manual：不派评审，PR 停在 AWAITING_HUMAN 等人审人合
+    pr_review: auto                  # auto（默认）：没有 issue 的 PR 也自动评审；manual：只评审打了 agent-review 标签的 PR
     checks:
       - argv: [node, --test]
         timeout_seconds: 300

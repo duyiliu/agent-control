@@ -296,7 +296,7 @@ run 的相位迁移写入 `run_events`；测试与评审证据写入 `check_resu
 npm test              # node:test 全套（含真实 git worktree 用例）
 npm run typecheck     # tsc --noEmit
 npm run ui:typecheck  # 前端类型检查
-npm run build         # → dist/
+npm run build         # → dist/ + ui/dist（ui/dist 不入库，发版必须重建）
 ```
 
 ## 相关文档

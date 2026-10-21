@@ -10,7 +10,7 @@ import type {
 } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -206,6 +206,17 @@ export class Store {
           .run(8, now());
       });
     }
+    if (current < 9) {
+      // v9: a task can be discovered from a bare PR. GitHub shares one
+      // number sequence between issues and PRs, so the unique key still
+      // holds; `source` is what tells the two apart.
+      this.tx(() => {
+        this.db.exec("ALTER TABLE tasks ADD COLUMN source TEXT NOT NULL DEFAULT 'issue'");
+        this.db
+          .prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)')
+          .run(9, now());
+      });
+    }
   }
 
   private txDepth = 0;
@@ -264,11 +275,53 @@ export class Store {
     });
   }
 
+  /**
+   * Register a PR that has no issue behind it. The task starts directly in
+   * AWAITING_REVIEW: DISCOVERED means "needs coding", and a bare PR must
+   * never reach tryDispatch (no ready label, nothing to code against).
+   * An existing task for the same number wins untouched — that is either
+   * an issue task or a PR already being reviewed.
+   */
+  upsertPrTask(input: {
+    repo: string;
+    number: number;
+    title: string;
+    url: string;
+    branch: string;
+  }): { task: TaskRow; created: boolean } {
+    return this.tx(() => {
+      const existing = this.getTask(input.repo, input.number);
+      if (existing) return { task: existing, created: false };
+      const t = now();
+      this.db
+        .prepare(
+          `INSERT INTO tasks (repo, issue_number, issue_title, issue_url, source, status, branch, pr_url, updated_at, created_at)
+           VALUES (?, ?, ?, ?, 'pr', 'AWAITING_REVIEW', ?, ?, ?, ?)`,
+        )
+        .run(input.repo, input.number, input.title, input.url, input.branch, input.url, t, t);
+      return { task: this.getTask(input.repo, input.number)!, created: true };
+    });
+  }
+
   getTask(repo: string, issueNumber: number): TaskRow | null {
     const row = this.db
       .prepare('SELECT * FROM tasks WHERE repo = ? AND issue_number = ?')
       .get(repo, issueNumber) as TaskRow | undefined;
     return row ?? null;
+  }
+
+  /**
+   * Drop every recorded review verdict for a task, so its current head can be
+   * judged again. Has no effect on code runs or their check evidence — only
+   * the `kind='review'` rows a re-review is meant to replace.
+   */
+  deleteReviewVerdicts(taskId: number) {
+    this.db
+      .prepare(
+        `DELETE FROM check_results
+         WHERE kind = 'review' AND run_id IN (SELECT run_id FROM runs WHERE task_id = ?)`,
+      )
+      .run(taskId);
   }
 
   getTaskById(id: number): TaskRow | null {

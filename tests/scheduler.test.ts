@@ -126,6 +126,31 @@ async function tickAndDrain(engine: Engine) {
 
 const ISSUE = { title: 'Fix parser', body: 'Fix the parsing bug.\n\nAC: test passes', labels: ['agent-ready'], state: 'OPEN', url: 'https://x/1' };
 
+test('stranded AWAITING_REVIEW parks for a human instead of showing forever', async () => {
+  const env = setup();
+  try {
+    const { store, engine } = makeEngine(env);
+    const { task } = store.upsertDiscovered({ repo: 'me/sandbox', issue_number: 50, issue_title: 't', issue_url: 'u' });
+    store.setTaskStatus(task.id, 'AWAITING_REVIEW', {
+      branch: 'agent/issue-50',
+      pr_url: 'https://github.com/me/sandbox/pull/50',
+    });
+    const run = store.claimRun(task.id, { kind: 'review', headSha: 'head-sha' });
+    store.endRun(run.run_id, 'BLOCKED', 'block');
+    store.addCheck({
+      run_id: run.run_id, kind: 'review', command: 'agent (review)',
+      exit_code: null, verdict: 'BLOCK', head_sha: 'head-sha',
+    });
+
+    await tickAndDrain(engine);
+
+    const after = store.getTaskById(task.id)!;
+    assert.equal(after.status, 'BLOCKED');
+    assert.ok(env.tracker.labelsAdded.some(([n, l]) => n === 50 && l === 'agent-blocked'));
+    assert.equal(store.runsForTask(task.id).filter((r) => r.kind === 'review').length, 1);
+  } finally { env.done(); }
+});
+
 test('AC1: happy path produces exactly one draft PR and awaits merge', async () => {
   const env = setup();
   try {

@@ -9,6 +9,7 @@ export interface OpsTracker {
   getIssue(repo: string, issueNumber: number): Promise<IssueData | null>;
   removeLabel(repo: string, issueNumber: number, label: string): Promise<void>;
   addPrLabel(repo: string, prNumber: number, label: string): Promise<void>;
+  removePrLabel(repo: string, prNumber: number, label: string): Promise<void>;
 }
 
 const RETRYABLE: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'RECOVERY_REQUIRED', 'CANCELED', 'FAILED'];
@@ -34,6 +35,13 @@ export function stopTask(store: Store, task: TaskRow): string {
   // AWAITING_REVIEW has no run either — stopping opts out of the automatic
   // review and hands the PR to a human as-is.
   if (task.status === 'AWAITING_REVIEW') {
+    // A bare PR has no human merge path in the host: AWAITING_HUMAN would be
+    // pulled straight back into the review queue by the unreviewed-head
+    // self-heal check, so opting out must be terminal here. Retry re-queues it.
+    if (task.source === 'pr') {
+      store.setTaskStatus(task.id, 'CANCELED');
+      return `PR #${task.issue_number} 已停止自动评审；重新评审请使用重试`;
+    }
     store.setTaskStatus(task.id, 'AWAITING_HUMAN');
     return `任务 ${task.repo}#${task.issue_number} 已退出自动评审，等待人工处理`;
   }
@@ -57,6 +65,11 @@ export async function approveMergeTask(store: Store, tracker: OpsTracker, task: 
   if (current.status !== 'AWAITING_HUMAN') {
     throw new OpsError(`只有待人工处理（AWAITING_HUMAN）的任务可以批准合并，当前状态 ${current.status}`);
   }
+  // A bare PR was never coded by the agent and its review is advisory; the
+  // host must not land someone else's branch.
+  if (current.source === 'pr') {
+    throw new OpsError('该任务只评审外部 PR，不会被自动合并；请在 GitHub 上人工合并');
+  }
   const prNum = current.pr_url?.match(/\/pull\/(\d+)/)?.[1];
   if (!prNum) throw new OpsError('任务没有关联 PR，无法批准合并');
   await tracker.addPrLabel(current.repo, Number(prNum), 'agent-merge');
@@ -70,6 +83,22 @@ export async function retryTask(
   task: TaskRow,
   processDeps: ProcessSafetyDeps = {},
 ): Promise<string> {
+  // A bare PR has no issue to re-approve: retrying means "judge the current
+  // head again", which is why the recorded verdicts are dropped instead of
+  // re-reading a ready label that will never exist. This is the only way back
+  // from an ERROR round, a stop, or a head nobody re-reviewed.
+  if (task.source === 'pr') {
+    if (store.activeRunForTask(task.id)) throw new OpsError('仍有活动的运行，请先停止');
+    const prNum = task.pr_url?.match(/\/pull\/(\d+)/)?.[1];
+    if (!prNum) throw new OpsError('任务没有关联 PR，无法重试');
+    store.tx(() => {
+      store.deleteReviewVerdicts(task.id);
+      store.setTaskStatus(task.id, 'AWAITING_REVIEW', { pending_fix: null });
+    });
+    await tracker.removePrLabel(task.repo, Number(prNum), 'agent-blocked').catch(() => {});
+    return `PR #${prNum} 已重新排队评审`;
+  }
+
   if (!RETRYABLE.includes(task.status)) {
     throw new OpsError(`任务状态 ${task.status} 不可重试`);
   }
@@ -102,6 +131,12 @@ export async function retryTask(
     if (!current || !RETRYABLE.includes(current.status) || store.activeRunForTask(task.id)) {
       throw new OpsError('检查重试期间任务已变化，请刷新后重试');
     }
+    // A retry means "judge the current state again". Dropping the recorded
+    // verdicts is what makes that true: a task whose branch already has an
+    // OPEN PR goes DISCOVERED → existing-PR → AWAITING_REVIEW, and the sha
+    // idempotency would otherwise skip the unchanged head forever, leaving a
+    // task that shows as "reviewing" but can never move.
+    store.deleteReviewVerdicts(task.id);
     // A human retry re-approves the whole pipeline: discard any stale
     // review-fix intent so the new run starts clean.
     store.setTaskStatus(task.id, 'DISCOVERED', { approved_hash: approvalHash(issue), pending_fix: null });

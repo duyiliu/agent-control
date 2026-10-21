@@ -30,6 +30,11 @@
   is reviewer tampering → ERROR verdict + human path, never a fixable verdict.
   A verdict row (`check_results.head_sha`) suppresses re-dispatch for that sha;
   head-moved/cancelled rounds write no row so a new sha can be reviewed.
+  `retryTask` drops the task's review verdict rows — without that, a task
+  whose branch already has an OPEN PR re-enters `AWAITING_REVIEW` with an
+  unchanged head and the sha idempotency strands it forever (it shows as
+  "reviewing" and can never move). `dispatchReviews` parks such a stranded
+  task in `BLOCKED` (retryable) instead of leaving it looking alive.
   A low-risk PASS parks the task in `MERGING` — a host-side sweep
   (`reconcileMergeStates`/`driveMerge`) owns landing, never the review run.
   The cleared sha is recorded on the task (`approved_sha`, `approved_by`).
@@ -62,6 +67,23 @@
   different Pi model/settings for review. `agent.model` is required — no
   implicit model default; `reasoning_effort` is optional (unset = runner
   default). All children get the scrubbed env.
+- A PR with no issue behind it is still a review input (`pr_review`, default
+  `auto`; `manual` reviews only `agent-review`-summoned PRs). Such a task has
+  `source='pr'` and lands directly in `AWAITING_REVIEW` — never `DISCOVERED`,
+  so it can never reach `tryDispatch`/the coder. Its verdict is advisory:
+  post it on the PR and park the task where the state matches the verdict —
+  PASS / HUMAN_REVIEW_REQUIRED → `AWAITING_HUMAN`, BLOCK → `BLOCKED` (author
+  must change the PR). Never spawn a fix run, never queue a merge, and an
+  `agent-merge` label is ignored. `retryTask` on a bare PR drops its review
+  verdict rows and re-queues the same head for review — that is the only way
+  back from an ERROR round or a stop. Discovery only registers
+  PRs opened after `pr_review_since:<repo>` (seeded on first tick, so enabling
+  the feature cannot queue a repo's backlog), skips drafts, forks (their head is
+  not fetchable locally), `branch_prefix` branches (the task path already owns
+  those heads) and other base branches, and registers at most `PR_REVIEW_BATCH`
+  per tick. GitHub shares one number sequence between issues and PRs, which is
+  why `tasks.issue_number` holds a PR number unchanged and `UNIQUE(repo,
+  issue_number)` still holds.
 - Cross-instance claiming is label-based: `agent-running` on an issue means
   another scheduler owns it — `listReadyIssues` filters it and `tryDispatch`
   skips it (stays DISCOVERED, reconciles via the existing-PR path). The label
@@ -84,6 +106,9 @@
 - `npm test` / `npm run typecheck`
 - `npm run ui:build` — rebuild the served dashboard (`ui/dist`; the server
   reads it per request, so a refresh is enough — no service restart)
+- `npm run build` — backend `dist/` **and** `ui/dist`. `ui/dist` is
+  gitignored, so every release must rebuild it; running from source reads
+  whatever `ui/dist` is on disk, and a stale one serves the old dashboard.
 
 ## Service lifecycle (scheduled task)
 

@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { Store } from '../store/sqlite.js';
 import { RunLog, type AppLog } from '../telemetry/logging.js';
-import { approvalHash, GitHubTracker } from '../tracker/github.js';
+import { approvalHash, GitHubTracker, type OpenPr } from '../tracker/github.js';
 import { DiffTooLargeError, GitWorkspace } from '../workspace/git.js';
 import { openPiCoderSession, type CoderSession, type CoderSessionOpts, type CoderTurn } from '../runners/session.js';
 import { PI_ALL_TOOLS } from '../runners/pi.js';
@@ -37,6 +37,13 @@ const TERMINAL_FOR_TASK: Phase[] = [
 
 /** Failed `gh pr merge` retries before a MERGING task gives up to a human. */
 const MAX_MERGE_ATTEMPTS = 20;
+
+/** New PR-first tasks registered per tick — a burst of PRs must not fan out
+ *  into a burst of review runs. */
+const PR_REVIEW_BATCH = 1;
+
+/** Label a human adds to summon a review for a PR opened before the anchor. */
+const PR_SUMMON_LABEL = 'agent-review';
 
 /** Task states a human must look at — surfaced as a GitHub issue comment. */
 const ATTENTION_PHASES: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED'];
@@ -90,6 +97,7 @@ export class Engine {
       await this.reconcileMergeStates();
       await this.discover();
       await this.dispatch();
+      await this.discoverPrs();
       await this.dispatchReviews();
     } finally {
       this.ticking = false;
@@ -160,13 +168,16 @@ export class Engine {
     // Self-heal: an AWAITING_HUMAN task whose current head was never reviewed
     // (e.g. a repair pushed a new head while the task was parked) must go back
     // to the review queue — otherwise the new head can never be approved.
-    if (project.review_mode === 'auto' && !this.store.hasReviewVerdictForSha(task.id, pr.headSha)) {
+    if (this.reviewsPr(project, task) && !this.store.hasReviewVerdictForSha(task.id, pr.headSha)) {
       // Any pending approval covers the old head only — drop it, re-review.
       await this.prLabelQuietly(project.repo, prNumber, 'agent-merge', false);
       this.setTaskStatus(task.id, 'AWAITING_REVIEW');
       this.appLog.event('human_head_unreviewed', { task: task.id, head_sha: pr.headSha });
       return;
     }
+    // External PRs are review-only: a human merges them by hand, so an
+    // agent-merge label must never route one into the host merge sweep.
+    if (task.source === 'pr') return;
     if (!pr.labels.includes('agent-merge')) return;
     const reviewedSha = this.store.latestReviewVerdictSha(task.id);
     if (reviewedSha && pr.headSha !== reviewedSha) {
@@ -191,6 +202,11 @@ export class Engine {
       `## 人工批准，排队自动合并\n\n合并将钉在 \`${pr.headSha.slice(0, 12)}\`；失败/冲突会走修复回路，需重新批准。`)
       .catch((err) => this.appLog.event('pr_comment_error', { task: task.id, error: String(err) }));
     this.appLog.event('human_merge_approved', { task: task.id, head_sha: pr.headSha });
+  }
+
+  /** Whether an autonomous review run may judge this task's PR. */
+  private reviewsPr(project: ProjectConfig, task: TaskRow): boolean {
+    return task.source === 'pr' || project.review_mode === 'auto';
   }
 
   /**
@@ -331,6 +347,73 @@ export class Engine {
             await this.labelQuietly(project.repo, issue.number, 'add', 'agent-blocked');
           }
         }
+      }
+    }
+  }
+
+  /**
+   * PR-first discovery: an external PR is a complete input on its own — no
+   * issue is required. Registering a PR-only task puts it straight into
+   * AWAITING_REVIEW, where the existing sha-idempotent review dispatch picks
+   * it up; nothing here can start a coding run.
+   *
+   * Runs after dispatch() so coding work claims the concurrency budget first.
+   */
+  private async discoverPrs() {
+    for (const project of this.config.projects) {
+      if (project.pr_review !== 'auto') continue;
+      const sinceKey = `pr_review_since:${project.repo}`;
+      const since = this.store.getMeta(sinceKey);
+      if (!since) {
+        // Cold start: only PRs opened from now on are auto-reviewed. Without
+        // this anchor, switching the feature on would queue every historical
+        // PR in the repo.
+        this.store.setMeta(sinceKey, new Date().toISOString());
+        continue;
+      }
+      let prs: OpenPr[];
+      try {
+        prs = await this.tracker.listOpenPrs(project.repo);
+      } catch (err) {
+        this.appLog.event('pr_discover_error', { repo: project.repo, error: String(err) });
+        this.recordError('pr_discover_error', err);
+        continue;
+      }
+      const sinceMs = Date.parse(since);
+      const candidates = prs.filter((pr) => {
+        if (pr.isDraft) return false;
+        // A fork head is not fetchable from the local repo's remote, so the
+        // review site could never be materialized.
+        if (pr.isCrossRepository) return false;
+        if (pr.baseRefName !== project.base_branch) return false;
+        // The agent's own PRs hang off issue tasks; registering them here
+        // would race the task-driven review path for the same head.
+        if (pr.headRefName.startsWith(project.branch_prefix)) return false;
+        if (pr.labels.includes(PR_SUMMON_LABEL)) return true;
+        return Date.parse(pr.createdAt) >= sinceMs;
+      }).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+
+      let created = 0;
+      for (const pr of candidates) {
+        const summoned = pr.labels.includes(PR_SUMMON_LABEL);
+        if (this.store.getTask(project.repo, pr.number)) {
+          // Leftover authorization: the task exists, so the label already did
+          // its job. A removal that failed last tick is retried here instead
+          // of being skipped forever with the task.
+          if (summoned) await this.prLabelQuietly(project.repo, pr.number, PR_SUMMON_LABEL, false);
+          continue;
+        }
+        if (created >= PR_REVIEW_BATCH) break;
+        this.store.upsertPrTask({
+          repo: project.repo,
+          number: pr.number,
+          title: pr.title,
+          url: pr.url,
+          branch: pr.headRefName,
+        });
+        created++;
+        if (summoned) await this.prLabelQuietly(project.repo, pr.number, PR_SUMMON_LABEL, false);
+        this.appLog.event('pr_task_discovered', { repo: project.repo, pr: pr.number, branch: pr.headRefName });
       }
     }
   }
@@ -792,7 +875,8 @@ export class Engine {
       if (!project) continue;
       // Manual-review projects never enter AWAITING_REVIEW — the PR parks
       // in AWAITING_HUMAN and a human reviews and merges, no run is spent.
-      if (project.review_mode !== 'auto') continue;
+      // reviewsPr() owns the exception for bare PRs.
+      if (!this.reviewsPr(project, task)) continue;
       if (this.store.activeRunForTask(task.id)) continue;
       try {
         const prNum = prNumberFromUrl(task.pr_url)
@@ -809,7 +893,16 @@ export class Engine {
           await this.setPrLabel(project.repo, prNum, false);
           this.appLog.event('stale_review_label_cleared', { task: task.id, pr: prNum });
         }
-        if (this.store.hasReviewVerdictForSha(task.id, pr.headSha)) continue;
+        if (this.store.hasReviewVerdictForSha(task.id, pr.headSha)) {
+          // AWAITING_REVIEW + a verdict for exactly this head is a stranded
+          // state: the sha idempotency below will never dispatch it again, so
+          // the UI would show "reviewing" for a task that cannot move. BLOCKED
+          // is the honest label and it is retryable — retry clears the verdict.
+          this.setTaskStatus(task.id, 'BLOCKED');
+          await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-blocked');
+          this.appLog.event('review_stranded', { task: task.id, head_sha: pr.headSha, pr: prNum });
+          continue;
+        }
 
         // Claim + pin fields + task status in one transaction so a crash
         // cannot leave a zombie task with no active run or vice versa.
@@ -985,6 +1078,23 @@ export class Engine {
         artifact_path: logPath, verdict: result.verdict, head_sha: reviewedSha });
       store.transition(runId, 'REVIEWING', 'REVIEWING', { kind: 'review_completed', head_sha: reviewedSha,
         verdict: result.verdict, risk: result.risk, summary: result.summary, artifact_path: logPath });
+
+      // An external PR has no issue to gate on and no branch the agent owns.
+      // Its review is informational: post the verdict and park it. Never
+      // spawn a fix run (nothing authorized touching someone's branch) and
+      // never queue a merge. The state must still say which verdict it was:
+      // BLOCK means the author has to change the PR (BLOCKED), while PASS and
+      // HUMAN_REVIEW_REQUIRED both leave the decision with a human.
+      if (task.source === 'pr') {
+        if (prNum) {
+          await this.tracker.commentPr(project.repo, prNum, this.externalPrReviewComment(result))
+            .catch((err) => this.appLog.event('pr_comment_error', { run: runId, error: String(err) }));
+        }
+        const blocked = result.verdict === 'BLOCK';
+        this.finishReview(run, task, blocked ? 'BLOCKED' : 'COMPLETED',
+          `external PR review ${result.verdict}`, blocked ? 'BLOCKED' : 'AWAITING_HUMAN');
+        return;
+      }
 
       if (result.verdict === 'PASS') {
         const riskReasons = this.assessRisk(diffEvidence, result.risk);
@@ -1184,6 +1294,26 @@ export class Engine {
 
 
   private async makePromptContext(run: RunRow, task: TaskRow, project: ProjectConfig): Promise<PromptContext> {
+    if (task.source === 'pr') {
+      // A PR-only task's description is the PR body — `gh issue view` does
+      // not resolve a PR number.
+      const prNum = prNumberFromUrl(task.pr_url);
+      const pr = prNum ? await this.tracker.getPrDetails(project.repo, prNum).catch(() => null) : null;
+      return {
+        project,
+        issue: {
+          number: task.issue_number,
+          title: task.issue_title,
+          body: pr?.body ?? '',
+          labels: [],
+          state: 'OPEN',
+          url: task.issue_url,
+        },
+        branch: run.branch ?? task.branch ?? project.base_branch,
+        workflowPath: join(this.deps.installDir, 'WORKFLOW.md'),
+        worktreePath: run.workspace ?? this.worktreePathFor(project, task),
+      };
+    }
     const issue = await this.tracker.getIssue(project.repo, task.issue_number);
     return {
       project,
@@ -1281,6 +1411,9 @@ export class Engine {
    * Returns 'ok' or a terminal phase.
    */
   private async gateApproval(project: ProjectConfig, task: TaskRow): Promise<'ok' | Phase> {
+    // An external PR is authorized by its own existence: there is no ready
+    // label to re-check and no approval hash to drift.
+    if (task.source === 'pr') return 'ok';
     const issue = await this.tracker.getIssue(project.repo, task.issue_number);
     if (!issue || issue.state !== 'OPEN' || !issue.labels.includes(project.ready_label)) return 'CANCELED';
     const current = this.store.getTaskById(task.id)!;
@@ -1371,6 +1504,20 @@ export class Engine {
       ...reasons.map((reason) => `- ${reason}`),
       '',
       '本 PR 不会自动合并，请人工审查后再合并。',
+    ].join('\n');
+  }
+
+  private externalPrReviewComment(result: ReviewResult): string {
+    const findings = result.findings.filter((f) => f.trim());
+    return [
+      `## 自动评审：${result.verdict}`,
+      '',
+      `- 结论：${result.verdict}`,
+      `- 风险：${result.risk}`,
+      `- 摘要：${result.summary}`,
+      '',
+      ...(findings.length > 0 ? ['### 发现', ...findings.map((f) => `- ${f}`), ''] : []),
+      '此 PR 没有关联 issue，agent-control 只做评审，不会修改分支、也不会自动合并。',
     ].join('\n');
   }
 

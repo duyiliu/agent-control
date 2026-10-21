@@ -10,7 +10,7 @@
   "scripts": {
     "ac": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "npm run ui:build && tsc -p tsconfig.build.json",
     "test": "tsx --test tests/*.test.ts",
     "ui:dev": "npm --prefix ui run dev",
     "ui:build": "npm --prefix ui run build",

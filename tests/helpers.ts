@@ -37,6 +37,9 @@ export function makeConfig(dir: string, overrides?: Partial<AppConfig>): AppConf
         branch_prefix: 'agent/issue-',
         checks: [{ argv: [process.execPath, '-e', 'process.exit(0)'] }],
         review_mode: 'auto',
+        // PR-first discovery is exercised by its own tests; leaving it on
+        // would make every scheduler test poll the fake tracker for PRs.
+        pr_review: 'manual',
       },
     ],
     agent: {
@@ -84,6 +87,14 @@ export interface FakeTracker {
   mergeable: Map<number, 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN'>;
   mergeErrors: Map<number, Error>;
   prLabels: Map<number, string[]>;
+  /** Successive `getPrDetails` calls consume this queue before `headSha`,
+   *  so a test can show a head moving between dispatch and pre-flight. */
+  headShaSequence: string[];
+  openPrs: {
+    number: number; title: string; url: string; isDraft: boolean;
+    headRefName: string; baseRefName: string; createdAt: string;
+    labels: string[]; isCrossRepository: boolean;
+  }[];
 }
 
 export function makeFakeTracker(): FakeTracker & {
@@ -103,6 +114,7 @@ export function makeFakeTracker(): FakeTracker & {
   createDraftPr: (repo: string, o: any) => Promise<any>;
   addComment: (repo: string, n: number, body: string) => Promise<void>;
   listIssueComments: (repo: string, n: number) => Promise<{ body: string; createdAt: string }[]>;
+  listOpenPrs: (repo: string) => Promise<any[]>;
 } {
   const t: FakeTracker = {
     issues: new Map(),
@@ -119,6 +131,8 @@ export function makeFakeTracker(): FakeTracker & {
     mergeable: new Map(),
     mergeErrors: new Map(),
     prLabels: new Map(),
+    headShaSequence: [],
+    openPrs: [],
   };
   return Object.assign(t, {
     async listReadyIssues(_repo: string, label: string) {
@@ -152,14 +166,19 @@ export function makeFakeTracker(): FakeTracker & {
     },
     async getPrDetails(_repo: string, n: number) {
       const pr = [...t.prs.values()].find((p) => p.number === n);
+      const sha = t.headShaSequence.length > 0 ? t.headShaSequence.shift()! : t.headSha;
       return {
         state: (t.prStates.get(n) ?? pr?.state ?? 'OPEN') as 'OPEN' | 'CLOSED' | 'MERGED',
-        headSha: t.headSha,
+        headSha: sha,
         labels: t.prLabels.get(n) ?? [],
         isDraft: pr?.isDraft ?? true,
         url: pr?.url ?? `https://github.com/x/y/pull/${n}`,
+        body: '',
         mergeable: t.mergeable.get(n) ?? 'MERGEABLE',
       };
+    },
+    async listOpenPrs(_repo: string) {
+      return t.openPrs.map((pr) => ({ ...pr, labels: [...pr.labels] }));
     },
     async markPrReady(_repo: string, _n: number) {},
     async mergePr(_repo: string, n: number, _sha: string) {
