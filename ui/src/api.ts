@@ -17,12 +17,15 @@ export type Phase =
   | 'CANCELED'
   | 'RECOVERY_REQUIRED';
 
+export type TaskSource = 'issue' | 'pr';
+
 export interface TaskSummary {
   id: number;
   repo: string;
   issue_number: number;
   issue_title: string;
   issue_url: string;
+  source: TaskSource;
   status: Phase;
   pr_url: string | null;
   fix_rounds: number;

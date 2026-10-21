@@ -1031,11 +1031,23 @@ export class Engine {
           this.writeReviewVerdict(runId, reviewedSha, 'HUMAN_REVIEW_REQUIRED');
           this.finishReview(run, task, 'AWAITING_HUMAN', 'review diff too large; human review required');
           await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+          // An external PR has no issue comment to explain the label, so say
+          // it on the PR itself.
+          if (task.source === 'pr' && prNum) {
+            await this.tracker.commentPr(project.repo, prNum,
+              '## 自动评审：已跳过\n\n改动超过自动评审的大小上限（4 MB），无法自动判断，已转人工评审。')
+              .catch((commentErr) => this.appLog.event('pr_comment_error', { run: runId, error: String(commentErr) }));
+          }
           return;
         }
         this.writeReviewVerdict(runId, reviewedSha, 'ERROR');
         this.finishReview(run, task, 'AWAITING_HUMAN', `review diff unavailable: ${String(err).slice(0, 300)}`);
         await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+        if (task.source === 'pr' && prNum) {
+          await this.tracker.commentPr(project.repo, prNum,
+            `## 自动评审：失败\n\n无法生成评审所需 diff（${String(err).slice(0, 200)}），已转人工评审。`)
+            .catch((commentErr) => this.appLog.event('pr_comment_error', { run: runId, error: String(commentErr) }));
+        }
         return;
       }
 
@@ -1268,9 +1280,13 @@ export class Engine {
 
   /** Issue-side note when auto-review cannot run — never throws. */
   private async notifyReviewInfra(task: TaskRow, run: RunRow, detail: string) {
+    const body = `agent-control: ${detail}。\nrun：\`${run.run_id}\``;
+    const prNum = task.source === 'pr' ? prNumberFromUrl(task.pr_url) : null;
     try {
-      await this.tracker.addComment(task.repo, task.issue_number,
-        `agent-control: ${detail}。\nrun：\`${run.run_id}\``);
+      // A bare PR is not an issue: comment on it through the PR API so the
+      // note lands next to the code being discussed.
+      if (prNum) await this.tracker.commentPr(task.repo, prNum, body);
+      else await this.tracker.addComment(task.repo, task.issue_number, body);
     } catch (err) {
       this.appLog.event('comment_error', { task: task.id, error: String(err) });
     }

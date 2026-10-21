@@ -105,7 +105,9 @@ export default function DetailDrawer(props: {
                     rel="noopener noreferrer"
                     className="font-mono text-[11px] text-info hover:underline"
                   >
-                    {t.repo}#{t.issue_number}
+                    {t.repo}
+                    {t.source === 'pr' ? ' PR#' : '#'}
+                    {t.issue_number}
                   </a>
                   <span className={`flex items-center gap-1.5 text-[11px] ${phaseTextClass(t.status)}`}>
                     <StatusIcon phase={t.status} />
@@ -154,7 +156,7 @@ export default function DetailDrawer(props: {
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex size-7 items-center justify-center rounded-md text-fg-muted hover:bg-elevated hover:text-fg"
-                title="在 GitHub 打开 issue"
+                title={t.source === 'pr' ? '在 GitHub 打开 PR' : '在 GitHub 打开 issue'}
               >
                 <ExternalLink className="size-3.5" />
               </a>

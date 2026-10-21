@@ -247,7 +247,9 @@ function TaskCard(props: {
       </div>
       <div className="mt-2 flex items-center gap-2 text-[11px] text-fg-muted">
         <span className="min-w-0 flex-1 truncate font-mono" title={task.repo}>
-          {shortRepo(task.repo)}#{task.issue_number}
+          {shortRepo(task.repo)}
+          {task.source === 'pr' ? ' PR#' : '#'}
+          {task.issue_number}
         </span>
         <span className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap ${phaseTextClass(phase)}`}>
           <StatusIcon phase={phase} />

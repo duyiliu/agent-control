@@ -1,7 +1,7 @@
 import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import type { Store } from '../store/sqlite.js';
-import type { AppConfig, CheckResultRow, Phase, RunRow, TaskRow } from '../types.js';
+import type { AppConfig, CheckResultRow, Phase, RunRow, TaskRow, TaskSource } from '../types.js';
 import type { OpsTracker } from '../ops.js';
 
 export interface TaskSummary {
@@ -10,6 +10,8 @@ export interface TaskSummary {
   issue_number: number;
   issue_title: string;
   issue_url: string;
+  /** 'pr' means the number is a PR, not an issue — the UI must not show it as one. */
+  source: TaskSource;
   status: Phase;
   pr_url: string | null;
   fix_rounds: number;
@@ -61,6 +63,7 @@ export function tasksPayload(store: Store): { tasks: TaskSummary[] } {
         issue_number: t.issue_number,
         issue_title: t.issue_title,
         issue_url: t.issue_url,
+        source: t.source,
         status: t.status,
         pr_url: t.pr_url,
         fix_rounds: t.fix_rounds,

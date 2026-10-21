@@ -54,7 +54,7 @@ export default function App() {
   const stopByDrag = useCallback(
     async (task: TaskSummary) => {
       const ok = window.confirm(
-        `停止「${task.issue_title || `#${task.issue_number}`}」？调度器会在一个轮询周期内中止当前运行。`,
+        `停止「${task.issue_title || `${task.source === 'pr' ? 'PR#' : '#'}${task.issue_number}`}」？调度器会在一个轮询周期内中止当前运行。`,
       );
       if (!ok) return;
       try {
