@@ -18,7 +18,7 @@ test('buildPiArgv: non-interactive, config-isolated, @file prompt', () => {
   assert.ok(s.includes('--no-extensions'));
   assert.ok(s.includes('--no-skills'));
   assert.ok(s.includes('--no-context-files'));
-  assert.ok(s.includes('--no-approve')); // 1.3: ignore project-local files, never prompt
+  assert.ok(!s.includes('--no-approve')); // pi 1.3.0 removed the flag; --no-context-files covers the trust prompt
   assert.ok(s.includes(' -- ')); // end option parsing before the @prompt include
   assert.ok(s.includes('--tools read,grep,find,ls'));
   assert.ok(s.includes('--model new-api/deepseek-v4.1-flash'));

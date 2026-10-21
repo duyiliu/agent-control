@@ -37,9 +37,9 @@ export const PI_ALL_TOOLS = ['read', 'bash', 'powershell', 'edit', 'write', 'gre
 /**
  * argv for one non-interactive `pi -p` call. Ambient project/user config is
  * disabled so the worktree (or its contents) cannot inject tools, skills,
- * templates or context files into the run; `--no-approve` additionally makes
- * pi ignore project-local files outright instead of prompting to trust them
- * (unattended runs must never block on a prompt), and `--` ends option
+ * templates or context files into the run (`--no-context-files` ignores
+ * project-local files outright instead of prompting to trust them —
+ * unattended runs must never block on a prompt), and `--` ends option
  * parsing so the trailing @prompt include is always taken as a message.
  */
 export function buildPiArgv(
@@ -56,7 +56,6 @@ export function buildPiArgv(
     '--no-skills',
     '--no-prompt-templates',
     '--no-context-files',
-    '--no-approve',
     '--tools', (opts.tools ?? PI_ALL_TOOLS).join(','),
     ...(opts.model ? ['--model', opts.model] : []),
     ...(opts.thinking ? ['--thinking', opts.thinking] : []),
@@ -83,7 +82,6 @@ export function buildRpcArgv(
     '--no-skills',
     '--no-prompt-templates',
     '--no-context-files',
-    '--no-approve',
     '--tools', (opts.tools ?? PI_ALL_TOOLS).join(','),
     ...(opts.model ? ['--model', opts.model] : []),
     ...(opts.thinking ? ['--thinking', opts.thinking] : []),
