@@ -224,7 +224,9 @@ npm run ui:typecheck
 
 调度器每个请求都会重新读取 `ui/dist`，所以改完前端只需 `npm run ui:build` 并刷新浏览器，**不需要重启服务**。`ui:dev` 的代理目标写死在 `ui/vite.config.ts` 的 `8788`；如果你的 `server.ui.port` 不是 8788，需要一起改。UI 启动失败（如端口被占）只记警告，调度不受影响。
 
-## 常驻服务（Windows 计划任务）
+## 常驻服务
+
+### Windows 计划任务
 
 前台验证通过后注册计划任务，登录即自启：
 
@@ -250,6 +252,39 @@ schtasks /run /tn agent-control
 ```
 
 重启后确认任务状态为 `Running`，`agent-control.lock` 里是新 pid 且心跳是新的；配置了 token 时，未带凭据访问 `GET /api/health` 应返回 401。
+
+### Linux systemd
+
+Linux 上没有单实例脚本可复用，直接用 systemd 托管，systemd 负责停旧起新：
+
+```ini
+# /etc/systemd/system/agent-control.service
+[Unit]
+Description=agent-control scheduler
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/git/agent-control
+Environment=HOME=/root PATH=/usr/local/node22/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/node22/bin/node --import tsx src/cli.ts start
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now agent-control
+systemctl status agent-control
+systemctl restart agent-control
+journalctl -u agent-control -n 50 --no-pager
+```
+
+- `PATH` 必须包含 `pi` 所在目录（`/usr/local/node22/bin`），否则 `which('pi')` 找不到 runner；交互式 SSH 的 PATH 不含它时，手动跑 `npm run ac -- doctor` 会误报 `pi not on PATH`，而服务本身正常。
+- 重启后看三件事：`systemctl is-active` 为 `active`、`<logs_dir>/agent-control.jsonl` 尾部有 `ui_start` + `reconcile_done`、`agent-control.lock` 是新 pid 且心跳是新的。
+- `Restart=on-failure` 提供崩溃自愈；单实例仍由心跳锁保证，systemd 之外的重复启动会直接退出。
 
 ## 安全边界
 

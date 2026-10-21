@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { runReview } from '../src/verify/review.js';
@@ -17,12 +17,25 @@ test('configured GPT-6 Luna reviewer model reaches the runner with SHA evidence'
     const bin = join(dir, 'bin');
     const cliDir = join(bin, 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'bundle');
     mkdirSync(cliDir, { recursive: true });
-    writeFileSync(join(bin, 'pi.cmd'), '');
     const argvPath = join(dir, 'captured-argv.json');
     writeFileSync(join(cliDir, 'cli.js'), `const fs=require('node:fs'); fs.writeFileSync(${JSON.stringify(argvPath)},JSON.stringify(process.argv.slice(2))); console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:${JSON.stringify(passed)}}]}}));`);
+    // Windows resolves the npm .cmd shim through cli.js; POSIX gets an
+    // executable shim that execs the same bundle, so the model plumbing is
+    // covered on both hosts.
+    if (process.platform === 'win32') {
+      writeFileSync(join(bin, 'pi.cmd'), '');
+    } else {
+      const shim = join(bin, 'pi');
+      writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${join(cliDir, 'cli.js')}" "$@"\n`);
+      chmodSync(shim, 0o755);
+    }
     process.env.PATH = `${bin}${process.platform === 'win32' ? ';' : ':'}${originalPath ?? ''}`;
     const invocation = resolvePiInvocation();
-    assert.equal(invocation.prefix[0], join(cliDir, 'cli.js'), 'must use the local fake CLI, not a real model runner');
+    assert.equal(
+      process.platform === 'win32' ? invocation.prefix[0] : invocation.argv0,
+      process.platform === 'win32' ? join(cliDir, 'cli.js') : join(bin, 'pi'),
+      'must use the local fake CLI, not a real model runner',
+    );
 
     const config = makeConfig(dir);
     config.agent.review_model = 'new-api-responses/gpt-6-luna';

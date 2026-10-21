@@ -110,7 +110,9 @@
   gitignored, so every release must rebuild it; running from source reads
   whatever `ui/dist` is on disk, and a stale one serves the old dashboard.
 
-## Service lifecycle (scheduled task)
+## Service lifecycle
+
+### Windows (scheduled task)
 
 The service is owned by the Windows scheduled task `agent-control` (logon
 trigger). Never start it with a bare `Start-Process` — a manual instance
@@ -127,5 +129,23 @@ Get-CimInstance Win32_Process |
 Start-ScheduledTask -TaskName agent-control
 ```
 
-After restart: task state `Running`, `agent-control.lock` carries the new pid
-with a fresh heartbeat, and `GET /api/health` answers 401 (auth gate alive).
+### Linux (systemd)
+
+The 214 deployment runs `agent-control.service` (systemd, root,
+`WorkingDirectory=/root/git/agent-control`, `ExecStart=/usr/local/node22/bin/node
+--import tsx src/cli.ts start`). Its `Environment=` line carries `HOME` plus a
+`PATH` that includes `/usr/local/node22/bin` — `pi` is only installed there, so
+an interactive SSH shell may not see it even though the service does.
+
+```bash
+systemctl status agent-control
+systemctl restart agent-control    # single instance: systemd stops the old one first
+journalctl -u agent-control -n 50 --no-pager
+```
+
+After restart: `systemctl is-active` says `active`, the tail of
+`<logs_dir>/agent-control.jsonl` shows `ui_start` + `reconcile_done`, and
+`agent-control.lock` carries the new pid with a fresh heartbeat.
+
+Either platform: after restart check the same three signals (state/liveness,
+lock pid + heartbeat, `GET /api/health` answers 401 when a token is set).

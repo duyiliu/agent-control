@@ -6,6 +6,14 @@ import { join } from 'node:path';
 import { PiCoderSession, splitRpcLines } from '../src/runners/session.js';
 import { makeConfig } from './helpers.js';
 
+async function waitFor(pred: () => boolean, ms = 2000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (pred()) return;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
 const FAKE_PI = `
 import { writeFileSync } from 'node:fs';
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
@@ -81,6 +89,9 @@ test('session: prompt returns the assistant text and writes the log', async () =
     assert.equal(again.ok, true);
     assert.equal(again.lastMessage, 'echo:again');
     assert.equal(session.pid, pid);
+    // The turn settles on the child's event, which can arrive before the log
+    // WriteStream has flushed — wait for the record instead of racing it.
+    await waitFor(() => readFileSync(logPath, 'utf8').includes('echo:again'));
     assert.match(readFileSync(logPath, 'utf8'), /echo:again/);
   } finally {
     await session.close();

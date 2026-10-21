@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store } from './store/sqlite.js';
@@ -215,7 +216,7 @@ export async function runDoctor(config: AppConfig | null, configError?: string):
       ? { name: 'pi', status: 'PASS', detail: `${inv.argv0 === process.execPath ? 'node ' + inv.prefix[0] : inv.argv0} — ${v.stdoutTail.trim().split('\n')[0]}` }
       : { name: 'pi', status: 'FAIL', detail: v.stderrTail.trim().slice(0, 200) });
     items.push({ name: 'pi-invocation', status: 'PASS', detail: runnerArgv(['-p', '…']).join(' ') });
-    const piCfg = join(process.env.USERPROFILE ?? '', '.pi', 'agent', 'models.json');
+    const piCfg = join(homedir(), '.pi', 'agent', 'models.json');
     items.push(existsSync(piCfg)
       ? { name: 'pi-models', status: 'PASS', detail: `${piCfg}${config?.agent.review_model ? ` (review: ${config.agent.review_model})` : ''}` }
       : { name: 'pi-models', status: 'FAIL', detail: `${piCfg} missing — pi providers/models are file-configured` });
