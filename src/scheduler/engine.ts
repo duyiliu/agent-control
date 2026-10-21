@@ -611,6 +611,13 @@ export class Engine {
               // scrubbed env cannot fetch, so the host refreshes the ref.
               await this.workspace.fetchBranch(project.local_repo, project.base_branch)
                 .catch((err) => this.appLog.event('fetch_error', { run: runId, error: String(err) }));
+              // The work must start from the PR branch's remote head: a reused
+              // worktree may sit at a stale commit, and merging base onto it
+              // pushes a non-fast-forward that GitHub rejects.
+              const fixBranch = run.branch ?? task.branch ?? `${project.branch_prefix}${task.issue_number}`;
+              await this.workspace.fetchBranch(project.local_repo, fixBranch)
+                .then(() => this.workspace.resetHard(worktreePath, `origin/${fixBranch}`))
+                .catch((err) => this.appLog.event('fix_head_sync_error', { run: runId, error: String(err).slice(0, 300) }));
               prompt = buildFixPrompt(ctx, `${pendingFix.title ?? 'Review BLOCK'}：${pendingFix.summary}\n${pendingFix.findings.join('\n')}`);
             }
             const turn = ensureCoder();

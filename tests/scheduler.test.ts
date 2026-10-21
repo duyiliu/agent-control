@@ -29,7 +29,8 @@ function fakeWorkspace(calls?: string[]): GitWorkspace {
     aheadCount: async () => 1,
     diffVsBase: async () => 'diff',
     push: async () => {},
-    fetchBranch: async () => {},
+    fetchBranch: async (_repo: string, b: string) => { calls?.push(`fetch:${b}`); },
+    resetHard: async (_p: string, ref: string) => { calls?.push(`reset:${ref}`); },
     addDetachedWorktree: async (_repo: string, sha: string, p: string) => { siteHeads.set(p, sha); return p; },
     removeWorktree: async (_repo: string, p: string) => { calls?.push(`rm-wt:${p}`); },
     deleteLocalBranch: async (_repo: string, b: string) => { calls?.push(`del-local:${b}`); },
@@ -1010,7 +1011,8 @@ test('merge conflict after PASS spawns a fix run via pending_fix', async () => {
   try {
     env.tracker.issues.set(63, { ...ISSUE });
     env.config.approvals.auto_merge.enabled = true;
-    const { store, engine } = makeEngine(env);
+    const calls: string[] = [];
+    const { store, engine } = makeEngine(env, { workspace: fakeWorkspace(calls) });
     await tickAndDrain(engine); // code run → PR published
     const task = store.getTask('me/sandbox', 63)!;
     const prNum = Number(task.pr_url!.match(/pull\/(\d+)/)![1]);
@@ -1037,6 +1039,10 @@ test('merge conflict after PASS spawns a fix run via pending_fix', async () => {
       .find((d) => d?.kind === 'pending_fix_consumed');
     assert.equal(consumed.head_sha, 'head-sha');
     assert.ok(consumed.findings.some((f: string) => f.includes('git merge origin/')));
+    // The fix run must sync the worktree to the remote PR head before the
+    // agent merges base — otherwise publish pushes a non-fast-forward.
+    assert.ok(calls.includes('fetch:agent/issue-63'), `PR branch fetched: ${calls}`);
+    assert.ok(calls.includes('reset:origin/agent/issue-63'), `worktree reset to remote head: ${calls}`);
   } finally { env.done(); }
 });
 

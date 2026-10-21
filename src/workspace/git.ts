@@ -126,6 +126,11 @@ export class GitWorkspace {
     await this.git(['fetch', 'origin', branch], repoDir, 120_000);
   }
 
+  /** Hard-reset a worktree to a ref (fix runs sync to the remote PR head). */
+  async resetHard(worktreePath: string, ref: string): Promise<void> {
+    await this.git(['reset', '--hard', ref], worktreePath);
+  }
+
   /**
    * Materialize one commit as a detached worktree — the review site for a PR
    * head sha, independent of any coding worktree state.
