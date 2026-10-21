@@ -242,11 +242,20 @@ function TaskCard(props: {
       } ${dragging ? 'opacity-40' : ''}`}
     >
       {active && <span className="absolute inset-y-0 left-0 w-[2px] bg-ok" />}
-      <div className="text-[13px] font-medium leading-snug text-fg" style={{ paddingLeft: active ? 6 : 0 }}>
-        <span className="line-clamp-2">{task.issue_title || '(无标题)'}</span>
+      <div
+        className="text-[13px] font-medium leading-snug text-fg"
+        style={{ paddingLeft: active ? 6 : 0 }}
+      >
+        {/* Full title on hover: two lines are never enough for long PR names. */}
+        <span className="line-clamp-3" title={task.issue_title || '(无标题)'}>
+          {task.issue_title || '(无标题)'}
+        </span>
       </div>
       <div className="mt-2 flex items-center gap-2 text-[11px] text-fg-muted">
-        <span className="min-w-0 flex-1 truncate font-mono" title={task.repo}>
+        <span
+          className="min-w-0 flex-1 truncate font-mono"
+          title={`${task.repo}${task.source === 'pr' ? ' PR#' : '#'}${task.issue_number}`}
+        >
           {shortRepo(task.repo)}
           {task.source === 'pr' ? ' PR#' : '#'}
           {task.issue_number}
