@@ -246,54 +246,53 @@ function TaskCard(props: {
         className="text-[13px] font-medium leading-snug text-fg"
         style={{ paddingLeft: active ? 6 : 0 }}
       >
-        {/* Full title on hover: two lines are never enough for long PR names. */}
-        <span className="line-clamp-3" title={task.issue_title || '(无标题)'}>
-          {task.issue_title || '(无标题)'}
-        </span>
+        {/* No clamping and no hover dependency: a long PR name wraps instead
+            of being hidden, which also works on touch screens. */}
+        <span className="break-words">{task.issue_title || '(无标题)'}</span>
       </div>
-      <div className="mt-2 flex items-center gap-2 text-[11px] text-fg-muted">
-        <span
-          className="min-w-0 flex-1 truncate font-mono"
+      <div className="mt-2 space-y-1 text-[11px] text-fg-muted">
+        <div
+          className="truncate font-mono"
           title={`${task.repo}${task.source === 'pr' ? ' PR#' : '#'}${task.issue_number}`}
         >
           {shortRepo(task.repo)}
           {task.source === 'pr' ? ' PR#' : '#'}
           {task.issue_number}
-        </span>
-        <span className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap ${phaseTextClass(phase)}`}>
-          <StatusIcon phase={phase} />
-          {phaseLabel(phase)}
-        </span>
-        <span className="flex shrink-0 items-center gap-3">
-          {active ? (
-            <span className="flex items-center gap-1 whitespace-nowrap tabular-nums text-ok">
-              <Clock className="size-3" />
-              {fmtDur(active.started_at)}
-            </span>
-          ) : (
-            // How long the task has sat without a state change — the fastest
-            // way to spot something that quietly stalled.
-            <span
-              className="flex items-center gap-1 whitespace-nowrap tabular-nums text-fg-dim"
-              title={`最后处理：${fmtTime(task.updated_at)}`}
-            >
-              <Clock className="size-3" />
-              {fmtDur(task.updated_at)}前
-            </span>
-          )}
-          {task.pr_url && (
-            <a
-              href={task.pr_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              title={task.pr_url}
-              onClick={(e) => e.stopPropagation()}
-              className="flex items-center gap-1 text-info/80 hover:text-info"
-            >
-              <GitPullRequest className="size-3.5" />
-            </a>
-          )}
-        </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap ${phaseTextClass(phase)}`}>
+            <StatusIcon phase={phase} />
+            {phaseLabel(phase)}
+          </span>
+          <span className="ml-auto flex shrink-0 items-center gap-3">
+            {active ? (
+              <span className="flex items-center gap-1 whitespace-nowrap tabular-nums text-ok">
+                <Clock className="size-3" />
+                {fmtDur(active.started_at)}
+              </span>
+            ) : (
+              <span
+                className="flex items-center gap-1 whitespace-nowrap tabular-nums text-fg-dim"
+                title={`最后处理：${fmtTime(task.updated_at)}`}
+              >
+                <Clock className="size-3" />
+                {fmtDur(task.updated_at)}前
+              </span>
+            )}
+            {task.pr_url && (
+              <a
+                href={task.pr_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={task.pr_url}
+                onClick={(e) => e.stopPropagation()}
+                className="flex items-center gap-1 text-info/80 hover:text-info"
+              >
+                <GitPullRequest className="size-3.5" />
+              </a>
+            )}
+          </span>
+        </div>
       </div>
     </div>
   );
