@@ -361,10 +361,13 @@ export class Engine {
    */
   private async discoverPrs() {
     for (const project of this.config.projects) {
-      if (project.pr_review !== 'auto') continue;
+      // 'manual' still scans: the agent-review label is the only way an
+      // external PR gets reviewed there, so skipping the project entirely
+      // would make the documented summon path dead.
+      const autoOn = project.pr_review === 'auto';
       const sinceKey = `pr_review_since:${project.repo}`;
       const since = this.store.getMeta(sinceKey);
-      if (!since) {
+      if (autoOn && !since) {
         // Cold start: only PRs opened from now on are auto-reviewed. Without
         // this anchor, switching the feature on would queue every historical
         // PR in the repo.
@@ -379,7 +382,7 @@ export class Engine {
         this.recordError('pr_discover_error', err);
         continue;
       }
-      const sinceMs = Date.parse(since);
+      const sinceMs = since ? Date.parse(since) : Number.POSITIVE_INFINITY;
       const candidates = prs.filter((pr) => {
         if (pr.isDraft) return false;
         // A fork head is not fetchable from the local repo's remote, so the
@@ -390,6 +393,7 @@ export class Engine {
         // would race the task-driven review path for the same head.
         if (pr.headRefName.startsWith(project.branch_prefix)) return false;
         if (pr.labels.includes(PR_SUMMON_LABEL)) return true;
+        if (!autoOn) return false;
         return Date.parse(pr.createdAt) >= sinceMs;
       }).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
 

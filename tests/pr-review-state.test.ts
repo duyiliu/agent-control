@@ -180,7 +180,7 @@ test('S4 agent-review summons a pre-anchor PR and is consumed once', async () =>
   } finally { ctx.done(); }
 });
 
-test('S5 pr_review: manual never scans PRs', async () => {
+test('S5 pr_review: manual ignores unsummoned PRs', async () => {
   const ctx = boot();
   try {
     ctx.config.projects[0]!.pr_review = 'manual';
@@ -188,6 +188,17 @@ test('S5 pr_review: manual never scans PRs', async () => {
     await tick(ctx.engine);
     await tick(ctx.engine);
     assert.equal(ctx.store.getTask(REPO, 51), null);
+  } finally { ctx.done(); }
+});
+
+test('S5b pr_review: manual still honours the agent-review label', async () => {
+  const ctx = boot();
+  try {
+    ctx.config.projects[0]!.pr_review = 'manual';
+    ctx.tracker.openPrs = [pr({ number: 52, createdAt: new Date(Date.now() - 86_400_000).toISOString(), labels: ['agent-review'] })];
+    await tick(ctx.engine);
+    assert.ok(ctx.store.getTask(REPO, 52));
+    assert.ok(!(ctx.tracker.prLabels.get(52) ?? []).includes('agent-review'));
   } finally { ctx.done(); }
 });
 
