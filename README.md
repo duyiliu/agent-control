@@ -195,6 +195,10 @@ checks 失败会自动进入修复回路，同一个编码 run 内最多修复 `
 http://127.0.0.1:8787     # 端口以 agent-control.yaml 的 server.ui.port 为准
 ```
 
+看板示例：
+
+![agent-control Web 管理界面](docs/images/ui-board.png)
+
 - **七列看板**：排队中 → 进行中 → 审查中 → 合并中 → 待人工处理 → 已完成 → 异常需介入。卡片带 repo#issue、相位徽章、实时运行时长和 PR 链接；支持按仓库筛选、按 `/` 聚焦搜索、5 秒自动刷新。
 - **详情抽屉**：相位时间线（`run_events`）、checks 结果、修复轮次、实时日志（跟随/暂停、原始 JSONL）、artifact 弹窗（测试日志、review 结论、`review-diff.patch`、`run-*.jsonl`）。`.jsonl` 会逐行解析成事件流；服务端强制路径必须落在 `logs_dir` 内，越界访问返回 403。
 - **操作**：停止、重试、批准合并，均有确认弹窗；进行中的卡片也可以拖到「异常需介入」触发停止。所有写操作与 CLI 走同一 Store/ops 路径，两者可以混用。
