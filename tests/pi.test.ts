@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildPiArgv, extractLastMessage, PI_REVIEW_TOOLS, resolvePiInvocation } from '../src/runners/pi.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { buildPiArgv, extractLastMessage, PI_REVIEW_TOOLS, piBesideNode, resolvePiInvocation } from '../src/runners/pi.js';
+
+const piName = process.platform === 'win32' ? 'pi.cmd' : 'pi';
 
 const inv = { argv0: 'node', prefix: ['/x/cli.js'] };
 
@@ -50,9 +55,36 @@ test('resolvePiInvocation: explicit pi_path wins over the PATH lookup', () => {
   assert.deepEqual(inv.prefix, []);
 });
 
-test('resolvePiInvocation: unset pi_path falls back to PATH', () => {
-  const inv = resolvePiInvocation('/definitely/not/on/path', undefined);
-  assert.equal(inv.argv0, 'pi'); // unresolved marker used by doctor
+test('resolvePiInvocation: empty PATH and empty node dir → unresolved marker', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-empty-'));
+  try {
+    const inv = resolvePiInvocation('/definitely/not/on/path', undefined, dir);
+    assert.equal(inv.argv0, 'pi'); // the marker doctor reports as FAIL
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('resolvePiInvocation: falls back to the runtime node directory', () => {
+  // A systemd-only PATH is invisible to an interactive shell; the shim sitting
+  // beside the runtime node is the "current user's default install" fallback.
+  const dir = mkdtempSync(join(tmpdir(), 'pi-node-'));
+  try {
+    writeFileSync(join(dir, piName), '#!/bin/sh\n');
+    const inv = resolvePiInvocation('/definitely/not/on/path', undefined, dir);
+    assert.notEqual(inv.argv0, 'pi');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('piBesideNode: returns null when the directory has no pi', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-beside-'));
+  try {
+    assert.equal(piBesideNode(dir), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('extractLastMessage: no assistant text → null', () => {

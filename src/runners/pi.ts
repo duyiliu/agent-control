@@ -10,15 +10,34 @@ export interface PiInvocation {
 }
 
 /**
+ * `npm i -g` puts the pi shim in the same directory as the node binary that
+ * runs it, so look beside the runtime node before shelling out to npm. This is
+ * the "current user's default install" fallback: a systemd unit's Environment
+ * is not inherited by an interactive shell, and the reverse holds too, so PATH
+ * alone cannot be trusted to be the same in both contexts.
+ */
+export function piBesideNode(nodeDir: string): string | null {
+  const names = process.platform === 'win32' ? ['pi.cmd', 'pi.exe', 'pi'] : ['pi'];
+  for (const name of names) {
+    const p = join(nodeDir, name);
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+/**
  * Resolve `pi`: the npm .cmd shim spawns poorly without a shell on Windows,
  * so invoke the bundled cli.js via node directly.
  *
- * `explicit` (agent.pi_path) wins over the PATH lookup: a systemd unit's
- * Environment is invisible to an interactive shell, so without it the service
- * and `ac doctor` can resolve pi differently.
+ * Order: an explicit `agent.pi_path` first (it is the operator's decision),
+ * then PATH, then the runtime node's own directory.
  */
-export function resolvePiInvocation(envPath = process.env.PATH ?? '', explicit?: string): PiInvocation {
-  const found = explicit || which('pi', envPath);
+export function resolvePiInvocation(
+  envPath = process.env.PATH ?? '',
+  explicit?: string,
+  nodeDir = dirname(process.execPath),
+): PiInvocation {
+  const found = explicit || which('pi', envPath) || piBesideNode(nodeDir);
   if (found) {
     if (found.toLowerCase().endsWith('.cmd') || found.toLowerCase().endsWith('.bat')) {
       const js = join(
