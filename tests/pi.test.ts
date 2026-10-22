@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildPiArgv, extractLastMessage, PI_REVIEW_TOOLS, piBesideNode, resolvePiInvocation } from '../src/runners/pi.js';
+import { buildPiArgv, extractLastMessage, PI_REVIEW_TOOLS, piBesideNode, piEntryViaSymlink, resolvePiInvocation } from '../src/runners/pi.js';
 
 const piName = process.platform === 'win32' ? 'pi.cmd' : 'pi';
 
@@ -100,6 +100,47 @@ test('piBesideNode: returns null when the directory has no pi', () => {
   const dir = mkdtempSync(join(tmpdir(), 'pi-beside-'));
   try {
     assert.equal(piBesideNode(dir), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Symlinks need privileges on Windows; the assertion is POSIX-shaped anyway.
+const posixOnly = { skip: process.platform === 'win32' };
+
+test('piEntryViaSymlink: follows an npm-style link to the JS entry', posixOnly, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-link-'));
+  try {
+    const entry = join(dir, 'cli.js');
+    writeFileSync(entry, 'process.exit(0)\n');
+    const shim = join(dir, 'pi');
+    symlinkSync(entry, shim);
+    assert.equal(piEntryViaSymlink(shim), entry);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('piEntryViaSymlink: a plain script keeps the shim', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-plain-'));
+  try {
+    const shim = join(dir, 'pi');
+    writeFileSync(shim, '#!/bin/sh\nexec node "$@"\n');
+    assert.equal(piEntryViaSymlink(shim), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('resolvePiInvocation: a symlinked shim runs the entry with this node', posixOnly, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-inv-link-'));
+  try {
+    const entry = join(dir, 'cli.js');
+    writeFileSync(entry, 'process.exit(0)\n');
+    symlinkSync(entry, join(dir, 'pi'));
+    const inv = resolvePiInvocation(dir, undefined, dir);
+    assert.equal(inv.argv0, process.execPath);
+    assert.deepEqual(inv.prefix, [entry]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

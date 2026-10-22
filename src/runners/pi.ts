@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { runProc, scrubEnvForAgent, which } from '../proc.js';
 import type { AppConfig } from '../types.js';
 import type { AgentCallOpts, AgentCallResult } from './types.js';
@@ -23,6 +23,22 @@ export function piBesideNode(nodeDir: string): string | null {
     if (existsSync(p)) return p;
   }
   return null;
+}
+
+/**
+ * npm links `bin/pi` to `dist/bundle/cli.js`. Following it lets both platforms
+ * run the entry with this process's node instead of relying on the shim's
+ * `#!/usr/bin/env node`, which resolves through PATH and can pick a different
+ * node than the one running agent-control. Returns null for a real script or
+ * binary (a wrapper someone installed on purpose), so callers keep the shim.
+ */
+export function piEntryViaSymlink(shim: string): string | null {
+  try {
+    const abs = resolve(dirname(shim), readlinkSync(shim));
+    return abs.endsWith('.js') && existsSync(abs) ? abs : null;
+  } catch {
+    return null; // not a symlink
+  }
 }
 
 /**
@@ -53,6 +69,8 @@ export function resolvePiInvocation(
       const comspec = process.env.ComSpec ?? 'cmd.exe';
       return { argv0: comspec, prefix: ['/d', '/s', '/c', found] };
     }
+    const entry = piEntryViaSymlink(found);
+    if (entry) return { argv0: process.execPath, prefix: [entry] };
     return { argv0: found, prefix: [] };
   }
   return { argv0: 'pi', prefix: [] };

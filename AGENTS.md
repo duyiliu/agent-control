@@ -134,8 +134,28 @@ Start-ScheduledTask -TaskName agent-control
 The 214 deployment runs `agent-control.service` (systemd, root,
 `WorkingDirectory=/root/git/agent-control`, `ExecStart=/usr/local/node22/bin/node
 --import tsx src/cli.ts start`). Its `Environment=` line carries `HOME` plus a
-`PATH` that includes `/usr/local/node22/bin` — `pi` is only installed there, so
-an interactive SSH shell may not see it even though the service does.
+`PATH` that includes `/usr/local/node22/bin`.
+
+**Provisioning requirement:** after installing the node toolchain, expose its
+`bin` to the whole machine — not just to this unit:
+
+```bash
+# /etc/profile.d/node22.sh
+export PATH=/usr/local/node22/bin:$PATH
+```
+
+systemd does not read `profile.d`, so the unit still needs its own
+`Environment=`. But without the profile entry every interactive shell, manual
+`npm run ac`, and `ac doctor` resolves `pi` differently from the service — 214
+historically symlinked only `node` into `/usr/local/bin`, which left `pi`
+unreachable from a shell while the service saw it fine. PATH is a machine-level
+fact and belongs to provisioning, not to per-application workarounds.
+
+`pi` resolves as: `agent.pi_path` → `PATH` → the directory of the node running
+agent-control. Set `agent.pi_path` only for a layout that convention cannot
+derive. A symlinked `bin/pi` is followed to `dist/bundle/cli.js` and run with
+that same node, so both platforms take the same path and neither depends on the
+shim's `#!/usr/bin/env node` finding the same node through PATH.
 
 ```bash
 systemctl status agent-control
