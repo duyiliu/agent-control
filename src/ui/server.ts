@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { createReadStream, existsSync } from 'node:fs';
+import { createReadStream, statSync } from 'node:fs';
 import { timingSafeEqual } from 'node:crypto';
-import { extname, join, resolve } from 'node:path';
+import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppLog } from '../telemetry/logging.js';
 import { approveMergeTask, OpsError, retryTask, stopTask } from '../ops.js';
@@ -48,15 +48,24 @@ const MIME: Record<string, string> = {
 function serveStatic(path: string, res: ServerResponse): boolean {
   const rel = path === '/' ? 'index.html' : path.replace(/^\/+/, '');
   const file = resolve(join(UI_DIST, rel));
-  // Only files inside ui/dist are servable — no traversal.
-  if (!file.startsWith(UI_DIST)) return false;
-  if (!existsSync(file)) return false;
+  // Only files strictly inside ui/dist are servable — the trailing separator
+  // keeps a sibling like ui/dist2 from passing the prefix check.
+  if (!file.startsWith(UI_DIST + sep)) return false;
+  // A directory passes existsSync but makes the read stream emit EISDIR;
+  // on a directory fd that error is uncaught and kills the process.
+  const st = statSync(file, { throwIfNoEntry: false });
+  if (!st?.isFile()) return false;
   res.writeHead(200, {
     'content-type': MIME[extname(file)] ?? 'application/octet-stream',
     // index.html must not be cached: it pins the hashed bundle name.
     'cache-control': extname(file) === '.html' ? 'no-cache' : 'public, max-age=31536000, immutable',
   });
-  createReadStream(file).pipe(res);
+  const stream = createReadStream(file);
+  stream.on('error', () => {
+    if (!res.headersSent) res.writeHead(500);
+    res.end();
+  });
+  stream.pipe(res);
   return true;
 }
 

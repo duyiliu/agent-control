@@ -88,6 +88,10 @@ export class Store {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA journal_mode = WAL');
+    // WAL still allows only one writer; without a timeout a second connection
+    // (e.g. `ac stop` while the service holds a tx) fails with SQLITE_BUSY
+    // in under a millisecond instead of waiting.
+    this.db.exec('PRAGMA busy_timeout = 5000');
     this.db.exec('PRAGMA foreign_keys = ON');
     this.migrate();
   }

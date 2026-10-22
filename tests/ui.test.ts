@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { startUiServer } from '../src/ui/server.js';
 import { makeConfig, makeFakeTracker, makeStore, nullLog, teardown, tmpDir } from './helpers.js';
 
@@ -151,6 +152,22 @@ test('web ui', async (t) => {
     assert.match(r.headers.get('content-type') ?? '', /text\/html/);
     const body = await r.text();
     assert.ok(body.includes('<div id="root">') || body.includes('尚未构建'), 'index shell or not-built hint');
+  });
+
+  await t.test('GET an existing directory inside ui/dist is rejected, not streamed', async (t2) => {
+    // existsSync passes on directories; piping createReadStream(dir) emits an
+    // uncaught 'error' (EISDIR/EPERM) that used to kill the whole process.
+    const dist = fileURLToPath(new URL('../ui/dist', import.meta.url));
+    const sub = existsSync(dist)
+      ? readdirSync(dist).find((n) => statSync(join(dist, n)).isDirectory())
+      : undefined;
+    if (!sub) { t2.skip('ui/dist not built'); return; }
+    const r = await fetch(`${ui.url}/${sub}/`);
+    assert.equal(r.status, 404);
+    await r.text().catch(() => {});
+    // The server must still be alive to answer the next request.
+    const alive = await fetchJson(`${ui.url}/api/health`);
+    assert.equal(alive.pid, process.pid);
   });
 
   await t.test('GET /task/:404 and /api/tasks/:404', async () => {

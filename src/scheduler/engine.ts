@@ -613,7 +613,9 @@ export class Engine {
 
     // One conversation per run: FIXING continues the turn that produced the
     // failing diff instead of re-priming a cold process with the same facts.
-    const coderRef: { current: { session: CoderSession; logPath: string } | null } = { current: null };
+    const coderRef: {
+      current: { session: CoderSession; logPath: string; pid: number | null; identity: string | null } | null;
+    } = { current: null };
 
     try {
       let phase: Phase = run.phase;
@@ -634,6 +636,7 @@ export class Engine {
         mkdirSync(artifactsDir, { recursive: true });
         const stamp = Date.now();
         const logPath = join(artifactsDir, `agent-${stamp}.jsonl`);
+        const spawned: { pid: number | null; identity: string | null } = { pid: null, identity: null };
         const session = this.openCoderSessionFn({
           workdir: worktreePath,
           agentConfig: this.config.agent,
@@ -642,9 +645,13 @@ export class Engine {
           tools: PI_ALL_TOOLS,
           logPath,
           lastMessagePath: join(artifactsDir, `coder-last-${stamp}.txt`),
-          onSpawn: (pid, identity) => this.store.updateRunFields(run.run_id, { pid, process_identity: identity }),
+          onSpawn: (pid, identity) => {
+            spawned.pid = pid;
+            spawned.identity = identity;
+            this.store.updateRunFields(run.run_id, { pid, process_identity: identity });
+          },
         });
-        coderRef.current = { session, logPath };
+        coderRef.current = { session, logPath, pid: spawned.pid, identity: spawned.identity };
         return coderRef.current;
       };
 
@@ -731,6 +738,14 @@ export class Engine {
               skipped: skippedChecks(project.checks),
             });
             const summary = await this.callChecks(run, log, worktreePath, signal, headBeforeChecks);
+            // runChecks borrowed runs.pid for its transient check child. Point
+            // it back at the long-lived session process before FIXING or
+            // PUBLISHING_PR, or a crash there sees a dead pid and resume spawns
+            // a duplicate agent while the orphaned pi child still owns the
+            // worktree (its argv carries no worktree path for the orphan scan).
+            if (coderRef.current && coderRef.current.pid != null) {
+              store.updateRunFields(runId, { pid: coderRef.current.pid, process_identity: coderRef.current.identity });
+            }
             const headAfterChecks = await this.workspace.head(worktreePath).catch(() => null);
             const checksWorktreeClean = !(await this.workspace.isDirty(worktreePath));
             store.transition(runId, phase, phase, {

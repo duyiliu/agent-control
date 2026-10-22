@@ -595,6 +595,34 @@ test('stop during checks aborts their process before network polling completes',
   } finally { env.done(); }
 });
 
+test('runs.pid always names the long-lived coder session, not a finished check', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(90, { ...ISSUE });
+    const store = makeStore(env.dir); env.stores.push(store);
+    const engine = new Engine({
+      store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
+      workspace: fakeWorkspace(), appLog: nullLog, installDir: env.dir,
+      openCoderSessionFn: (opts) => {
+        opts.onSpawn?.(42, '42:1000');
+        return fakeCoderSession(async () => okCoder());
+      },
+      runReviewFn: reviewPass as never,
+      claimArbitrationMs: 0,
+      // The check phase borrows runs.pid for its own transient child; the run
+      // row must point back at the session pid once checks finish.
+      runChecksFn: async (_checks, _workdir, _logPathFor, _exec, _signal, onSpawn) => {
+        onSpawn?.(777);
+        return checksOk();
+      },
+    });
+    await tickAndDrain(engine);
+    const run = store.runsForTask(store.getTask('me/sandbox', 90)!.id).find((r) => r.kind === 'code')!;
+    assert.equal(run.pid, 42);
+    assert.equal(run.process_identity, '42:1000');
+  } finally { env.done(); }
+});
+
 test('checks infrastructure failure never triggers a code repair', async () => {
   const env = setup();
   try {

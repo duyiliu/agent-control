@@ -16,6 +16,8 @@ test('migrations are idempotent and schema_version recorded', () => {
     const checkCols = s2.db.prepare("PRAGMA table_info(check_results)").all() as { name: string }[];
     assert.ok(checkCols.some((c) => c.name === 'head_sha'));
     const taskCols = s2.db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[];
+    const busy = s2.db.prepare('PRAGMA busy_timeout').get() as { timeout: number };
+    assert.ok(busy.timeout > 0, 'second connections (CLI) must wait instead of failing fast with SQLITE_BUSY');
     assert.ok(taskCols.some((c) => c.name === 'pending_fix') && taskCols.some((c) => c.name === 'merge_attempts') && taskCols.some((c) => c.name === 'approved_sha'));
     assert.ok(taskCols.some((c) => c.name === 'source'));
     s2.close();

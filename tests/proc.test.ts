@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pidAlive, runProc, scrubEnvForAgent, which } from '../src/proc.js';
@@ -79,6 +80,22 @@ test('runProc stdinData is piped and stdin closed', async () => {
   assert.match(res.stdoutTail, /got:payload-123/);
 });
 
+test('runProc survives when the log path cannot be opened', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ac-proclog-'));
+  try {
+    // A directory as logPath fails asynchronously (EISDIR/EPERM); an
+    // unhandled stream 'error' there used to kill the scheduler process.
+    const res = await runProc({
+      argv: [process.execPath, '-e', 'process.exit(0)'],
+      timeoutMs: 10_000,
+      logPath: dir,
+    });
+    assert.equal(res.exitCode, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('scrubEnvForAgent: allowlist only — ambient secrets never pass', () => {
   const env = {
     PATH: '/x',
@@ -111,7 +128,9 @@ test('which finds node on this machine', () => {
 
 test('pidAlive detects own pid and dead pid', () => {
   assert.equal(pidAlive(process.pid), true);
-  assert.equal(pidAlive(2 ** 22), false); // implausible pid
+  // 2**22 is Linux's default pid_max — a real process can own it. Above the
+  // max a pid cannot exist (and Windows pids are multiples of 4).
+  assert.equal(pidAlive(2 ** 22 + 1), false);
 });
 
 test('parseWorktreeList parses porcelain output', () => {

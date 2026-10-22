@@ -68,6 +68,9 @@ export function runProc(opts: RunProcOpts): Promise<ProcResult> {
     if (opts.logPath) {
       mkdirSync(dirname(opts.logPath), { recursive: true });
       log = createWriteStream(opts.logPath, { flags: 'a' });
+      // Open/write failures arrive on 'error'; unhandled they kill the
+      // scheduler (a directory logPath raises EISDIR the same way).
+      log.on('error', () => { /* logging is best-effort */ });
       log.write(`\n===== ${new Date().toISOString()} $ ${opts.argv.join(' ')}\n`);
     }
 

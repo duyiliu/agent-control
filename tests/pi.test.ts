@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildPiArgv, extractLastMessage, PI_REVIEW_TOOLS, piBesideNode, piEntryViaSymlink, resolvePiInvocation } from '../src/runners/pi.js';
@@ -70,7 +70,10 @@ test('resolvePiInvocation: falls back to the runtime node directory', () => {
   // beside the runtime node is the "current user's default install" fallback.
   const dir = mkdtempSync(join(tmpdir(), 'pi-node-'));
   try {
-    writeFileSync(join(dir, piName), '#!/bin/sh\n');
+    // POSIX which() requires X_OK; a non-executable shim must not win.
+    const shim = join(dir, piName);
+    writeFileSync(shim, '#!/bin/sh\n');
+    chmodSync(shim, 0o755);
     const inv = resolvePiInvocation('/definitely/not/on/path', undefined, dir);
     assert.notEqual(inv.argv0, 'pi');
   } finally {
@@ -84,8 +87,10 @@ test('resolvePiInvocation: PATH wins over discovery so it stays overridable', ()
   const nodeDir = mkdtempSync(join(tmpdir(), 'pi-rank-node-'));
   const pathDir = mkdtempSync(join(tmpdir(), 'pi-rank-path-'));
   try {
-    writeFileSync(join(nodeDir, piName), '#!/bin/sh\n');
-    writeFileSync(join(pathDir, piName), '#!/bin/sh\n');
+    for (const d of [nodeDir, pathDir]) {
+      writeFileSync(join(d, piName), '#!/bin/sh\n');
+      chmodSync(join(d, piName), 0o755); // POSIX which() filters out non-executable names
+    }
     const inv = resolvePiInvocation(pathDir, undefined, nodeDir);
     const parts = [inv.argv0, ...inv.prefix];
     assert.ok(parts.some((s) => s.includes(pathDir)), `expected PATH pi, got ${parts.join(' ')}`);
