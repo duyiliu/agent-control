@@ -163,6 +163,12 @@ systemctl restart agent-control    # single instance: systemd stops the old one 
 journalctl -u agent-control -n 50 --no-pager
 ```
 
+Deploying to 214 is git-mediated: commit and push `main` locally, then
+`ssh root@192.168.1.214 "cd /root/git/agent-control && git pull --ff-only &&
+systemctl restart agent-control"`. The unit runs from `src/` via tsx, so a
+backend-only change needs no build step; rebuild `ui/dist` on the box only
+when `ui/` changed.
+
 After restart: `systemctl is-active` says `active`, the tail of
 `<logs_dir>/agent-control.jsonl` shows `ui_start` + `reconcile_done`, and
 `agent-control.lock` carries the new pid with a fresh heartbeat.
