@@ -31,6 +31,11 @@ export function piBesideNode(nodeDir: string): string | null {
  *
  * Order: an explicit `agent.pi_path` first (it is the operator's decision),
  * then PATH, then the runtime node's own directory.
+ *
+ * PATH stays ahead of discovery so it remains overridable — tests inject a shim
+ * through PATH, and an operator may wrap pi with a script. Discovery only
+ * covers the case where PATH does not have pi at all, which is exactly what
+ * happens when the service unit's Environment is not inherited by a shell.
  */
 export function resolvePiInvocation(
   envPath = process.env.PATH ?? '',

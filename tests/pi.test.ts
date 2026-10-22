@@ -78,6 +78,24 @@ test('resolvePiInvocation: falls back to the runtime node directory', () => {
   }
 });
 
+test('resolvePiInvocation: PATH wins over discovery so it stays overridable', () => {
+  // Operators wrap pi with scripts and tests inject shims via PATH, so PATH
+  // must keep the ability to override the discovered default.
+  const nodeDir = mkdtempSync(join(tmpdir(), 'pi-rank-node-'));
+  const pathDir = mkdtempSync(join(tmpdir(), 'pi-rank-path-'));
+  try {
+    writeFileSync(join(nodeDir, piName), '#!/bin/sh\n');
+    writeFileSync(join(pathDir, piName), '#!/bin/sh\n');
+    const inv = resolvePiInvocation(pathDir, undefined, nodeDir);
+    const parts = [inv.argv0, ...inv.prefix];
+    assert.ok(parts.some((s) => s.includes(pathDir)), `expected PATH pi, got ${parts.join(' ')}`);
+    assert.ok(!parts.some((s) => s.includes(nodeDir)));
+  } finally {
+    rmSync(nodeDir, { recursive: true, force: true });
+    rmSync(pathDir, { recursive: true, force: true });
+  }
+});
+
 test('piBesideNode: returns null when the directory has no pi', () => {
   const dir = mkdtempSync(join(tmpdir(), 'pi-beside-'));
   try {
