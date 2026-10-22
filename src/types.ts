@@ -91,6 +91,14 @@ export interface AppConfig {
     review_model?: string;
     review_reasoning_effort?: ReasoningEffort;
     env_deny: string[];
+    /**
+     * Absolute path to the pi executable. Required when pi is not on the
+     * service's PATH — a systemd unit's Environment is not inherited by an
+     * interactive shell, so `ac doctor` and any manual run would otherwise
+     * resolve pi differently from the service. Falls back to a PATH lookup
+     * when unset.
+     */
+    pi_path?: string;
   };
   approvals: {
     /** Host-side auto-merge for low-risk PRs that pass review. */

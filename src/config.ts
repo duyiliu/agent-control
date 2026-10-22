@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import YAML from 'yaml';
 import type { AppConfig, CheckSpec, ProjectConfig } from './types.js';
@@ -123,6 +123,12 @@ export function loadConfig(path: string): AppConfig {
   if (!Array.isArray(envDeny) || envDeny.some((e) => typeof e !== 'string')) {
     fail('agent.env_deny must be a string array');
   }
+  // Fail here rather than at spawn time: a wrong path would otherwise surface
+  // as a mysterious run failure much later.
+  const piPath = agent['pi_path'] !== undefined ? asStr(agent['pi_path'], 'agent.pi_path') : undefined;
+  if (piPath !== undefined && !existsSync(piPath)) {
+    fail(`agent.pi_path does not exist: ${piPath}`);
+  }
 
   const approvals = asObj(root['approvals'] ?? {}, 'approvals');
   const autoMerge = asObj(approvals['auto_merge'] ?? {}, 'approvals.auto_merge');
@@ -163,6 +169,7 @@ export function loadConfig(path: string): AppConfig {
       review_model: agent['review_model'] !== undefined ? asStr(agent['review_model'], 'agent.review_model') : undefined,
       review_reasoning_effort: reviewEffort as AppConfig['agent']['review_reasoning_effort'],
       env_deny: envDeny as string[],
+      pi_path: piPath,
     },
     approvals: {
       auto_merge: {

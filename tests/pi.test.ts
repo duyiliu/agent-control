@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildPiArgv, extractLastMessage, PI_REVIEW_TOOLS } from '../src/runners/pi.js';
+import { buildPiArgv, extractLastMessage, PI_REVIEW_TOOLS, resolvePiInvocation } from '../src/runners/pi.js';
 
 const inv = { argv0: 'node', prefix: ['/x/cli.js'] };
 
@@ -40,6 +40,19 @@ test('extractLastMessage: last assistant text blocks win', () => {
     JSON.stringify({ type: 'agent_end' }),
   ].join('\n');
   assert.equal(extractLastMessage(jsonl), '{"verdict":"PASS"}');
+});
+
+test('resolvePiInvocation: explicit pi_path wins over the PATH lookup', () => {
+  // A systemd-only PATH is invisible to an interactive shell, so an explicit
+  // path must decide regardless of what PATH says.
+  const inv = resolvePiInvocation('/definitely/not/on/path', '/opt/node/bin/pi');
+  assert.equal(inv.argv0, '/opt/node/bin/pi');
+  assert.deepEqual(inv.prefix, []);
+});
+
+test('resolvePiInvocation: unset pi_path falls back to PATH', () => {
+  const inv = resolvePiInvocation('/definitely/not/on/path', undefined);
+  assert.equal(inv.argv0, 'pi'); // unresolved marker used by doctor
 });
 
 test('extractLastMessage: no assistant text → null', () => {

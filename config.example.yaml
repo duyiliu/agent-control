@@ -32,6 +32,12 @@ agent:
   # reasoning_effort: medium          # optional — Pi --thinking level; unset = Pi default
   # review_model: new-api/GLM-5.3-Flash  # optional — use a different model for review
   # review_reasoning_effort: low     # optional — override review thinking level
+  # pi_path: /usr/local/node22/bin/pi  # optional — absolute path to pi. Set this
+  #                                    # when pi is not on the service's PATH: a
+  #                                    # systemd unit's Environment is not inherited
+  #                                    # by an interactive shell, so without it
+  #                                    # `ac doctor` resolves pi differently from
+  #                                    # the running service. Unset = PATH lookup.
   env_deny:
     - GH_TOKEN
     - GITHUB_TOKEN

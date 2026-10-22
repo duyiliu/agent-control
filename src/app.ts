@@ -215,10 +215,10 @@ export async function runDoctor(config: AppConfig | null, configError?: string):
   }
 
   // Resolve npm .cmd shims explicitly; spawn cannot invoke them directly on Windows.
-  const inv = resolvePiInvocation();
+  const inv = resolvePiInvocation(process.env.PATH ?? '', config?.agent.pi_path);
   const runnerArgv = (args: string[]) => [inv.argv0, ...inv.prefix, ...args];
   if (inv.argv0 === 'pi') {
-    items.push({ name: 'pi', status: 'FAIL', detail: 'not on PATH' });
+    items.push({ name: 'pi', status: 'FAIL', detail: 'not on PATH — set agent.pi_path to an absolute path' });
     items.push({ name: 'pi-invocation', status: 'FAIL', detail: 'unresolved' });
   } else {
     const v = await runProc({ argv: runnerArgv(['--version']), timeoutMs: 20_000 });

@@ -111,7 +111,7 @@ export class PiCoderSession implements CoderSession {
   private exitInfo: { code: number | null; signal: string | null } | null = null;
 
   constructor(private readonly opts: CoderSessionOpts) {
-    const inv = opts.invocation ?? resolvePiInvocation();
+    const inv = opts.invocation ?? resolvePiInvocation(process.env.PATH ?? '', opts.agentConfig.pi_path);
     const argv = buildRpcArgv(
       { tools: opts.tools, model: opts.model, thinking: opts.thinking },
       inv,

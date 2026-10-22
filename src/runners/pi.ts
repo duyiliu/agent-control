@@ -12,9 +12,13 @@ export interface PiInvocation {
 /**
  * Resolve `pi`: the npm .cmd shim spawns poorly without a shell on Windows,
  * so invoke the bundled cli.js via node directly.
+ *
+ * `explicit` (agent.pi_path) wins over the PATH lookup: a systemd unit's
+ * Environment is invisible to an interactive shell, so without it the service
+ * and `ac doctor` can resolve pi differently.
  */
-export function resolvePiInvocation(envPath = process.env.PATH ?? ''): PiInvocation {
-  const found = which('pi', envPath);
+export function resolvePiInvocation(envPath = process.env.PATH ?? '', explicit?: string): PiInvocation {
+  const found = explicit || which('pi', envPath);
   if (found) {
     if (found.toLowerCase().endsWith('.cmd') || found.toLowerCase().endsWith('.bat')) {
       const js = join(
@@ -122,7 +126,7 @@ export async function runPi(
   config: AppConfig['agent'],
   invocation?: PiInvocation,
 ): Promise<AgentCallResult> {
-  const inv = invocation ?? resolvePiInvocation();
+  const inv = invocation ?? resolvePiInvocation(process.env.PATH ?? '', config.pi_path);
   const promptPath = join(dirname(opts.lastMessagePath), `pi-prompt-${Date.now()}.txt`);
   writeFileSync(promptPath, opts.prompt, 'utf8');
 
