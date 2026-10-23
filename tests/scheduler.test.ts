@@ -11,7 +11,7 @@ import type { AgentCallResult } from '../src/runners/types.js';
 import type { CoderSession, CoderTurn } from '../src/runners/session.js';
 import { runChecks, type ChecksSummary } from '../src/verify/checks.js';
 import { stopTask } from '../src/ops.js';
-import type { AppConfig, ReviewResult } from '../src/types.js';
+import type { AppConfig, CheckSpec, ReviewResult } from '../src/types.js';
 import { makeConfig, makeFakeTracker, makeStore, nullLog, teardown } from './helpers.js';
 import type { Store } from '../src/store/sqlite.js';
 
@@ -24,6 +24,7 @@ function fakeWorkspace(calls?: string[]): GitWorkspace {
   return {
     ensureWorktree: async (i: { worktreePath: string }) => ({ path: i.worktreePath, created: true }),
     isDirty: async () => false,
+    dirtyUnder: async () => '',
     head: async (p?: string) => siteHeads.get(p ?? '') ?? 'head-sha',
     commitAll: async () => false,
     aheadCount: async () => 1,
@@ -33,6 +34,7 @@ function fakeWorkspace(calls?: string[]): GitWorkspace {
     resetHard: async (_p: string, ref: string) => { calls?.push(`reset:${ref}`); },
     addDetachedWorktree: async (_repo: string, sha: string, p: string) => { siteHeads.set(p, sha); return p; },
     removeWorktree: async (_repo: string, p: string) => { calls?.push(`rm-wt:${p}`); },
+    pruneWorktrees: async () => {},
     deleteLocalBranch: async (_repo: string, b: string) => { calls?.push(`del-local:${b}`); },
     deleteRemoteBranch: async (_repo: string, b: string) => { calls?.push(`del-remote:${b}`); },
   } as unknown as GitWorkspace;
@@ -100,6 +102,7 @@ function setup(): Env {
 function makeEngine(env: Env, over: {
   coder?: () => Promise<AgentCallResult>;
   checks?: () => Promise<ChecksSummary>;
+  runChecksFn?: typeof runChecks;
   review?: ReviewFn;
   workspace?: GitWorkspace;
 } = {}) {
@@ -113,7 +116,7 @@ function makeEngine(env: Env, over: {
     appLog: nullLog,
     installDir: env.dir,
     openCoderSessionFn: () => fakeCoderSession(over.coder ?? (async () => okCoder())),
-    runChecksFn: over.checks ? async () => over.checks!() : async () => checksOk(),
+    runChecksFn: over.runChecksFn ?? (over.checks ? async () => over.checks!() : async () => checksOk()),
     runReviewFn: (over.review ?? reviewPass) as never,
     claimArbitrationMs: 0,
   });
@@ -783,7 +786,7 @@ test('workspace publishes the reviewed SHA rather than a moving branch ref', asy
     calls.push(opts.argv);
     return { exitCode: 0, signal: null, timedOut: false, aborted: false, durationMs: 1, stdoutTail: '', stderrTail: '' };
   });
-  await ws.push('.', 'agent/issue-1', 'reviewed-sha');
+  await ws.push('.', 'agent/issue-1', 'origin', 'reviewed-sha');
   assert.deepEqual(calls[0], ['git', 'push', 'origin', 'reviewed-sha:refs/heads/agent/issue-1']);
 });
 
@@ -1021,10 +1024,40 @@ test('risk: a newly added test file does not block auto-merge', async () => {
   } finally { env.done(); }
 });
 
-test('risk: editing an existing test file keeps the human merge gate', async () => {
+test('risk: weakened test coverage keeps the human merge gate', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(61, { ...ISSUE });
+    env.config.approvals.auto_merge.enabled = true;
+    const ws = fakeWorkspace();
+    ws.diffVsBase = async () => [
+      'diff --git a/src/x.js b/src/x.js',
+      'index 1111111..2222222 100644',
+      '--- a/src/x.js',
+      '+++ b/src/x.js',
+      '@@ -1 +1 @@',
+      '-a', '+b',
+      'diff --git a/tests/x.test.js b/tests/x.test.js',
+      'index 3333333..4444444 100644',
+      '--- a/tests/x.test.js',
+      '+++ b/tests/x.test.js',
+      '@@ -1,20 +1 @@',
+      ...Array.from({ length: 20 }, (_, i) => `-assert.strictEqual(x, ${i})`),
+      '+assert.ok(true)',
+    ].join('\n');
+    const { store, engine } = makeEngine(env, { workspace: ws });
+    await tickAndDrain(engine);
+    await tickAndDrain(engine);
+    assert.equal(store.getTask('me/sandbox', 61)!.status, 'AWAITING_HUMAN');
+    assert.equal(env.tracker.merged.length, 0);
+    assert.ok(env.tracker.labelsAdded.some(([n, l]) => n === 61 && l === 'agent-high-risk'));
+  } finally { env.done(); }
+});
+
+test('risk: an edited test file is not weakened coverage and still auto-merges', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(66, { ...ISSUE });
     env.config.approvals.auto_merge.enabled = true;
     const ws = fakeWorkspace();
     ws.diffVsBase = async () => [
@@ -1044,9 +1077,96 @@ test('risk: editing an existing test file keeps the human merge gate', async () 
     const { store, engine } = makeEngine(env, { workspace: ws });
     await tickAndDrain(engine);
     await tickAndDrain(engine);
-    assert.equal(store.getTask('me/sandbox', 61)!.status, 'AWAITING_HUMAN');
+    await tickAndDrain(engine);
+    assert.equal(store.getTask('me/sandbox', 66)!.status, 'COMPLETED');
+    assert.equal(env.tracker.merged.length, 1);
+  } finally { env.done(); }
+});
+
+test('verify_build: generated output drifting from source blocks the merge', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(67, { ...ISSUE });
+    env.config.approvals.auto_merge.enabled = true;
+    const ws = fakeWorkspace();
+    ws.diffVsBase = async () => DIFF_NEW_TEST;
+    const { store, engine } = makeEngine(env, { workspace: ws });
+    await tickAndDrain(engine); // code run → publish
+    await tickAndDrain(engine); // review PASS → MERGING
+    const task = store.getTask('me/sandbox', 67)!;
+    mkdirSync(store.lastCodeWorkspace(task.id)!, { recursive: true });
+    env.config.approvals.auto_merge.verify_build = { argv: ['npm', 'run', 'build'] };
+    ws.dirtyUnder = async () => ' M dist/bundle.js';
+    await tickAndDrain(engine); // sweep: drift → human
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
     assert.equal(env.tracker.merged.length, 0);
-    assert.ok(env.tracker.labelsAdded.some(([n, l]) => n === 61 && l === 'agent-high-risk'));
+    assert.ok(env.tracker.labelsAdded.some(([n, l]) => n === 67 && l === 'agent-high-risk'));
+  } finally { env.done(); }
+});
+
+test('verify_build: missing code worktree falls back to a detached verify site', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(69, { ...ISSUE });
+    env.config.approvals.auto_merge.enabled = true;
+    const calls: string[] = [];
+    const ws = fakeWorkspace(calls);
+    ws.diffVsBase = async () => DIFF_NEW_TEST;
+    const seen: string[][] = [];
+    const { store, engine } = makeEngine(env, {
+      workspace: ws,
+      runChecksFn: async (checks: CheckSpec[]) => { seen.push(checks.map((c) => c.argv.join(' '))); return checksOk(); },
+    });
+    await tickAndDrain(engine); // code run → publish
+    await tickAndDrain(engine); // review PASS → MERGING
+    const task = store.getTask('me/sandbox', 69)!;
+    // The recorded worktree path is never materialized — the sweep must
+    // rebuild the approved sha on a detached site, bootstrapping deps first.
+    env.config.approvals.auto_merge.verify_bootstrap = { argv: ['npm', 'ci'] };
+    env.config.approvals.auto_merge.verify_build = { argv: ['npm', 'run', 'build'] };
+    await tickAndDrain(engine);
+    assert.equal(store.getTaskById(task.id)!.status, 'COMPLETED');
+    assert.equal(env.tracker.merged.length, 1);
+    assert.deepEqual(seen.at(-1), ['npm ci', 'npm run build']);
+    assert.ok(calls.some((c) => c.startsWith('rm-wt:'))); // detached site reclaimed
+  } finally { env.done(); }
+});
+
+test('verify_build: detached materialization failure fails closed to a human', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(70, { ...ISSUE });
+    env.config.approvals.auto_merge.enabled = true;
+    const ws = fakeWorkspace();
+    ws.diffVsBase = async () => DIFF_NEW_TEST;
+    ws.addDetachedWorktree = async () => { throw new Error('nope'); };
+    const { store, engine } = makeEngine(env, { workspace: ws });
+    await tickAndDrain(engine); // code run → publish
+    await tickAndDrain(engine); // review PASS → MERGING
+    const task = store.getTask('me/sandbox', 70)!;
+    env.config.approvals.auto_merge.verify_build = { argv: ['npm', 'run', 'build'] };
+    await tickAndDrain(engine); // sweep: cannot materialize a site → human
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
+    assert.equal(env.tracker.merged.length, 0);
+  } finally { env.done(); }
+});
+
+test('verify_build: a reproducible build still merges', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(68, { ...ISSUE });
+    env.config.approvals.auto_merge.enabled = true;
+    const ws = fakeWorkspace();
+    ws.diffVsBase = async () => DIFF_NEW_TEST;
+    const { store, engine } = makeEngine(env, { workspace: ws });
+    await tickAndDrain(engine);
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 68)!;
+    mkdirSync(store.lastCodeWorkspace(task.id)!, { recursive: true });
+    env.config.approvals.auto_merge.verify_build = { argv: ['npm', 'run', 'build'] };
+    await tickAndDrain(engine);
+    assert.equal(store.getTaskById(task.id)!.status, 'COMPLETED');
+    assert.equal(env.tracker.merged.length, 1);
   } finally { env.done(); }
 });
 

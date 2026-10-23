@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { approvalHash } from './tracker/github.js';
 import { runProcessRisk, type ProcessSafetyDeps } from './proc.js';
 import type { Store } from './store/sqlite.js';
@@ -7,6 +9,7 @@ import { RUN_ACTIVE_PHASES } from './types.js';
 /** Minimal tracker surface the shared stop/retry actions need. */
 export interface OpsTracker {
   getIssue(repo: string, issueNumber: number): Promise<IssueData | null>;
+  getPrState(repo: string, prNumber: number): Promise<'MERGED' | 'CLOSED' | 'OPEN'>;
   removeLabel(repo: string, issueNumber: number, label: string): Promise<void>;
   addPrLabel(repo: string, prNumber: number, label: string): Promise<void>;
   removePrLabel(repo: string, prNumber: number, label: string): Promise<void>;
@@ -15,6 +18,52 @@ export interface OpsTracker {
 const RETRYABLE: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'RECOVERY_REQUIRED', 'CANCELED', 'FAILED'];
 
 export class OpsError extends Error {}
+
+// ---------------- drain (pause dispatch, wait for in-flight runs) ----------------
+
+/**
+ * Pause all new work (discovery, code/review dispatch, merge sweep) while
+ * letting in-flight runs finish. The request is a nonce in the meta table —
+ * persisted, so it survives a restart — and the engine writes the same nonce
+ * to drain_ack once it observes a fully quiet scheduler.
+ */
+export function requestDrain(store: Store): string {
+  const id = randomUUID();
+  store.tx(() => {
+    store.setMeta('drain_requested', id);
+    store.setMeta('drain_ack', '');
+  });
+  return id;
+}
+
+/** Lift a drain: clear both keys so the next tick resumes normal dispatch. */
+export function resumeDispatch(store: Store): void {
+  store.tx(() => {
+    store.setMeta('drain_requested', '');
+    store.setMeta('drain_ack', '');
+  });
+}
+
+/**
+ * Wait for the engine to acknowledge THIS drain request. The poll first
+ * re-verifies the request is still ours — a cleared or replaced request
+ * means the wait can never resolve — then requires ack === requestId. An
+ * idle-looking DB or an older ack is never treated as drained.
+ */
+export async function waitForDrain(store: Store, requestId: string, timeoutMs: number, pollMs = 250): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const requested = store.getMeta('drain_requested');
+    if (requested !== requestId) {
+      throw new OpsError(requested ? '排空请求已被更新的请求替换' : '排空请求已被取消（undrain）');
+    }
+    if (store.getMeta('drain_ack') === requestId) return;
+    if (Date.now() >= deadline) {
+      throw new OpsError(`等待排空超时（${Math.round(timeoutMs / 1000)}s）；调度仍保持暂停，可用 undrain 恢复或稍后重试 drain`);
+    }
+    await sleep(pollMs);
+  }
+}
 
 export function stopTask(store: Store, task: TaskRow): string {
   const run = store.activeRunForTask(task.id);
@@ -124,6 +173,11 @@ export async function retryTask(
   }
   if (issue.labels.includes('agent-running')) {
     throw new OpsError('issue 带有 agent-running 标签；请先确认没有调度器持有它，再移除过期标签并重试');
+  }
+
+  const prNum = task.pr_url?.match(/\/pull\/(\d+)/)?.[1];
+  if (prNum && await tracker.getPrState(task.repo, Number(prNum)) === 'CLOSED') {
+    throw new OpsError(`关联 PR #${prNum} 已关闭；请先重新打开 PR，再重试任务`);
   }
 
   store.tx(() => {

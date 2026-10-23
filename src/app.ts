@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { Store } from './store/sqlite.js';
 import { Engine } from './scheduler/engine.js';
 import { reconcile } from './scheduler/recovery.js';
-import { GitHubTracker } from './tracker/github.js';
+import { GitHubTracker, SYSTEM_LABELS } from './tracker/github.js';
 import { GitWorkspace } from './workspace/git.js';
 import { AppLog } from './telemetry/logging.js';
 import { pidAlive, processStartedAt, runProc, which } from './proc.js';
@@ -100,13 +100,16 @@ function safeRead(file: string): { pid?: number; heartbeat_at?: string; started_
 
 export interface App {
   config: AppConfig;
+  /** Where the running config came from — the UI writes project additions
+   *  back to it. Undefined only when a config was fabricated in-process. */
+  configPath?: string;
   store: Store;
   engine: Engine;
   lock: InstanceLock;
   tracker: GitHubTracker;
 }
 
-export function createApp(config: AppConfig): App {
+export function createApp(config: AppConfig, configPath?: string): App {
   const store = new Store(config.server.database);
   const appLog = new AppLog(config.server.logs_dir);
   const tracker = new GitHubTracker();
@@ -117,7 +120,7 @@ export function createApp(config: AppConfig): App {
     store, config, tracker, workspace, appLog, installDir,
   });
   const lock = new InstanceLock(config.server.database);
-  return { config, store, engine, lock, tracker };
+  return { config, configPath, store, engine, lock, tracker };
 }
 
 export async function startService(app: App): Promise<void> {
@@ -131,7 +134,13 @@ export async function startService(app: App): Promise<void> {
   if (config.server.ui.enabled) {
     try {
       ui = await startUiServer({
-        deps: { store, config, tracker, activeCount: () => engine.activeCount() },
+        deps: {
+          store, config, tracker, activeCount: () => engine.activeCount(),
+          configPath: app.configPath,
+          checkRepoExists: (repo) => tracker.checkRepoExists(repo),
+          resolveRepo: (repo) => tracker.resolveRepo(repo),
+          provisionRepo: (repo, readyLabel) => provisionLabels(tracker, repo, readyLabel),
+        },
         host: config.server.ui.host,
         port: config.server.ui.port,
         appLog,
@@ -162,20 +171,26 @@ export async function startService(app: App): Promise<void> {
         }));
       } catch { /* db closed */ }
     });
-  await tick();
-  const timer = setInterval(tick, tickMs);
 
+  // Signal handlers must exist before the first dispatch tick — a shutdown
+  // arriving mid-dispatch is a suspend, never a cancel. `timer` is assigned
+  // after `await tick()`, so it is a let declared before the handler.
   let stopping = false;
+  let timer: NodeJS.Timeout | null = null;
   const shutdown = async (sig: string) => {
     if (stopping) return;
     stopping = true;
     appLog.event('service_stop', { sig });
     ui?.close();
-    clearInterval(timer);
+    if (timer) clearInterval(timer);
     clearInterval(cancelTimer);
-    for (const run of store.activeRuns()) engine.abortRun(run.run_id, 'service shutdown');
-    // Give in-flight runs a moment to land in CANCELED.
-    await new Promise((r) => setTimeout(r, 3_000));
+    // Coding runs suspend (stay active with their persisted Pi session) and
+    // are resumed by the next boot's reconcile; this only waits — bounded —
+    // for each run's finally/session.close. A run that cannot settle inside
+    // the budget is left to the restart's PID/orphan checks: never write
+    // CANCELED, never clear a pid we cannot prove dead.
+    const quiet = await engine.shutdown(10_000);
+    if (!quiet) appLog.event('shutdown_incomplete', { active: engine.activeCount() });
     lock.release();
     store.close();
     process.exit(0);
@@ -189,6 +204,29 @@ export async function startService(app: App): Promise<void> {
   if (process.platform === 'win32') {
     process.on('SIGBREAK', () => void shutdown('SIGBREAK'));
   }
+
+  await tick();
+  if (!stopping) timer = setInterval(tick, tickMs);
+}
+
+/** Best-effort label provisioning for a UI-added project; returns warnings. */
+async function provisionLabels(tracker: GitHubTracker, repo: string, readyLabel: string): Promise<string[]> {
+  const warnings: string[] = [];
+  const wanted = [...new Set([readyLabel, ...SYSTEM_LABELS])];
+  let missing: string[];
+  try {
+    missing = (await tracker.ensureLabels(repo, wanted)).missing;
+  } catch (err) {
+    return [`标签检查失败：${String(err).slice(0, 120)}`];
+  }
+  for (const name of missing) {
+    try {
+      await tracker.createLabel(repo, name);
+    } catch (err) {
+      warnings.push(`标签 ${name} 创建失败：${String(err).slice(0, 120)}`);
+    }
+  }
+  return warnings;
 }
 
 // ---------------- doctor ----------------

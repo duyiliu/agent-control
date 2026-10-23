@@ -88,7 +88,7 @@ const PHASE_LABEL: Record<Phase, string> = {
   RECOVERY_REQUIRED: '需恢复',
 };
 
-export const phaseLabel = (p: Phase) => PHASE_LABEL[p] ?? p;
+export const phaseLabel = (p: Phase | string) => PHASE_LABEL[p as Phase] ?? p;
 export const phaseHex = (p: Phase) => TONE_HEX[PHASE_TONE[p]];
 export const phaseTextClass = (p: Phase) => TONE_TEXT[PHASE_TONE[p]];
 /** Any phase where a live process is still working (coding or reviewing). */

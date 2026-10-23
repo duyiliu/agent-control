@@ -75,6 +75,16 @@ export class GitWorkspace {
     return res.stdoutTail.trim().length > 0;
   }
 
+  /** Uncommitted entries matching the given globs (git `:(glob)` pathspec). */
+  async dirtyUnder(worktreePath: string, globs: readonly string[]): Promise<string> {
+    if (globs.length === 0) return '';
+    const res = await this.git(
+      ['status', '--porcelain', '--', ...globs.map((glob) => `:(glob)${glob}`)],
+      worktreePath,
+    );
+    return res.stdoutTail.trim();
+  }
+
   /** HEAD sha — a moved ref is tampering `status --porcelain` cannot see. */
   async head(worktreePath: string): Promise<string> {
     const res = await this.git(['rev-parse', 'HEAD'], worktreePath);
@@ -114,20 +124,20 @@ export class GitWorkspace {
     return out;
   }
 
-  async push(worktreePath: string, branch: string, reviewedHead?: string): Promise<void> {
+  async push(worktreePath: string, branch: string, remote: string, reviewedHead?: string): Promise<void> {
     const args = reviewedHead
-      ? ['push', 'origin', `${reviewedHead}:refs/heads/${branch}`]
-      : ['push', '-u', 'origin', branch];
+      ? ['push', remote, `${reviewedHead}:refs/heads/${branch}`]
+      : ['push', '-u', remote, branch];
     await this.git(args, worktreePath, 180_000);
   }
 
   /**
    * Fetch a branch so a remote head sha resolves locally. The explicit
-   * destination refspec materializes refs/remotes/origin/<branch> even on
+   * destination refspec materializes refs/remotes/<remote>/<branch> even on
    * clones whose configured fetch refspec only covers the default branch.
    */
-  async fetchBranch(repoDir: string, branch: string): Promise<void> {
-    await this.git(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], repoDir, 120_000);
+  async fetchBranch(repoDir: string, branch: string, remote: string): Promise<void> {
+    await this.git(['fetch', remote, `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`], repoDir, 120_000);
   }
 
   /** Hard-reset a worktree to a ref (fix runs sync to the remote PR head). */
@@ -151,14 +161,20 @@ export class GitWorkspace {
     await this.git(['worktree', 'remove', '--force', worktreePath], repoDir);
   }
 
+  /** Drop registrations for worktrees whose directories vanished — a crashed
+   *  verify sweep can leave one behind and block re-adding the same path. */
+  async pruneWorktrees(repoDir: string): Promise<void> {
+    await this.git(['worktree', 'prune'], repoDir);
+  }
+
   /** Delete the agent branch ref left in the main repo after worktree removal. */
   async deleteLocalBranch(repoDir: string, branch: string): Promise<void> {
     await this.git(['branch', '-D', branch], repoDir);
   }
 
   /** Delete the merged remote agent branch. */
-  async deleteRemoteBranch(repoDir: string, branch: string): Promise<void> {
-    await this.git(['push', 'origin', '--delete', branch], repoDir, 120_000);
+  async deleteRemoteBranch(repoDir: string, branch: string, remote: string): Promise<void> {
+    await this.git(['push', remote, '--delete', branch], repoDir, 120_000);
   }
 
   /** Parse `git worktree list --porcelain` output. */

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildPiArgv, extractLastMessage, PI_REVIEW_TOOLS, piBesideNode, piEntryViaSymlink, resolvePiInvocation } from '../src/runners/pi.js';
+import { buildPiArgv, buildRpcArgv, extractLastMessage, PI_REVIEW_TOOLS, piBesideNode, piEntryViaSymlink, resolvePiInvocation } from '../src/runners/pi.js';
 
 const piName = process.platform === 'win32' ? 'pi.cmd' : 'pi';
 
@@ -154,4 +154,20 @@ test('resolvePiInvocation: a symlinked shim runs the entry with this node', posi
 test('extractLastMessage: no assistant text → null', () => {
   const jsonl = JSON.stringify({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: 'hi' }] } });
   assert.equal(extractLastMessage(jsonl), null);
+});
+
+test('buildRpcArgv: bound session swaps --no-session for --session-id/--session-dir', () => {
+  const argv = buildRpcArgv(
+    { tools: ['read'], sessionId: 'run-1', sessionDir: 'C:/a/pi-session' },
+    inv,
+  );
+  assert.ok(!argv.includes('--no-session'));
+  assert.deepEqual(argv.slice(argv.indexOf('--session-id'), argv.indexOf('--session-id') + 2), ['--session-id', 'run-1']);
+  assert.deepEqual(argv.slice(argv.indexOf('--session-dir'), argv.indexOf('--session-dir') + 2), ['--session-dir', 'C:/a/pi-session']);
+});
+
+test('buildRpcArgv: unbound stays ephemeral; one-sided binding is rejected', () => {
+  assert.ok(buildRpcArgv({ tools: ['read'] }, inv).includes('--no-session'));
+  assert.throws(() => buildRpcArgv({ tools: ['read'], sessionId: 'x' }, inv), /together/);
+  assert.throws(() => buildRpcArgv({ tools: ['read'], sessionDir: '/d' }, inv), /together/);
 });

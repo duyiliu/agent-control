@@ -6,8 +6,10 @@ import { fileURLToPath } from 'node:url';
 import type { AppLog } from '../telemetry/logging.js';
 import { approveMergeTask, OpsError, retryTask, stopTask } from '../ops.js';
 import {
+  addProjectPayload,
   artifactPayload,
   healthPayload,
+  projectsPayload,
   tailPayload,
   taskPayload,
   tasksPayload,
@@ -138,6 +140,33 @@ function checkAuth(deps: UiDeps, req: IncomingMessage, res: ServerResponse, url:
   return false;
 }
 
+const MAX_BODY = 64 * 1024;
+
+function readBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (c: Buffer) => {
+      size += c.length;
+      if (size > MAX_BODY) {
+        rejectPromise(new Error('body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (chunks.length === 0) { resolvePromise(null); return; }
+      try {
+        resolvePromise(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch {
+        rejectPromise(new Error('invalid JSON body'));
+      }
+    });
+    req.on('error', rejectPromise);
+  });
+}
+
 function notBuilt(res: ServerResponse) {
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(
@@ -164,6 +193,24 @@ async function handle(deps: UiDeps, req: IncomingMessage, res: ServerResponse): 
     const detail = taskPayload(deps.store, Number(taskApi[1]));
     if (!detail) { json(res, 404, { error: 'no such task' }); return; }
     json(res, 200, detail);
+    return;
+  }
+
+  if (method === 'GET' && path === '/api/projects') {
+    json(res, 200, projectsPayload(deps));
+    return;
+  }
+
+  if (method === 'POST' && path === '/api/projects') {
+    let body: unknown;
+    try {
+      body = await readBody(req);
+    } catch (err) {
+      json(res, 400, { error: String(err instanceof Error ? err.message : err) });
+      return;
+    }
+    const out = await addProjectPayload(deps, body);
+    json(res, out.status, out.body);
     return;
   }
 

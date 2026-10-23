@@ -67,6 +67,61 @@ function withCheck(checkLines: string[], run: (path: string) => void) {
   try { run(path); } finally { cleanup(dir); }
 }
 
+function withServer(serverLines: string[], run: (path: string) => void) {
+  const dir = tmpDir('ac-config-');
+  const path = join(dir, 'config.yaml');
+  writeFileSync(path, [
+    'server:',
+    `  database: '${join(dir, 'agent.db').replace(/\\/g, '/')}'`,
+    `  worktree_root: '${join(dir, 'worktrees').replace(/\\/g, '/')}'`,
+    ...serverLines,
+    'projects:',
+    '  - repo: owner/repo',
+    `    local_repo: '${dir.replace(/\\/g, '/')}'`,
+    'agent:',
+    '  model: test/coder',
+  ].join('\n'), 'utf8');
+  try { run(path); } finally { cleanup(dir); }
+}
+
+test('config: max_resumes defaults to 2', () => {
+  withServer([], (path) => {
+    assert.equal(loadConfig(path).server.max_resumes, 2);
+  });
+});
+
+for (const value of [0, 3]) {
+  test(`config: max_resumes=${value} is a valid non-negative integer`, () => {
+    withServer([`  max_resumes: ${value}`], (path) => {
+      assert.equal(loadConfig(path).server.max_resumes, value);
+    });
+  });
+}
+
+for (const [label, value] of [['negative', -1], ['fractional', 2.5], ['string', "'2'"], ['NaN', '.nan']] as const) {
+  test(`config: max_resumes rejects ${label} values`, () => {
+    withServer([`  max_resumes: ${value}`], (path) => {
+      assert.throws(() => loadConfig(path), (err) => err instanceof ConfigError && /server\.max_resumes must be a non-negative integer/.test(err.message));
+    });
+  });
+}
+
+test('config: an empty projects list is allowed — scheduler idles until the UI adds one', () => {
+  const dir = tmpDir('ac-config-');
+  const path = join(dir, 'config.yaml');
+  writeFileSync(path, [
+    'server:',
+    `  database: '${join(dir, 'agent.db').replace(/\\/g, '/')}'`,
+    `  worktree_root: '${join(dir, 'worktrees').replace(/\\/g, '/')}'`,
+    'projects: []',
+    'agent:',
+    '  model: test/coder',
+  ].join('\n'), 'utf8');
+  try {
+    assert.equal(loadConfig(path).projects.length, 0);
+  } finally { cleanup(dir); }
+});
+
 test('config: check platforms are parsed and passed through', () => {
   withCheck(['      - argv: [node, --test]', '        platforms: [win32, linux]'], (path) => {
     const config = loadConfig(path);

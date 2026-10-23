@@ -88,3 +88,56 @@ test('upsertDiscovered is idempotent', () => {
     cleanup(dir);
   }
 });
+
+test('resumeRun clears the recorded child and bumps the budget for an active run', () => {
+  const dir = tmpDir();
+  try {
+    const s = makeStore(dir);
+    const { task } = s.upsertDiscovered({ repo: 'a/b', issue_number: 4, issue_title: 't', issue_url: 'u' });
+    const run = s.claimRun(task.id);
+    s.transition(run.run_id, 'CLAIMED', 'VERIFYING');
+    s.updateRunFields(run.run_id, { pid: 99, process_identity: '99:1', workspace: '/wt' });
+
+    s.resumeRun(run.run_id, 'VERIFYING');
+
+    const after = s.getRun(run.run_id)!;
+    assert.equal(after.pid, null);
+    assert.equal(after.process_identity, null);
+    assert.equal(after.resume_count, 1);
+    assert.equal(after.phase, 'VERIFYING');
+    assert.equal(after.workspace, '/wt'); // site kept for the resumed phase
+    const last = s.eventsForRun(run.run_id).at(-1)!;
+    assert.equal(last.to_phase, 'VERIFYING');
+    assert.match(last.detail_json ?? '', /recovered/);
+    s.close();
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('resumeRun refuses a terminal run or a non-active target without touching the row', () => {
+  const dir = tmpDir();
+  try {
+    const s = makeStore(dir);
+    const { task } = s.upsertDiscovered({ repo: 'a/b', issue_number: 5, issue_title: 't', issue_url: 'u' });
+    const run = s.claimRun(task.id);
+    s.transition(run.run_id, 'CLAIMED', 'RUNNING');
+    s.updateRunFields(run.run_id, { pid: 9, process_identity: '9:1' });
+
+    assert.throws(() => s.resumeRun(run.run_id, 'COMPLETED'), /cannot resume/);
+    const before = { ...s.getRun(run.run_id)! };
+    const beforeEvents = s.eventsForRun(run.run_id).length;
+
+    s.endRun(run.run_id, 'FAILED', 'done');
+    assert.throws(() => s.resumeRun(run.run_id, 'RUNNING'), /cannot resume/);
+    const after = s.getRun(run.run_id)!;
+    assert.equal(after.phase, 'FAILED');
+    assert.equal(after.pid, 9);
+    assert.equal(after.resume_count, 0);
+    assert.equal(s.eventsForRun(run.run_id).length, beforeEvents + 1); // only the endRun event
+    assert.equal(before.phase, 'RUNNING'); // sanity: the refused target attempt changed nothing earlier
+    s.close();
+  } finally {
+    cleanup(dir);
+  }
+});

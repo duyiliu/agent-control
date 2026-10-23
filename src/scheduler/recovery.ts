@@ -19,13 +19,22 @@ export interface RecoveryDeps {
   findProcs?: (needle: string) => Promise<number[] | null>;
 }
 
+/** Narrower deps for the shared park path — the engine's deferred-resume
+ *  sweep reuses it without a full RecoveryDeps. */
+export interface RecoveryParkingDeps {
+  store: Store;
+  tracker: GitHubTracker;
+  appLog: AppLog;
+  engine: Pick<Engine, 'notifyTaskAttention'>;
+}
+
 export interface RecoveryReport {
   resumed: string[];
+  /** Safe to resume but held back by `server.max_concurrent`; the tick sweep takes them. */
+  deferred: string[];
   recoveryRequired: { run_id: string; why: string }[];
   finalized: string[];
 }
-
-const MAX_RESUMES = 2;
 
 /**
  * Boot-time reconciliation. Runs left in active phases are classified:
@@ -34,10 +43,21 @@ const MAX_RESUMES = 2;
  * - child gone -> resume idempotently from the saved phase
  * - PUBLISHING_PR -> check GitHub first: existing PR means the side effect
  *   already happened -> AWAITING_HUMAN; otherwise re-run the idempotent publish.
+ *
+ * Resumes go through `engine.resumeRun`: when the concurrency budget is full
+ * the run is queued in the engine's deferred set and started by the tick
+ * sweep, so a crash that left N runs cannot restart all N at once. Queuing
+ * spends no resume budget — `Store.resumeRun` runs only at launch.
  */
 export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
   const { store, appLog } = deps;
-  const report: RecoveryReport = { resumed: [], recoveryRequired: [], finalized: [] };
+  const report: RecoveryReport = { resumed: [], deferred: [], recoveryRequired: [], finalized: [] };
+  const budget = deps.config.server.max_resumes;
+
+  const resumeNow = (run: RunRow, to: Phase) => {
+    if (deps.engine.resumeRun(run.run_id, to)) report.resumed.push(run.run_id);
+    else report.deferred.push(run.run_id);
+  };
 
   for (const run of store.activeRuns()) {
     const task = store.getTaskById(run.task_id);
@@ -48,7 +68,8 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
 
     const risk = await runProcessRisk(run, deps);
     if (risk) {
-      markRecoveryRequired(deps, task, run, risk);
+      // Cannot prove the child is dead — the agent-running label stays.
+      await markRecoveryRequired(deps, task, run, risk);
       report.recoveryRequired.push({ run_id: run.run_id, why: risk });
       continue;
     }
@@ -58,16 +79,14 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
       // site is re-materialized, no workspace required. Anything else
       // (missing sha, unknown phase) cannot safely continue.
       if (run.head_sha && (run.phase === 'CLAIMED' || run.phase === 'REVIEWING')) {
-        if (run.resume_count >= MAX_RESUMES) {
-          markRecoveryRequired(deps, task, run, 'review resume budget exhausted');
+        if (run.resume_count >= budget) {
+          await markRecoveryRequired(deps, task, run, 'review resume budget exhausted', true);
           report.recoveryRequired.push({ run_id: run.run_id, why: 'resume budget' });
         } else {
-          resume(store, run, run.phase);
-          deps.engine.resumeRun(run.run_id);
-          report.resumed.push(run.run_id);
+          resumeNow(run, run.phase);
         }
       } else {
-        markRecoveryRequired(deps, task, run, `review run missing head_sha or in unexpected phase ${run.phase}`);
+        await markRecoveryRequired(deps, task, run, `review run missing head_sha or in unexpected phase ${run.phase}`, true);
         report.recoveryRequired.push({ run_id: run.run_id, why: 'unexpected phase' });
       }
       continue;
@@ -82,7 +101,7 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
           existing = project && branch ? await deps.tracker.findPrForBranch(project.repo, branch) : null;
         } catch (err) {
           const why = `cannot query PR during recovery; no external action taken: ${String(err).slice(0, 300)}`;
-          markRecoveryRequired(deps, task, run, why);
+          await markRecoveryRequired(deps, task, run, why, true);
           report.recoveryRequired.push({ run_id: run.run_id, why });
           break;
         }
@@ -102,19 +121,32 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
             issue = await deps.tracker.getIssue(project.repo, task.issue_number);
           } catch (err) {
             const why = `cannot confirm approval during recovery; PR left unchanged: ${String(err).slice(0, 300)}`;
-            markRecoveryRequired(deps, task, run, why);
+            await markRecoveryRequired(deps, task, run, why, true);
             report.recoveryRequired.push({ run_id: run.run_id, why });
             break;
           }
           const labelled = !!issue && issue.state === 'OPEN' && issue.labels.includes(project.ready_label);
           const hashOk = !!issue && (!task.approved_hash || approvalHash(issue) === task.approved_hash);
-          if (labelled && hashOk) {
+          if (labelled && hashOk && task.status === 'MERGING') {
+            // A merge-conflict repair publishes back into MERGING carrying
+            // its approval — finalizing to the review queue here would
+            // bounce it with a stale approved_sha. Resume the publish phase
+            // instead: the engine's mergeRepair path re-verifies and lands
+            // the new head with the original approved_by.
+            if (run.resume_count >= budget) {
+              await markRecoveryRequired(deps, task, run, 'publish resume budget exhausted', true);
+              report.recoveryRequired.push({ run_id: run.run_id, why: 'resume budget' });
+            } else {
+              resumeNow(run, 'PUBLISHING_PR');
+            }
+          } else if (labelled && hashOk) {
             // Publish already happened. Reviews are separate runs now — an
             // auto-review project lands in AWAITING_REVIEW for dispatch; a
             // manual-review project parks straight on the human merge path.
             const afterPublish: Phase = project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN';
             store.endRun(run.run_id, afterPublish, 'recovered: PR already exists');
             store.setTaskStatus(task.id, afterPublish, { pr_url: existing.url, branch });
+            report.finalized.push(run.run_id);
           } else {
             try { await deps.tracker.closePr(project.repo, existing.number); } catch { /* best effort */ }
             const phase: Phase = labelled ? 'BLOCKED_APPROVAL_CHANGED' : 'CANCELED';
@@ -123,15 +155,15 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
             if (phase === 'BLOCKED_APPROVAL_CHANGED') {
               void deps.engine.notifyTaskAttention(task, phase, 'approval revoked before recovery finalize; PR closed');
             }
+            report.finalized.push(run.run_id);
           }
-          report.finalized.push(run.run_id);
-        } else if (run.resume_count >= MAX_RESUMES) {
-          markRecoveryRequired(deps, task, run, 'publish resume budget exhausted');
+          // The MERGING-repair resume above reports through resumed/deferred —
+          // it is intentionally not counted as finalized.
+        } else if (run.resume_count >= budget) {
+          await markRecoveryRequired(deps, task, run, 'publish resume budget exhausted', true);
           report.recoveryRequired.push({ run_id: run.run_id, why: 'resume budget' });
         } else {
-          resume(store, run, 'PUBLISHING_PR');
-          deps.engine.resumeRun(run.run_id);
-          report.resumed.push(run.run_id);
+          resumeNow(run, 'PUBLISHING_PR');
         }
         break;
       }
@@ -139,25 +171,21 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
       case 'REVIEWING': {
         // Legacy pre-v4 code run: review is a separate run kind now. Send it
         // back through VERIFYING so the code state machine stays consistent.
-        if (run.resume_count >= MAX_RESUMES || !run.workspace || !existsSync(run.workspace)) {
-          markRecoveryRequired(deps, task, run, 'resume budget exhausted or workspace missing');
+        if (run.resume_count >= budget || !run.workspace || !existsSync(run.workspace)) {
+          await markRecoveryRequired(deps, task, run, 'resume budget exhausted or workspace missing', true);
           report.recoveryRequired.push({ run_id: run.run_id, why: 'budget/workspace' });
         } else {
-          resume(store, run, 'VERIFYING');
-          deps.engine.resumeRun(run.run_id);
-          report.resumed.push(run.run_id);
+          resumeNow(run, 'VERIFYING');
         }
         break;
       }
 
       case 'VERIFYING': {
-        if (run.resume_count >= MAX_RESUMES || !run.workspace || !existsSync(run.workspace)) {
-          markRecoveryRequired(deps, task, run, 'resume budget exhausted or workspace missing');
+        if (run.resume_count >= budget || !run.workspace || !existsSync(run.workspace)) {
+          await markRecoveryRequired(deps, task, run, 'resume budget exhausted or workspace missing', true);
           report.recoveryRequired.push({ run_id: run.run_id, why: 'budget/workspace' });
         } else {
-          resume(store, run, run.phase);
-          deps.engine.resumeRun(run.run_id);
-          report.resumed.push(run.run_id);
+          resumeNow(run, run.phase);
         }
         break;
       }
@@ -166,28 +194,24 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
       case 'RUNNING':
       case 'PREPARING':
       case 'CLAIMED': {
-        if (run.resume_count >= MAX_RESUMES) {
-          markRecoveryRequired(deps, task, run, 'resume budget exhausted');
+        if (run.resume_count >= budget) {
+          await markRecoveryRequired(deps, task, run, 'resume budget exhausted', true);
           report.recoveryRequired.push({ run_id: run.run_id, why: 'resume budget' });
         } else if (run.phase === 'FIXING' || run.phase === 'RUNNING') {
           if (!run.workspace || !existsSync(run.workspace)) {
-            markRecoveryRequired(deps, task, run, 'workspace missing; cannot continue safely');
+            await markRecoveryRequired(deps, task, run, 'workspace missing; cannot continue safely', true);
             report.recoveryRequired.push({ run_id: run.run_id, why: 'workspace missing' });
           } else {
-            resume(store, run, run.phase);
-            deps.engine.resumeRun(run.run_id);
-            report.resumed.push(run.run_id);
+            resumeNow(run, run.phase);
           }
         } else {
-          resume(store, run, 'PREPARING');
-          deps.engine.resumeRun(run.run_id);
-          report.resumed.push(run.run_id);
+          resumeNow(run, 'PREPARING');
         }
         break;
       }
 
       default: {
-        markRecoveryRequired(deps, task, run, `unexpected active phase ${run.phase}`);
+        await markRecoveryRequired(deps, task, run, `unexpected active phase ${run.phase}`, true);
         report.recoveryRequired.push({ run_id: run.run_id, why: 'unexpected phase' });
       }
     }
@@ -195,24 +219,33 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
 
   appLog.event('reconcile_done', {
     resumed: report.resumed.length,
+    deferred: report.deferred.length,
     recovery_required: report.recoveryRequired.length,
     finalized: report.finalized.length,
   });
   return report;
 }
 
-function resume(store: Store, run: RunRow, phase: Phase) {
-  store.tx(() => {
-    store.db
-      .prepare('UPDATE runs SET resume_count = resume_count + 1, pid = NULL, process_identity = NULL WHERE run_id = ?')
-      .run(run.run_id);
-    store.transition(run.run_id, run.phase, phase, { recovered: true });
+/**
+ * Park a run + its task on RECOVERY_REQUIRED for a human. `safeToReleaseClaim`
+ * may be true only when the caller already proved no child can still be alive
+ * (runProcessRisk returned null): budget exhausted, workspace missing, GitHub
+ * unreachable. A possibly-live pid, a stray process, or a failed scan always
+ * keeps `agent-running` — the label is the cross-instance claim and a false
+ * release would let a second scheduler work the same issue. Releasing is
+ * best-effort: an API failure is logged but the local park stands.
+ */
+export async function markRecoveryRequired(
+  deps: RecoveryParkingDeps,
+  task: TaskRow,
+  run: RunRow,
+  why: string,
+  safeToReleaseClaim = false,
+) {
+  deps.store.tx(() => {
+    deps.store.endRun(run.run_id, 'RECOVERY_REQUIRED', why);
+    deps.store.setTaskStatus(task.id, 'RECOVERY_REQUIRED');
   });
-}
-
-function markRecoveryRequired(deps: RecoveryDeps, task: TaskRow, run: RunRow, why: string) {
-  deps.store.endRun(run.run_id, 'RECOVERY_REQUIRED', why);
-  deps.store.setTaskStatus(task.id, 'RECOVERY_REQUIRED');
   void deps.engine.notifyTaskAttention(task, 'RECOVERY_REQUIRED', why);
   // A stranded review run must not leave `agent-reviewing` on the PR — that
   // label suppresses all future review dispatch for the task.
@@ -221,6 +254,15 @@ function markRecoveryRequired(deps: RecoveryDeps, task: TaskRow, run: RunRow, wh
     if (prNum) {
       deps.tracker.removePrLabel(task.repo, Number(prNum), 'agent-reviewing')
         .catch(() => { /* best effort */ });
+    }
+  }
+  // Only a code run behind an issue can hold `agent-running`; a bare-PR task
+  // never owns that label and must never touch it.
+  if (safeToReleaseClaim && run.kind === 'code' && task.source === 'issue') {
+    try {
+      await deps.tracker.removeLabel(task.repo, task.issue_number, 'agent-running');
+    } catch (err) {
+      deps.appLog.event('label_release_error', { task: task.id, run: run.run_id, error: String(err) });
     }
   }
 }

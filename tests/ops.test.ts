@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { approveMergeTask, retryTask, OpsError } from '../src/ops.js';
+import { approveMergeTask, requestDrain, resumeDispatch, retryTask, waitForDrain, OpsError } from '../src/ops.js';
 import { makeConfig, makeStore, makeFakeTracker, tmpDir, teardown } from './helpers.js';
 
 function setup() {
@@ -92,6 +92,50 @@ test('retry: dead child and clean orphan scan can requeue', async () => {
     await retryTask(env.store, env.config, env.tracker, env.task, { isPidAlive: () => false, findProcs: async () => [] });
     assert.equal(env.store.getTaskById(env.task.id)!.status, 'DISCOVERED');
   } finally { teardown(env.dir, [env.store]); }
+});
+
+test('drain: request + matching ack resolves the wait', async () => {
+  const dir = tmpDir('ac-drain-'); const store = makeStore(dir);
+  try {
+    const id = requestDrain(store);
+    assert.equal(store.getMeta('drain_requested'), id);
+    assert.equal(store.getMeta('drain_ack'), '');
+    const waiter = waitForDrain(store, id, 2000, 10);
+    store.setMeta('drain_ack', id);
+    await waiter;
+  } finally { teardown(dir, [store]); }
+});
+
+test('drain: a stale ack or idle-looking db never satisfies the wait', async () => {
+  const dir = tmpDir('ac-drain-'); const store = makeStore(dir);
+  try {
+    const id = requestDrain(store);
+    store.setMeta('drain_ack', 'older-request-nonce');
+    await assert.rejects(waitForDrain(store, id, 200, 10), /超时/);
+    // The timeout keeps the pause — never silently unpauses.
+    assert.equal(store.getMeta('drain_requested'), id);
+  } finally { teardown(dir, [store]); }
+});
+
+test('drain: a replaced request fails the old waiter', async () => {
+  const dir = tmpDir('ac-drain-'); const store = makeStore(dir);
+  try {
+    const first = requestDrain(store);
+    requestDrain(store);
+    await assert.rejects(waitForDrain(store, first, 2000, 10), /替换/);
+  } finally { teardown(dir, [store]); }
+});
+
+test('drain: undrain cancels a pending wait and clears both keys', async () => {
+  const dir = tmpDir('ac-drain-'); const store = makeStore(dir);
+  try {
+    const id = requestDrain(store);
+    const waiter = waitForDrain(store, id, 2000, 10);
+    resumeDispatch(store);
+    await assert.rejects(waiter, /取消/);
+    assert.equal(store.getMeta('drain_requested'), '');
+    assert.equal(store.getMeta('drain_ack'), '');
+  } finally { teardown(dir, [store]); }
 });
 
 test('retry: drops review verdicts so an unchanged PR head is judged again', async () => {

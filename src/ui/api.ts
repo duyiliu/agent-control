@@ -1,8 +1,11 @@
-import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import type { Store } from '../store/sqlite.js';
-import type { AppConfig, CheckResultRow, Phase, RunRow, TaskRow, TaskSource } from '../types.js';
+import type { AppConfig, CheckResultRow, Phase, ProjectConfig, RunRow, TaskRow, TaskSource } from '../types.js';
 import type { OpsTracker } from '../ops.js';
+import { appendProjectToConfigFile, ConfigError } from '../config.js';
+import { runProc } from '../proc.js';
+import { SYSTEM_LABELS } from '../tracker/github.js';
 
 export interface TaskSummary {
   id: number;
@@ -47,6 +50,196 @@ export interface UiDeps {
   config: AppConfig;
   activeCount(): number;
   tracker: OpsTracker;
+  /** Set when the service knows which file it loaded; absent in tests →
+   *  POST /api/projects reports itself as read-only. */
+  configPath?: string;
+  /** Optional remote validation (gh repo view); absent → skipped. */
+  checkRepoExists?: (repo: string) => Promise<void>;
+  /** Optional canonical-name resolution (follows rename redirects). */
+  resolveRepo?: (repo: string) => Promise<string>;
+  /** Optional label provisioning; returns warnings. */
+  provisionRepo?: (repo: string, readyLabel: string) => Promise<string[]>;
+}
+
+export interface ProjectInfo {
+  repo: string;
+  local_repo: string;
+  base_branch: string;
+  git_remote: string;
+  ready_label: string;
+  branch_prefix: string;
+  review_mode: 'auto' | 'manual';
+  pr_review: 'auto' | 'manual';
+  checks: { argv: string[]; timeout_seconds?: number; platforms?: string[] }[];
+}
+
+export function projectsPayload(deps: UiDeps): { projects: ProjectInfo[]; config_path: string | null; editable: boolean } {
+  return {
+    config_path: deps.configPath ?? null,
+    editable: deps.configPath !== undefined,
+    projects: deps.config.projects.map((p) => ({
+      repo: p.repo,
+      local_repo: p.local_repo,
+      base_branch: p.base_branch,
+      git_remote: p.git_remote,
+      ready_label: p.ready_label,
+      branch_prefix: p.branch_prefix,
+      review_mode: p.review_mode,
+      pr_review: p.pr_review,
+      checks: p.checks.map((c) => ({ argv: c.argv, timeout_seconds: c.timeout_seconds, platforms: c.platforms })),
+    })),
+  };
+}
+
+const REPO_NAME = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
+/** git@github.com:o/n.git, https://github.com/o/n(.git), ssh://git@github.com/o/n */
+const GITHUB_REMOTE = /github\.com[:/]+([A-Za-z0-9._-]+)\/+([A-Za-z0-9._-]+?)(?:\.git)?\s*$/i;
+
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+}
+
+function optStr(o: Record<string, unknown>, key: string): string | undefined {
+  const v = o[key];
+  return typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined;
+}
+
+/**
+ * `git remote get-url <remote>` cross-check: when it resolves to a GitHub
+ * owner/name that disagrees with the requested repo, the local path was
+ * almost certainly mis-typed — refuse, unless gh resolves the remote's repo
+ * to the same canonical name (the URL survives a repo rename). Anything
+ * inconclusive is a warning.
+ */
+async function checkRemote(
+  deps: UiDeps, localRepo: string, remote: string, repo: string, warnings: string[],
+): Promise<{ reject?: string; missing?: string }> {
+  const res = await runProc({
+    argv: ['git', '-C', localRepo, 'remote', 'get-url', remote],
+    timeoutMs: 15_000,
+    streamStdoutToLog: false,
+  });
+  if (res.exitCode !== 0) {
+    return { missing: res.spawnError ?? (res.stderrTail.trim() || `no ${remote}`) };
+  }
+  const url = res.stdoutTail.trim();
+  const m = GITHUB_REMOTE.exec(url);
+  if (!m) {
+    warnings.push(`${remote} 不是可识别的 GitHub 地址（${url.slice(0, 120)}），未能确认归属`);
+    return {};
+  }
+  const actual = `${m[1]}/${m[2]}`;
+  if (actual.toLowerCase() === repo.toLowerCase()) return {};
+  const canonical = deps.resolveRepo ? await deps.resolveRepo(actual).catch(() => null) : null;
+  if (canonical && canonical.toLowerCase() === repo.toLowerCase()) {
+    warnings.push(`${remote} 指向 ${actual}，GitHub 重定向到 ${canonical}，归属一致`);
+    return {};
+  }
+  return { reject: canonical ? `${actual}（解析为 ${canonical}）` : actual };
+}
+
+/**
+ * POST /api/projects: validate → append to the yaml (comments preserved) →
+ * splice the re-parsed list into the live config so the next tick picks the
+ * project up without a restart → best-effort label provisioning.
+ */
+export async function addProjectPayload(
+  deps: UiDeps,
+  body: unknown,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const err = (status: number, error: string) => ({ status, body: { error } });
+  if (!deps.configPath) return err(400, '配置文件路径未知，无法写入；请手动编辑 yaml 后重启');
+  const o = asRecord(body);
+  if (!o) return err(400, 'request body must be a JSON object');
+
+  const repo = optStr(o, 'repo');
+  if (!repo || !REPO_NAME.test(repo)) return err(400, 'repo 必须是 owner/name 形式');
+  if (deps.config.projects.some((p) => p.repo.toLowerCase() === repo.toLowerCase())) {
+    return err(409, `项目 ${repo} 已在配置中`);
+  }
+
+  const localRepo = optStr(o, 'local_repo');
+  if (!localRepo) return err(400, 'local_repo 必填：本机已 clone 的仓库路径');
+  if (!existsSync(localRepo)) return err(400, `local_repo 不存在：${localRepo}`);
+  if (!existsSync(join(localRepo, '.git'))) return err(400, `${localRepo} 不是 git 仓库（缺少 .git）`);
+
+  const gitRemote = optStr(o, 'git_remote') ?? 'origin';
+  if (!/^\S+$/.test(gitRemote)) return err(400, 'git_remote 不能包含空白字符');
+  for (const key of ['base_branch', 'ready_label', 'branch_prefix']) {
+    if (o[key] !== undefined && optStr(o, key) === undefined) return err(400, `${key} 不能为空`);
+  }
+  for (const key of ['review_mode', 'pr_review']) {
+    const v = optStr(o, key);
+    if (v !== undefined && v !== 'auto' && v !== 'manual') return err(400, `${key} 只能是 auto 或 manual`);
+  }
+  if (o['checks'] !== undefined && !Array.isArray(o['checks'])) return err(400, 'checks 必须是数组');
+
+  const warnings: string[] = [];
+  const remoteCheck = await checkRemote(deps, localRepo, gitRemote, repo, warnings);
+  if (remoteCheck.reject) {
+    return err(400, `local_repo 的 ${gitRemote} 指向 ${remoteCheck.reject}，与 ${repo} 不一致`);
+  }
+  if (remoteCheck.missing !== undefined) {
+    if (gitRemote !== 'origin') {
+      return err(400, `local_repo 没有 ${gitRemote} remote——调度器的 push/fetch 使用配置的 remote`);
+    }
+    if (remoteCheck.missing === 'no origin') {
+      warnings.push('local_repo 没有 origin remote，无法确认它确实属于该 GitHub 仓库');
+    } else {
+      warnings.push(`无法读取 origin remote：${remoteCheck.missing.slice(0, 160)}`);
+    }
+  }
+
+  if (deps.checkRepoExists) {
+    try {
+      await deps.checkRepoExists(repo);
+    } catch (e) {
+      return err(400, `GitHub 校验失败（gh repo view ${repo}）：${String(e instanceof Error ? e.message : e).slice(0, 200)}`);
+    }
+  }
+
+  const raw: Record<string, unknown> = {
+    repo,
+    local_repo: localRepo,
+    base_branch: optStr(o, 'base_branch') ?? 'main',
+    git_remote: gitRemote,
+    ready_label: optStr(o, 'ready_label') ?? 'agent-ready',
+    branch_prefix: optStr(o, 'branch_prefix') ?? 'agent/issue-',
+    review_mode: optStr(o, 'review_mode') ?? 'auto',
+    pr_review: optStr(o, 'pr_review') ?? 'auto',
+  };
+  if (Array.isArray(o['checks']) && o['checks'].length > 0) raw['checks'] = o['checks'];
+
+  let fresh: AppConfig;
+  try {
+    fresh = appendProjectToConfigFile(deps.configPath, raw);
+  } catch (e) {
+    const msg = e instanceof ConfigError ? e.message : `写入配置文件失败：${String(e).slice(0, 200)}`;
+    return err(e instanceof ConfigError ? 400 : 500, msg);
+  }
+  // Splice (not replace) so the reference the engine holds stays live.
+  deps.config.projects.splice(0, deps.config.projects.length, ...fresh.projects);
+  const project: ProjectConfig | undefined = fresh.projects.find((p) => p.repo.toLowerCase() === repo.toLowerCase());
+
+  if (deps.provisionRepo) {
+    try {
+      warnings.push(...await deps.provisionRepo(repo, project?.ready_label ?? 'agent-ready'));
+    } catch (e) {
+      warnings.push(`标签准备失败：${String(e).slice(0, 160)}`);
+    }
+  } else {
+    warnings.push(`请确认 ${repo} 存在标签：${SYSTEM_LABELS.join(', ')}（ac doctor 可检查）`);
+  }
+
+  return {
+    status: 200,
+    body: {
+      message: `已添加 ${repo}，下一个调度周期开始扫描；配置已写入 ${deps.configPath}`,
+      warnings,
+      project,
+    },
+  };
 }
 
 const RED_PHASES: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED'];

@@ -116,14 +116,19 @@ export function buildPiArgv(
  * stdin, and the process keeps its conversation between phases.
  */
 export function buildRpcArgv(
-  opts: { tools?: string[]; model?: string; thinking?: string },
+  opts: { tools?: string[]; model?: string; thinking?: string; sessionId?: string; sessionDir?: string },
   inv: PiInvocation,
 ): string[] {
+  if ((opts.sessionId == null) !== (opts.sessionDir == null)) {
+    throw new Error('sessionId and sessionDir must be set together');
+  }
   return [
     inv.argv0,
     ...inv.prefix,
     '--mode', 'rpc',
-    '--no-session',
+    ...(opts.sessionId != null
+      ? ['--session-id', opts.sessionId, '--session-dir', opts.sessionDir!]
+      : ['--no-session']),
     '--no-extensions',
     '--no-skills',
     '--no-prompt-templates',
