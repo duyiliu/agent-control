@@ -30,6 +30,7 @@ export default function Board(props: {
 }) {
   const { tasks, projectRepos, tick, selected, onSelect, onStop, onIntakeChanged, onChanged, onToast } = props;
   const [disposition, setDisposition] = useState<'normal' | 'deferred' | 'history'>('normal');
+  const [mobileGroup, setMobileGroup] = useState<GroupKey | null>(null);
   const [repoFilter, setRepoFilter] = useState<string | null>(() => localStorage.getItem(FILTER_KEY));
   const [keyword, setKeyword] = useState('');
   const [draggingId, setDraggingId] = useState<number | null>(null);
@@ -92,46 +93,57 @@ export default function Board(props: {
     list.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   }
 
+  const defaultMobileGroup = displayGroups.find(g => byGroup.get(g.key)!.length)?.key ?? displayGroups[0]!.key;
+  const selectedMobileGroup = mobileGroup && displayGroups.some(g => g.key === mobileGroup) ? mobileGroup : defaultMobileGroup;
+
   // Only active cards are draggable, and only into Needs Attention (= stop).
   const draggedTask = draggingId !== null ? (visible.find((t) => t.id === draggingId) ?? null) : null;
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
-      <div className="flex shrink-0 flex-wrap items-center gap-1.5 px-4 pt-3">
-        <Chip active={activeFilter === null} onClick={() => setFilter(null)}>
-          全部
-          <Count n={tasks.length} />
-        </Chip>
-        {repoNames.map((repo) => (
-          <Chip key={repo} active={activeFilter === repo} onClick={() => setFilter(repo)}>
-            {repo}
-            <Count n={repos.get(repo)!} />
-          </Chip>
-        ))}
-        <Chip active={disposition === 'normal'} onClick={() => setDisposition('normal')}>任务</Chip>
-        <Chip active={disposition === 'deferred'} onClick={() => setDisposition('deferred')}>暂缓 <Count n={deferredCount} /></Chip>
-        <Chip active={disposition === 'history'} onClick={() => setDisposition('history')}>无需处理 <Count n={skippedCount} /></Chip>
-        <div className="relative ml-auto">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3 -translate-y-1/2 text-fg-dim" />
-          <input
-            ref={searchRef}
-            value={keyword}
-            onChange={(e) => setKeyword(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                setKeyword('');
-                e.currentTarget.blur();
-              }
-            }}
-            placeholder="搜索  /"
-            className="w-52 rounded-md border border-edge bg-card py-1 pl-7.5 pr-2.5 text-[11px] text-fg outline-none transition-colors placeholder:text-fg-dim focus:border-edge-strong"
-          />
+      <div className="z-10 shrink-0 border-b border-edge bg-canvas/95 px-3 py-2 backdrop-blur-sm sm:px-4 sm:pt-3">
+        <div className="flex min-w-0 gap-1.5 overflow-x-auto pb-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:flex-wrap lg:overflow-visible">
+          <Chip active={activeFilter === null} onClick={() => setFilter(null)}>全部<Count n={tasks.length} /></Chip>
+          {repoNames.map((repo) => (
+            <Chip key={repo} active={activeFilter === repo} onClick={() => setFilter(repo)}>
+              <span className="max-w-[68vw] truncate sm:max-w-none">{repo}</span><Count n={repos.get(repo)!} />
+            </Chip>
+          ))}
+        </div>
+        <div className="flex min-w-0 items-center gap-1.5 pt-1 lg:flex-wrap">
+          <div className="flex min-w-0 flex-1 gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:contents">
+            <Chip active={disposition === 'normal'} onClick={() => { setDisposition('normal'); setMobileGroup(null); }}>任务</Chip>
+            <Chip active={disposition === 'deferred'} onClick={() => { setDisposition('deferred'); setMobileGroup(null); }}>暂缓 <Count n={deferredCount} /></Chip>
+            <Chip active={disposition === 'history'} onClick={() => { setDisposition('history'); setMobileGroup(null); }}>无需处理 <Count n={skippedCount} /></Chip>
+          </div>
+          <div className="group relative w-10 shrink-0 transition-[width] focus-within:w-40 [&:has(input:not(:placeholder-shown))]:w-40 sm:w-52">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3 -translate-y-1/2 text-fg-dim" />
+            <input
+              ref={searchRef}
+              value={keyword}
+              onChange={(e) => setKeyword(e.target.value)}
+
+              onKeyDown={(e) => { if (e.key === 'Escape') { setKeyword(''); e.currentTarget.blur(); } }}
+              aria-label="搜索任务"
+              placeholder="搜索"
+              className="w-full rounded-md border border-edge bg-card py-1.5 pl-7.5 pr-2 text-[11px] text-fg outline-none placeholder:text-fg-dim focus:border-edge-strong"
+            />
+          </div>
         </div>
       </div>
+      <div role="tablist" aria-label="任务状态" className="flex shrink-0 gap-1.5 overflow-x-auto border-b border-edge bg-panel/50 px-3 py-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:hidden">
+        {displayGroups.map(g => {
+          const count = byGroup.get(g.key)!.length;
+          const active = selectedMobileGroup === g.key;
+          return <button key={g.key} type="button" role="tab" aria-selected={active} onClick={() => setMobileGroup(g.key)} className={`flex min-h-10 shrink-0 items-center gap-2 rounded-md border px-3 text-xs font-medium ${active ? 'border-brand/40 bg-brand/10 text-brand' : 'border-edge bg-card text-fg-muted'}`}>
+            <span className={`size-1.5 rounded-full ${g.dot}`} />{g.label}<span className="tabular-nums opacity-70">{count}</span>
+          </button>;
+        })}
+      </div>
       {visible.length === 0 && tasks.length > 0 && (
-        <div className="px-4 pt-3 text-[11px] text-fg-dim">没有匹配当前筛选或搜索的任务。</div>
+        <div className="px-3 pt-3 text-[11px] text-fg-dim sm:px-4">没有匹配当前筛选或搜索的任务。</div>
       )}
-      <div className="flex flex-1 gap-3 overflow-x-auto p-4">
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-3 lg:flex-row lg:gap-3 lg:overflow-x-auto lg:overflow-y-hidden lg:p-4">
         {displayGroups.map((g) => {
           const items = byGroup.get(g.key)!;
           const isDropTarget = g.key === 'blocked' && draggedTask !== null;
@@ -155,11 +167,11 @@ export default function Board(props: {
                     }
                   : undefined
               }
-              className={`flex max-h-full w-[288px] shrink-0 flex-col rounded-lg border bg-panel transition-colors ${
+              className={`flex min-h-0 w-full shrink-0 flex-col rounded-lg border bg-panel lg:max-h-full lg:w-[288px] ${g.key === selectedMobileGroup ? 'flex' : 'hidden'} lg:flex ${
                 isDropTarget ? 'border-danger/40 bg-danger/[0.04]' : 'border-edge'
               }`}
             >
-              <header className="flex items-center gap-2 px-3 py-2.5 text-[12px] font-medium text-fg-muted">
+              <header className="flex shrink-0 items-center gap-2 px-3 py-2.5 text-[12px] font-medium text-fg-muted">
                 <span
                   className={`size-1.5 rounded-full ${g.dot} ${g.key === 'active' ? '[animation:pulse-dot_1.5s_infinite]' : ''}`}
                 />
@@ -168,7 +180,7 @@ export default function Board(props: {
                   {items.length}
                 </span>
               </header>
-              <div className="flex-1 space-y-1.5 overflow-y-auto px-2 pb-2">
+              <div className="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain px-2 pb-[max(.5rem,env(safe-area-inset-bottom))]">
                 {items.map((t) => (
                   <TaskCard
                     key={t.id}
@@ -203,7 +215,7 @@ function Chip(props: { active: boolean; onClick: () => void; children: React.Rea
   return (
     <button
       onClick={props.onClick}
-      className={`flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition-colors ${
+      className={`flex items-center gap-1.5 min-h-9 shrink-0 touch-manipulation rounded-md border px-2.5 py-1.5 text-[11px] transition-colors ${
         props.active
           ? 'border-brand/40 bg-brand/10 text-brand'
           : 'border-edge text-fg-muted hover:border-edge-strong hover:text-fg'
@@ -242,8 +254,6 @@ function TaskCard(props: {
   return (
     <div
       data-tick={tick}
-      role="button"
-      tabIndex={0}
       draggable={draggable}
       onDragStart={
         draggable
@@ -255,24 +265,15 @@ function TaskCard(props: {
           : undefined
       }
       onDragEnd={draggable ? onDragEnd : undefined}
-      onClick={() => onSelect(task.id)}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') onSelect(task.id);
-      }}
       title={draggable ? '拖到「需要处理」即可停止' : undefined}
-      className={`relative w-full cursor-pointer overflow-hidden rounded-md border p-3 text-left transition-colors ${
+      className={`relative w-full overflow-hidden rounded-md border p-3 text-left transition-colors ${
         selected ? 'border-edge-strong bg-elevated' : 'border-edge bg-card hover:border-edge-strong hover:bg-elevated'
       } ${dragging ? 'opacity-40' : ''}`}
     >
       {active && <span className="absolute inset-y-0 left-0 w-[2px] bg-ok" />}
-      <div
-        className="text-[13px] font-medium leading-snug text-fg"
-        style={{ paddingLeft: active ? 6 : 0 }}
-      >
-        {/* No clamping and no hover dependency: a long PR name wraps instead
-            of being hidden, which also works on touch screens. */}
+      <button type="button" onClick={() => onSelect(task.id)} className="w-full touch-manipulation rounded text-left text-[13px] font-semibold leading-snug text-fg focus-visible:outline-2 focus-visible:outline-brand" style={{ paddingLeft: active ? 6 : 0 }}>
         <span className="break-words">{task.issue_title || '(无标题)'}</span>
-      </div>
+      </button>
       <div className="mt-2 space-y-1 text-[11px] text-fg-muted">
         <div
           className="truncate font-mono"

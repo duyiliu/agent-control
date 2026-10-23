@@ -104,16 +104,16 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex min-h-11 shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-edge px-4 py-2 md:h-11 md:flex-nowrap md:py-0">
+      <header className="flex min-h-11 shrink-0 flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-edge px-3 py-2 sm:px-4 md:h-11 md:flex-nowrap md:gap-x-4 md:py-0">
         <div className="flex shrink-0 items-center gap-2 whitespace-nowrap text-[13px] font-semibold text-fg">
           <Activity className="size-3.5 text-fg-muted" />
           agent-control
         </div>
         <HealthLine health={health} />
-        <div className="ml-auto flex shrink-0 items-center gap-2">
+        <div className="ml-auto flex shrink-0 items-center gap-1.5 sm:gap-2">
           <button
             onClick={() => setShowProjects(true)}
-            className="flex items-center gap-1.5 rounded-md border border-edge px-2 py-1 text-[11px] text-fg-muted transition-colors hover:border-edge-strong hover:text-fg"
+            className="flex min-h-9 touch-manipulation items-center gap-1.5 rounded-md border border-edge px-2 py-1.5 text-[11px] text-fg-muted transition-colors hover:border-edge-strong hover:text-fg"
             title="查看/添加 GitHub 项目"
           >
             <FolderGit2 className="size-3" />
@@ -189,7 +189,7 @@ function ThemeSwitcher(props: { theme: ThemeId; onChange: (t: ThemeId) => void }
     <div ref={ref} className="relative">
       <button
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1.5 rounded-md border border-edge px-2 py-1 text-[11px] text-fg-muted transition-colors hover:border-edge-strong hover:text-fg"
+        className="flex min-h-9 touch-manipulation items-center gap-1.5 rounded-md border border-edge px-2 py-1.5 text-[11px] text-fg-muted transition-colors hover:border-edge-strong hover:text-fg"
         title="切换主题"
       >
         <Palette className="size-3" />
@@ -232,20 +232,20 @@ function HealthLine({ health }: { health: HealthInfo | null }) {
   if (!health) return null;
   const upFrom = new Date(Date.now() - health.uptime_s * 1000).toISOString();
   return (
-    <div className="order-3 flex w-full min-w-0 items-center gap-3 text-[11px] text-fg-muted md:order-none md:w-auto">
-      <span className="flex items-center gap-1.5 whitespace-nowrap">
+    <div className="order-3 flex w-full min-w-0 items-center gap-2 overflow-hidden text-[10px] text-fg-muted sm:text-[11px] md:order-none md:w-auto">
+      <span className="flex min-w-0 items-center gap-1.5">
         <span
           className="size-1.5 rounded-full bg-ok"
           style={{ animation: 'pulse-dot 1.5s infinite' }}
         />
-        pid {health.pid} · 已运行 {fmtDur(upFrom)} · 运行中 {health.active_runs_in_process} 个
+        <span className="truncate">pid {health.pid} · {fmtDur(upFrom)} · 运行中 {health.active_runs_in_process}</span>
       </span>
       {health.last_error && (() => {
         const startedAt = Date.now() - health.uptime_s * 1000;
         const stale = Date.parse(health.last_error.at) < startedAt;
         return (
           <span
-            className={`flex min-w-0 items-center gap-1 ${stale ? 'text-fg-dim' : 'text-danger'}`}
+            className={`hidden min-w-0 items-center gap-1 md:flex ${stale ? 'text-fg-dim' : 'text-danger'}`}
             title={health.last_error.error}
           >
             <TriangleAlert className="size-3 shrink-0" />

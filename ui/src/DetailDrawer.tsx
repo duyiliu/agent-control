@@ -89,10 +89,10 @@ export default function DetailDrawer(props: {
     <div className="fixed inset-0 z-20" style={{ animation: 'fade-in .15s ease-out' }}>
       <div className="absolute inset-0 bg-black/50" onClick={onClose} />
       <aside
-        className="absolute right-0 top-0 flex h-full w-[560px] max-w-[94vw] flex-col border-l border-edge bg-panel shadow-2xl"
+        className="absolute inset-x-0 bottom-0 top-[env(safe-area-inset-top)] flex h-[calc(100%-env(safe-area-inset-top))] w-full flex-col rounded-t-xl border-t border-edge bg-panel shadow-2xl md:inset-y-0 md:left-auto md:right-0 md:h-full md:w-[560px] md:max-w-[94vw] md:rounded-none md:border-l md:border-t-0"
         style={{ animation: 'drawer-in .18s ease-out' }}
       >
-        <header className="flex shrink-0 items-start gap-3 border-b border-edge px-4 py-3.5">
+        <header className="flex shrink-0 flex-wrap items-start gap-x-2 gap-y-2 border-b border-edge px-3 py-3 sm:px-4 md:flex-nowrap md:gap-3 md:py-3.5">
           <button
             onClick={onClose}
             className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-md text-fg-muted hover:bg-elevated hover:text-fg"
@@ -128,11 +128,11 @@ export default function DetailDrawer(props: {
             )}
           </div>
           {t && (
-            <div className="flex shrink-0 items-center gap-2 pt-0.5">
+            <div className="order-2 flex w-full items-center justify-end gap-2 md:order-none md:ml-auto md:w-auto md:shrink-0 md:pt-0.5">
               {t.status === 'AWAITING_HUMAN' && t.pr_url && (
                 <button
                   onClick={() => act('approve-merge')}
-                  className="flex items-center gap-1.5 rounded-md border border-ok/30 px-2.5 py-1.5 text-[11px] font-medium text-ok hover:bg-ok/10"
+                  className="flex min-h-10 touch-manipulation items-center gap-1.5 rounded-md border border-ok/30 px-3 py-2 text-xs font-medium text-ok hover:bg-ok/10"
                 >
                   <Check className="size-3" />
                   批准合并
@@ -141,7 +141,7 @@ export default function DetailDrawer(props: {
               {showStop && (
                 <button
                   onClick={() => act('stop')}
-                  className="flex items-center gap-1.5 rounded-md border border-danger/30 px-2.5 py-1.5 text-[11px] font-medium text-danger hover:bg-danger/10"
+                  className="flex min-h-10 touch-manipulation items-center gap-1.5 rounded-md border border-danger/30 px-3 py-2 text-xs font-medium text-danger hover:bg-danger/10"
                 >
                   <Square className="size-3" />
                   停止
@@ -150,7 +150,7 @@ export default function DetailDrawer(props: {
               {detail!.retryable && !t.intake && (
                 <button
                   onClick={() => act('retry')}
-                  className="flex items-center gap-1.5 rounded-md border border-info/30 px-2.5 py-1.5 text-[11px] font-medium text-info hover:bg-info/10"
+                  className="flex min-h-10 touch-manipulation items-center gap-1.5 rounded-md border border-info/30 px-3 py-2 text-xs font-medium text-info hover:bg-info/10"
                 >
                   <RotateCw className="size-3" />
                   重试
@@ -169,7 +169,7 @@ export default function DetailDrawer(props: {
           )}
         </header>
 
-        <div className="flex-1 overflow-y-auto px-4 py-3.5">
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-3.5 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-4 md:px-4">
           {error && (
             <div className="rounded-md border border-danger/30 bg-danger/10 px-3 py-2.5 text-xs text-danger">
               {error}
@@ -211,7 +211,7 @@ function MetaGrid({ detail }: { detail: TaskDetail }) {
   ];
   if (t.branch) items.push(['分支', t.branch]);
   return (
-    <div className="grid grid-cols-2 gap-x-6 gap-y-2.5 rounded-md border border-edge bg-card px-3.5 py-3 text-[11px]">
+    <div className="grid grid-cols-2 gap-x-3 gap-y-2 rounded-md border border-edge bg-card px-3 py-3 text-[11px] sm:gap-x-6 sm:gap-y-2.5 sm:px-3.5">
       {items.map(([k, v]) => (
         <div key={k} className="flex min-w-0 flex-col gap-0.5">
           <span className="text-fg-dim">{k}</span>
@@ -386,12 +386,12 @@ function ArtifactModal(props: {
   const name = path.split(/[\\/]/).pop() ?? path;
   return (
     <div
-      className="fixed inset-0 z-30 flex items-center justify-center bg-black/60 p-8"
+      className="fixed inset-0 z-30 flex items-end justify-center bg-black/60 p-2 pb-[max(.5rem,env(safe-area-inset-bottom))] sm:items-center sm:p-8"
       style={{ animation: 'fade-in .15s ease-out' }}
       onClick={onClose}
     >
       <div
-        className="flex max-h-full w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-edge-strong bg-panel shadow-2xl"
+        className="flex max-h-[92dvh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-edge-strong bg-panel shadow-2xl"
         onClick={(e) => e.stopPropagation()}
         style={{ animation: 'drawer-in .15s ease-out' }}
       >
@@ -405,7 +405,7 @@ function ArtifactModal(props: {
             ✕
           </button>
         </header>
-        <div className="overflow-auto px-4 py-3">
+        <div className="min-h-0 overflow-auto px-3 py-3 sm:px-4">
           {error && <div className="text-xs text-danger">{error}</div>}
           {!error && !data && <div className="py-8 text-center text-xs text-fg-dim">加载中…</div>}
           {data?.kind === 'text' && (

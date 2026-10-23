@@ -45,13 +45,13 @@ export default function ProjectsDialog(props: {
     <div className="fixed inset-0 z-20" style={{ animation: 'fade-in .15s ease-out' }}>
       <div className="absolute inset-0 bg-black/50" onClick={onClose} />
       <aside
-        className="absolute right-0 top-0 flex h-full w-[560px] max-w-[94vw] flex-col border-l border-edge bg-panel shadow-2xl"
+        className="absolute inset-x-0 bottom-0 top-[env(safe-area-inset-top)] flex h-[calc(100%-env(safe-area-inset-top))] w-full flex-col rounded-t-xl border-t border-edge bg-panel shadow-2xl md:inset-y-0 md:left-auto md:right-0 md:h-full md:w-[560px] md:max-w-[94vw] md:rounded-none md:border-l md:border-t-0"
         style={{ animation: 'drawer-in .18s ease-out' }}
       >
-        <header className="flex shrink-0 items-center gap-3 border-b border-edge px-4 py-3">
+        <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-edge px-3 py-2.5 sm:px-4 sm:py-3">
           <button
             onClick={onClose}
-            className="flex size-7 shrink-0 items-center justify-center rounded-md text-fg-muted hover:bg-elevated hover:text-fg"
+            className="flex size-10 shrink-0 touch-manipulation items-center justify-center rounded-md text-fg-muted hover:bg-elevated hover:text-fg"
             title="关闭"
           >
             <ChevronLeft className="size-4" />
@@ -61,12 +61,12 @@ export default function ProjectsDialog(props: {
             项目
           </div>
           {data?.config_path && (
-            <span className="min-w-0 flex-1 truncate text-right font-mono text-[10.5px] text-fg-dim" title={data.config_path}>
+            <span className="w-full truncate pl-12 font-mono text-[10px] text-fg-dim sm:ml-auto sm:w-auto sm:pl-0 sm:text-right sm:text-[10.5px]" title={data.config_path}>
               {data.config_path}
             </span>
           )}
         </header>
-        <div className="flex-1 space-y-5 overflow-y-auto p-4">
+        <div className="min-h-0 flex-1 space-y-5 overflow-y-auto overscroll-contain p-3 pb-[max(1rem,env(safe-area-inset-bottom))] sm:p-4">
           {loadError && <div className="text-xs text-danger">加载失败：{loadError}</div>}
           {data && (
             <>
