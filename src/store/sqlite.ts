@@ -442,6 +442,27 @@ export class Store {
     this.db.prepare('UPDATE runs SET cancel_requested = 1 WHERE run_id = ?').run(runId);
   }
 
+  /**
+   * Take a crashed run back under control: the recorded child is gone, so the
+   * pid is cleared before a new process may claim the run. Shared by boot-time
+   * reconciliation and the deferred-resume sweep so both count the budget.
+   * Only an active run can be resumed, and only into an active phase —
+   * terminal transitions go through endRun.
+   */
+  resumeRun(runId: string, to: Phase) {
+    this.tx(() => {
+      const run = this.getRun(runId);
+      if (!run) throw new Error(`run ${runId} not found`);
+      if (!RUN_ACTIVE_PHASES.includes(run.phase) || !RUN_ACTIVE_PHASES.includes(to)) {
+        throw new Error(`run ${runId} cannot resume ${run.phase} -> ${to}`);
+      }
+      this.db
+        .prepare('UPDATE runs SET resume_count = resume_count + 1, pid = NULL, process_identity = NULL WHERE run_id = ?')
+        .run(runId);
+      this.transition(runId, run.phase, to, { recovered: true });
+    });
+  }
+
   transition(runId: string, from: Phase | null, to: Phase, detail?: unknown) {
     this.tx(() => {
       const t = now();

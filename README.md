@@ -69,10 +69,12 @@ npm run ui:build
 其他命令：
 
 ```powershell
-npm run ac -- status          # 任务一览（含最近内部错误）
+npm run ac -- status          # 调度状态 + 任务一览（含最近内部错误）
 npm run ac -- runs <issue>    # 单任务事件时间线 + checks 证据
 npm run ac -- stop <issue>    # 安全取消（一个取消轮询周期内生效）
 npm run ac -- retry <issue>   # 以当前 Issue 内容重新批准并入队
+npm run ac -- drain           # 暂停派发新任务并等在途 run 收尾（--timeout-seconds 默认 600）
+npm run ac -- undrain         # 恢复派单
 ```
 
 多项目配置时，`runs`、`stop`、`retry` 需要加 `--repo owner/name`。
@@ -86,6 +88,7 @@ npm run ac -- retry <issue>   # 以当前 Issue 内容重新批准并入队
 | `server.poll_interval_seconds` | `30` | 调度 tick 间隔 |
 | `server.max_concurrent` | `1` | 编码 run 与评审 run 共用的并发上限 |
 | `server.retry_limit` | `3` | 单 run 内修复次数上限，也是任务级修复 run 的轮次上限 |
+| `server.max_resumes` | `2` | 单个 run 崩溃后允许自动恢复的次数（非负整数）；`0` = 不启动恢复执行，需执行的 run 一律 `RECOVERY_REQUIRED`（`PUBLISHING_PR` 已有 PR 的仍可对账收尾） |
 | `server.max_task_minutes` | `45` | 单次 agent 调用的超时（不含排队与 checks） |
 | `server.cancel_poll_seconds` | `5` | cancel 标志的独立轮询间隔 |
 | `server.logs_dir` | `<database 所在目录>/logs` | 事件流与 artifacts 目录 |
@@ -96,8 +99,12 @@ npm run ac -- retry <issue>   # 以当前 Issue 内容重新批准并入队
 | `agent.model` | 必填 | `<provider>/<model id>`，来自 `~/.pi/agent/models.json` |
 | `agent.review_model` | 同 `agent.model` | 评审模型，可用来做异构评审 |
 | `approvals.auto_merge.enabled` | `false` | 仅控制评审 PASS 后是否自动进入合并流程；人工 `agent-merge` 批准不受此开关影响 |
-| `approvals.auto_merge.max_files` | `10` | 改动文件数超过此值 → 风险升级转人工 |
-| `approvals.auto_merge.max_lines` | `400` | 改动行数超过此值 → 风险升级转人工 |
+| `approvals.auto_merge.max_files` | `10` | **源码**文件数超过此值 → 风险升级转人工；生成物、文档、测试不计入 |
+| `approvals.auto_merge.max_lines` | `400` | **源码**增删行数超过此值 → 风险升级转人工；生成物、文档、测试不计入 |
+| `approvals.auto_merge.generated_paths` | `dist/**`、`*.generated.*`、`*.min.*`、`*.map` | 构建产物：不参与风险统计，也不进入评审 diff |
+| `approvals.auto_merge.doc_paths` | `docs/**`、`**/*.md` | 文档：不参与大小闸门 |
+| `projects[].verify_build` | 未设置 | 合并前重建并比对生成物；与提交不一致 → 阻止合并转人工。`approvals.auto_merge.verify_build` 可作全局兜底，项目级优先 |
+| `projects[].verify_bootstrap` | 未设置 | 编码 worktree 不可用时（如 existing-PR 任务），在被批准 SHA 的 detached worktree 上先跑此命令装依赖再构建，如 `npm ci`。无编码 worktree 且无 bootstrap 时构建多半失败转人工 |
 
 `checks.argv` 直接以进程参数数组启动，不经过 shell。Windows 上 `npm`/`npx` 会解析到 Node 入口；其他 `.cmd`/`.bat` 需显式配置可执行入口，否则记基础设施错误。
 
@@ -139,7 +146,7 @@ checks 失败会自动进入修复回路，同一个编码 run 内最多修复 `
 2. 评审现场是该 sha 的本地物化：优先复用编码 worktree（仅当 HEAD 正好是该 sha 且工作区干净），否则新建 detached worktree。评审结束后宿主校验 HEAD 未移动、工作区干净；被改动或 HEAD 被移动 → `ERROR` 结论并转人工，不会采纳评审意见。
 3. 结论处理：
    - **PASS + 低风险**：`approvals.auto_merge.enabled: true` 时任务进 `MERGING`；关闭时进 `AWAITING_HUMAN` 等人工处理。
-   - **PASS 但宿主判定高风险**：进 `AWAITING_HUMAN` 并加 `agent-high-risk`。触发条件包括 reviewer 标记 `risk=high`、改动文件数/行数超限、命中权限/认证/密钥/依赖/构建/迁移路径，或修改了既有测试。
+   - **PASS 但宿主判定高风险**：进 `AWAITING_HUMAN` 并加 `agent-high-risk`。触发条件包括 reviewer 标记 `risk=high`、**源码**文件数/行数超限、命中权限/认证/密钥/构建/迁移路径、依赖声明变化（`package.json` 的 `dependencies`/`engines` 等，改 `scripts` 不算）、或测试覆盖被削弱（删除测试文件，或净删除 10 行以上）。生成物（`dist/**` 等）与文档既不计数也不进入评审 diff，只在 diff 开头标注被省略的文件。
    - **BLOCK 且有具体 findings 且任务级修复预算未耗尽**：写 `pending_fix`，任务回 `DISCOVERED` 派生一轮冷启动修复 run；修复后重新 checks + 评审。修复 run 没有产生新提交（HEAD 仍是评审 sha）→ `BLOCKED`。
    - **BLOCK 但无 findings 或预算耗尽** → `BLOCKED`。
    - **评审基础设施不可用**（现场物化失败、diff 不可得、reviewer 进程失败等）→ 记 `ERROR` 或 `HUMAN_REVIEW_REQUIRED`，转 `AWAITING_HUMAN` + `agent-high-risk`，不消耗修复预算。
@@ -166,6 +173,7 @@ checks 失败会自动进入修复回路，同一个编码 run 内最多修复 `
 | checks / 评审修复预算耗尽 | `BLOCKED`，Issue 收到评论 | 看 `runs <issue>` 证据，人工处理或 `retry` |
 | 执行/评审期间 Issue 内容被改 | `BLOCKED_APPROVAL_CHANGED` | `npm run ac -- retry <issue>` 重新批准当前内容 |
 | 中途叫停 | 活动 run 被取消 | `npm run ac -- stop <issue>` |
+| 服务正常停机（SIGTERM/SIGBREAK） | 活动编码 run 挂起，保持当前相位 | 不取消、不释放 `agent-running`；下次启动对账自动续行 |
 | 服务崩溃 | 启动时先对账 | 能证明子进程已死、现场可用且恢复预算内 → 自动从已存相位续行；否则 `RECOVERY_REQUIRED` |
 | PR 被关闭 | `BLOCKED` | 人工重开原 PR，或新建任务 |
 
@@ -178,6 +186,25 @@ checks 失败会自动进入修复回路，同一个编码 run 内最多修复 `
 
 `retry` 只接受 `BLOCKED`、`BLOCKED_APPROVAL_CHANGED`、`FAILED`、`CANCELED`、`RECOVERY_REQUIRED`。重试前会检查旧 PID 身份和 worktree 孤儿进程；无法证明旧进程已退出则拒绝。若 Issue 上仍有 `agent-running` 标签，需先确认没有其他调度器持有它，再人工移除。
 
+`RECOVERY_REQUIRED` 对 `agent-running` 的处理是保守的：只有已证明旧子进程不存在的停车（恢复预算耗尽、worktree 缺失、GitHub 查询失败等）才会顺带摘除 issue 的 `agent-running` 标签，避免它无限期挡住重试或其他实例；pid 可能存活、worktree 有孤儿进程、或扫描失败时标签一律保留——摘除失败只记日志，不影响本地停车。
+
+### 6. 维护窗口：drain / undrain
+
+升级或维护前的标准顺序是「先停派单，再等收尾」：
+
+```powershell
+npm run ac -- drain --timeout-seconds 600
+# 排空成功后调度仍保持暂停，此时重启服务（计划任务 / systemctl）
+# 重启后确认服务健康（status / UI / 日志 reconcile_done）
+npm run ac -- undrain
+```
+
+- `drain` 只暂停**新工作**：发现、code/review 派单、merge sweep 全部停；在途 run 和崩溃恢复队列继续正常收尾，**不取消任务、不强杀进程**。
+- 请求持久化在数据库里：重启后仍处于暂停态，启动对账会先把崩溃前在途的 run 恢复完再继续排空。
+- 确认条件严格：只有调度器在 tick 完全收尾后确认无任何在途 run，才写回本次请求的 ack。服务没运行或卡住不确认时，`drain` 到 `--timeout-seconds`（默认 600，正整数）后以非 0 退出，暂停标记保留。
+- `status` 第一行显示「运行中 / 排空中 / 已排空」；`undrain` 清除暂停标记，下个 tick 恢复派单。
+- `drain`/`undrain` 不重启服务。`systemctl restart` 发的是 SIGTERM，走优雅停机：在途编码 run 挂起（保留相位与 `agent-running`），下次启动对账自动续行，不再取消。Windows 计划任务停止/`schtasks /end` 是强杀，不保证走到停机 handler——其效果等同崩溃，已落盘的 Pi 会话仍可恢复，但需按崩溃对账路径走 PID/孤儿检查。
+
 ## 质量闸门
 
 - **checks 是受信的**：命令只来自仓库配置，不来自 Issue。checks 执行前后都会校验 HEAD 和工作区；测试过程中代码被改动 → `BLOCKED`。命令启动失败、超时或异常终止记基础设施错误，不自动修改业务代码。
@@ -185,7 +212,9 @@ checks 失败会自动进入修复回路，同一个编码 run 内最多修复 `
 - **证据绑定 SHA**：checks 与 review 结论都写入 `check_results.head_sha`。评审证据只取被审 sha 对应的检查结果；历史数据没有 `head_sha` 时会明确告知评审“证据未绑定当前 SHA”。
 - **评审只拦有证据的问题**：仅对可复现的正确性、验收或越界问题返回 `BLOCK`，findings 必填。风格偏好、可选重构和超出任务范围的改进不作为阻塞项。
 - **失效即转人工**：评审现场物化失败、diff 超限/不可得、HEAD/工作区被改动、评审输出无法恢复，统一转人工，不惩罚编码成果。即使从叙述中恢复出结论，也会强制按高风险处理，不自动合并。
-- **恢复不重复执行**：重启时若无法证明旧子进程已死，进入 `RECOVERY_REQUIRED` 而不是再起一个；每个 run 最多自动恢复 2 次，预算耗尽同样转人工。
+- **恢复不重复执行**：重启时若无法证明旧子进程已死，进入 `RECOVERY_REQUIRED` 而不是再起一个；每个 run 最多自动恢复 `server.max_resumes` 次（默认 2），预算耗尽同样转人工。
+- **Pi 会话按 run 持久化**：编码会话绑定 `--session-id <run_id>` / `--session-dir <run artifacts>/pi-session`，RUNNING/FIXING 与重启恢复共享同一份已落盘历史；恢复的第一次 agent 调用会带上「服务重启后的接续」说明。session 文件随 run 的 artifacts 目录保留（本版不新增清理策略、不自动删文件）；会话目录只认绑定 `run_id` + 工作目录的头记录，损坏/错配/多文件时拒绝复用而不是静默换会话。
+- **恢复语义有边界**：被切断前未落盘的流式 token、正在执行的外部命令无法保证恰好一次；恢复后由提示词引导先 `git status`/`git diff`/`git log` 核实现状再续做。升级前用 `--no-session` 跑的旧 run 没有历史可找回，只能无上下文续做（行为同前版）。服务停机不等同于取消：挂起的 run 记 `service_shutdown` 事件、`cancel_requested` 仍为 0；`stop <issue>` 的显式取消优先于停机，仍然落 `CANCELED`。
 
 ## Web 管理界面
 

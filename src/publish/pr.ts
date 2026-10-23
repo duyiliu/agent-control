@@ -49,7 +49,7 @@ export async function publishDraftPr(input: {
 
   const existing = await tracker.findPrForBranch(project.repo, branch);
   await assertReviewed();
-  await workspace.push(worktreePath, branch, input.expectedHead);
+  await workspace.push(worktreePath, branch, project.git_remote, input.expectedHead);
   await assertReviewed();
   if (existing) return existing;
 

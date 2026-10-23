@@ -295,9 +295,12 @@ function Timeline({ run }: { run: RunDetail }) {
             <span className="absolute -left-[21px] top-[7px] size-1.5 rounded-full bg-fg-dim" />
             <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
               <span className="font-mono text-[10.5px] text-fg-dim">{fmtTime(e.at)}</span>
-              <span className="font-mono text-[11px] text-fg">
-                {e.from_phase ? `${e.from_phase} → ` : ''}
-                {e.to_phase}
+              <span
+                className="font-mono text-[11px] text-fg"
+                title={e.from_phase ? `${e.from_phase} → ${e.to_phase}` : e.to_phase}
+              >
+                {e.from_phase ? `${phaseLabel(e.from_phase)} → ` : ''}
+                {phaseLabel(e.to_phase)}
               </span>
             </div>
             {e.detail_json && (

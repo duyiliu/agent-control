@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Activity, Check, Palette, RefreshCw, TriangleAlert } from 'lucide-react';
-import { fetchHealth, fetchTasks, postAction, type HealthInfo, type TaskSummary } from './api';
+import { Activity, Check, FolderGit2, Palette, RefreshCw, TriangleAlert } from 'lucide-react';
+import { fetchHealth, fetchProjects, fetchTasks, postAction, type HealthInfo, type TaskSummary } from './api';
 import { fmtDur } from './groups';
 import Board from './Board';
 import DetailDrawer from './DetailDrawer';
+import ProjectsDialog from './ProjectsDialog';
 
 export interface Toast {
   msg: string;
@@ -37,12 +38,19 @@ function useTheme(): [ThemeId, (t: ThemeId) => void] {
 export default function App() {
   const [tasks, setTasks] = useState<TaskSummary[] | null>(null);
   const [health, setHealth] = useState<HealthInfo | null>(null);
+  const [projectRepos, setProjectRepos] = useState<string[]>([]);
   const [selected, setSelected] = useState<number | null>(null);
+  const [showProjects, setShowProjects] = useState(false);
   const [tick, setTick] = useState(0);
   const [toast, setToast] = useState<Toast | null>(null);
   const [theme, setTheme] = useTheme();
 
   const refresh = useCallback(async () => {
+    // Projects feed the board's repo filter; a failure keeps the last list
+    // and must not block the task/health update.
+    fetchProjects()
+      .then((p) => setProjectRepos(p.projects.map((x) => x.repo)))
+      .catch(() => {});
     try {
       const [t, h] = await Promise.all([fetchTasks(), fetchHealth()]);
       setTasks(t.tasks);
@@ -88,21 +96,36 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex h-11 shrink-0 items-center gap-4 border-b border-edge px-4">
-        <div className="flex items-center gap-2 text-[13px] font-semibold text-fg">
+      <header className="flex min-h-11 shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-edge px-4 py-2 md:h-11 md:flex-nowrap md:py-0">
+        <div className="flex shrink-0 items-center gap-2 whitespace-nowrap text-[13px] font-semibold text-fg">
           <Activity className="size-3.5 text-fg-muted" />
           agent-control
         </div>
         <HealthLine health={health} />
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          <button
+            onClick={() => setShowProjects(true)}
+            className="flex items-center gap-1.5 rounded-md border border-edge px-2 py-1 text-[11px] text-fg-muted transition-colors hover:border-edge-strong hover:text-fg"
+            title="查看/添加 GitHub 项目"
+          >
+            <FolderGit2 className="size-3" />
+            项目
+          </button>
           <ThemeSwitcher theme={theme} onChange={setTheme} />
-          <span className="flex items-center gap-1.5 text-[11px] text-fg-dim">
+          <span className="hidden items-center gap-1.5 text-[11px] text-fg-dim md:flex">
             <RefreshCw className="size-3" />
             自动刷新 5 秒
           </span>
         </div>
       </header>
-      <Board tasks={tasks} tick={tick} selected={selected} onSelect={setSelected} onStop={stopByDrag} />
+      <Board
+        tasks={tasks}
+        projectRepos={projectRepos}
+        tick={tick}
+        selected={selected}
+        onSelect={setSelected}
+        onStop={stopByDrag}
+      />
       {selected !== null && (
         <DetailDrawer
           taskId={selected}
@@ -110,6 +133,9 @@ export default function App() {
           onChanged={refresh}
           onToast={setToast}
         />
+      )}
+      {showProjects && (
+        <ProjectsDialog onClose={() => setShowProjects(false)} onChanged={refresh} onToast={setToast} />
       )}
       {toast && (
         <div
@@ -195,7 +221,7 @@ function HealthLine({ health }: { health: HealthInfo | null }) {
   if (!health) return null;
   const upFrom = new Date(Date.now() - health.uptime_s * 1000).toISOString();
   return (
-    <div className="flex min-w-0 items-center gap-3 text-[11px] text-fg-muted">
+    <div className="order-3 flex w-full min-w-0 items-center gap-3 text-[11px] text-fg-muted md:order-none md:w-auto">
       <span className="flex items-center gap-1.5 whitespace-nowrap">
         <span
           className="size-1.5 rounded-full bg-ok"

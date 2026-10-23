@@ -97,6 +97,14 @@ export function buildFixPrompt(ctx: PromptContext, evidence: string): string {
   ].join('\n');
 }
 
+export const CODER_RESUME_NOTE = [
+  '# 服务重启后的接续',
+  '这是同一个 run 的恢复，不是新任务。Pi 会话中已有的历史仅代表此前已保存的进度。',
+  '先用 git status、git diff 和 git log 核对当前工作区与提交，再继续尚未完成的工作。',
+  '上一次工具调用可能已完成、失败或只执行了一部分；先核实结果，不要盲目重复命令、覆盖文件或重复提交。',
+  '若任务已经完成，不要重做；报告现状，交由宿主重新验证和发布。',
+].join('\n');
+
 export const MAX_REVIEW_DIFF_CHARS = 120_000;
 
 export function buildReviewPrompt(ctx: PromptContext, testEvidence: string, diffEvidence: string, headSha?: string, strictReminder = false): string {
@@ -107,6 +115,7 @@ export function buildReviewPrompt(ctx: PromptContext, testEvidence: string, diff
     '# 审查对象',
     `当前目录是隔离 worktree。分支 ${ctx.branch} 相对 ${ctx.project.base_branch} 的全部改动已由宿主生成，见下方 <diff> 块，它是待审查改动的权威证据。`,
     `本轮待审查提交 SHA：${headSha ?? '(未提供)'}。只可依据该 SHA 对应的 <diff> 和测试证据作出结论。`,
+    '若 <diff> 开头标注了「已省略 N 个生成物文件」（dist 等构建产物），那是宿主有意省略的可复现产物，不算证据缺失；请基于源码判断。',
     '不要依赖 git 子命令（本环境中它们可能失败）。如需核实上下文，直接读取 worktree 中的文件。',
     '',
     '# 待审查改动（宿主生成，可信）',

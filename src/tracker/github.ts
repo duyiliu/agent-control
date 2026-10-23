@@ -29,6 +29,13 @@ export interface OpenPr {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Labels the scheduler relies on beyond the per-project ready_label —
+ *  provisioned (best-effort) when a project is added through the UI. */
+export const SYSTEM_LABELS = [
+  'agent-running', 'agent-blocked', 'agent-pr', 'agent-reviewing',
+  'agent-high-risk', 'agent-merge', 'agent-review',
+];
+
 /**
  * GitHub access via the `gh` CLI. Returns structured data; throws
  * TrackerError on persistent failure. Retries transient errors with
@@ -261,6 +268,30 @@ export class GitHubTracker {
     ]);
     const have = new Set(rows.map((r) => r.name));
     return { ok: labels.every((l) => have.has(l)), missing: labels.filter((l) => !have.has(l)) };
+  }
+
+  /** Cheap existence+access check used when a project is added at runtime. */
+  async checkRepoExists(repo: string): Promise<void> {
+    await this.resolveRepo(repo);
+  }
+
+  /** Canonical owner/name — gh follows GitHub's rename redirects, so a stale
+   *  remote URL still resolves to the repo it actually feeds. */
+  async resolveRepo(repo: string): Promise<string> {
+    const o = await this.ghJson<{ nameWithOwner: string }>(['repo', 'view', repo, '--json', 'nameWithOwner']);
+    return o.nameWithOwner;
+  }
+
+  /** Create a label if missing; --force turns the already-exists race into a no-op. */
+  async createLabel(repo: string, name: string): Promise<void> {
+    const res = await this.exec({
+      argv: [this.ghPath, 'label', 'create', name, '-R', repo, '--color', '7d7bff', '--force'],
+      timeoutMs: 60_000,
+      streamStdoutToLog: false,
+    });
+    if (res.exitCode !== 0) {
+      throw new TrackerError(`gh label create ${name} failed: ${res.stderrTail.trim() || 'unknown'}`, res);
+    }
   }
 }
 

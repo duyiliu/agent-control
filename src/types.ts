@@ -56,6 +56,10 @@ export interface ProjectConfig {
   repo: string;
   local_repo: string;
   base_branch: string;
+  /** Remote the scheduler fetches/pushes — 'origin' by default; a clone may
+   *  name its GitHub remote differently (e.g. 'github' when 'origin' is a
+   *  company mirror). */
+  git_remote: string;
   ready_label: string;
   branch_prefix: string;
   checks: CheckSpec[];
@@ -67,6 +71,14 @@ export interface ProjectConfig {
    *  them (the PR is the whole input). 'manual': only PRs a human summons
    *  with the agent-review label are reviewed. */
   pr_review: 'auto' | 'manual';
+  /** Rebuild the approved head before merging and refuse if generated paths
+   *  drift from the commit. Project-level because each repo builds its own
+   *  way; falls back to approvals.auto_merge.verify_build when unset. */
+  verify_build?: CheckSpec;
+  /** Optional dependency install run before verify_build when there is no
+   *  usable coding worktree (e.g. existing-PR tasks) — the check then runs in
+   *  a detached worktree of the approved sha, which starts with no deps. */
+  verify_bootstrap?: CheckSpec;
 }
 
 export interface AppConfig {
@@ -74,6 +86,8 @@ export interface AppConfig {
     poll_interval_seconds: number;
     max_concurrent: number;
     retry_limit: number;
+    /** Crash-recovery resumes allowed per run before parking on RECOVERY_REQUIRED. */
+    max_resumes: number;
     max_task_minutes: number;
     worktree_root: string;
     database: string;
@@ -104,8 +118,21 @@ export interface AppConfig {
     /** Host-side auto-merge for low-risk PRs that pass review. */
     auto_merge: {
       enabled: boolean;
+      /** Source files only — generated output, docs and tests are excluded. */
       max_files: number;
+      /** Source lines only — generated output, docs and tests are excluded. */
       max_lines: number;
+      /** Build outputs excluded from risk counting and the reviewer diff. */
+      generated_paths?: string[];
+      /** Documentation excluded from the size gate. */
+      doc_paths?: string[];
+      /** Rebuild before merging and refuse if the generated files drift from
+       *  the commit. This is the counterweight for excluding them from review:
+       *  a hand-edited build output would otherwise be invisible. */
+      verify_build?: CheckSpec;
+      /** Ran before verify_build on the detached-worktree fallback path —
+       *  e.g. `npm ci` — since a fresh materialization has no node_modules. */
+      verify_bootstrap?: CheckSpec;
     };
   };
 }

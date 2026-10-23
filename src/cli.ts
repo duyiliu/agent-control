@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { loadConfig } from './config.js';
 import { createApp, runDoctor, startService } from './app.js';
 import { GitHubTracker } from './tracker/github.js';
-import { retryTask, stopTask } from './ops.js';
+import { requestDrain, resumeDispatch, retryTask, stopTask, waitForDrain } from './ops.js';
 import { Store } from './store/sqlite.js';
 import type { AppConfig } from './types.js';
 
@@ -18,6 +18,8 @@ Usage:
   agent-control [--config <path>] runs <issue-number> [--repo owner/name]
   agent-control [--config <path>] retry <issue-number> [--repo owner/name]
   agent-control [--config <path>] stop  <issue-number> [--repo owner/name]
+  agent-control [--config <path>] drain [--timeout-seconds <n>]
+  agent-control [--config <path>] undrain
 
 Config resolution: --config > AGENT_CONTROL_CONFIG > ./agent-control.yaml > ./config.yaml
 `;
@@ -34,13 +36,14 @@ function resolveConfigPath(flag?: string): string | null {
 function pickRepo(config: AppConfig, flag?: string): string {
   if (flag) return flag;
   if (config.projects.length === 1) return config.projects[0]!.repo;
+  if (config.projects.length === 0) throw new Error('no projects configured; pass --repo owner/name');
   throw new Error('multiple projects configured; pass --repo owner/name');
 }
 
 async function main() {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
-    options: { config: { type: 'string' }, repo: { type: 'string' } },
+    options: { config: { type: 'string' }, repo: { type: 'string' }, 'timeout-seconds': { type: 'string' } },
   });
   const cmd = positionals[0];
   if (!cmd || cmd === 'help' || cmd === '--help') {
@@ -75,7 +78,7 @@ async function main() {
 
     case 'start': {
       if (!config) die(`config required: ${configError}`);
-      const app = createApp(config);
+      const app = createApp(config, configPath ?? undefined);
       console.log(`agent-control starting; db=${config.server.database} poll=${config.server.poll_interval_seconds}s`);
       await startService(app);
       return; // startService never returns until shutdown
@@ -85,6 +88,9 @@ async function main() {
       if (!config) die(`config required: ${configError}`);
       const store = new Store(config.server.database);
       try {
+        const requested = store.getMeta('drain_requested');
+        const drainState = !requested ? '运行中' : store.getMeta('drain_ack') === requested ? '已排空' : '排空中';
+        console.log(`调度状态：${drainState}`);
         const tasks = store.listTasks();
         if (tasks.length === 0) { console.log('(no tasks)'); return; }
         for (const t of tasks) {
@@ -162,6 +168,40 @@ async function main() {
         const task = store.getTask(repo, issueNumber);
         if (!task) die(`no task for ${repo}#${issueNumber}`);
         console.log(stopTask(store, task));
+      } finally {
+        store.close();
+      }
+      return;
+    }
+
+    case 'drain': {
+      if (!config) die(`config required: ${configError}`);
+      const timeoutSec = Number(values['timeout-seconds'] ?? '600');
+      if (!Number.isInteger(timeoutSec) || timeoutSec <= 0) die('drain --timeout-seconds 必须是正整数');
+      const store = new Store(config.server.database);
+      try {
+        const requestId = requestDrain(store);
+        console.log(`已请求排空（request ${requestId.slice(0, 8)}…）：停止派发新任务，在途 run 继续正常收尾`);
+        try {
+          await waitForDrain(store, requestId, timeoutSec * 1000);
+        } catch (err) {
+          console.error(`error: ${err instanceof Error ? err.message : err}`);
+          process.exitCode = 1;
+          return;
+        }
+        console.log('排空完成：没有在途 run。调度仍保持暂停——重启服务、确认健康后用 undrain 恢复派单。');
+      } finally {
+        store.close();
+      }
+      return;
+    }
+
+    case 'undrain': {
+      if (!config) die(`config required: ${configError}`);
+      const store = new Store(config.server.database);
+      try {
+        resumeDispatch(store);
+        console.log('已恢复派单：调度器下个轮询周期起正常发现与派发任务。');
       } finally {
         store.close();
       }

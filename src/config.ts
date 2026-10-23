@@ -1,6 +1,7 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import YAML from 'yaml';
+import { isMap, isSeq } from 'yaml';
 import type { AppConfig, CheckSpec, ProjectConfig } from './types.js';
 
 export class ConfigError extends Error {}
@@ -24,9 +25,22 @@ function asNum(v: unknown, name: string, min: number): number {
   return v;
 }
 
+function asNonNegInt(v: unknown, name: string): number {
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) fail(`${name} must be a non-negative integer`);
+  return v;
+}
+
 function asBool(v: unknown, name: string): boolean {
   if (typeof v !== 'boolean') fail(`${name} must be a boolean`);
   return v;
+}
+
+function optStrArray(v: unknown, name: string): string[] | undefined {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v) || v.length === 0 || v.some((item) => typeof item !== 'string' || item.length === 0)) {
+    fail(`${name} must be a non-empty string array`);
+  }
+  return v as string[];
 }
 
 const PLATFORMS: readonly NodeJS.Platform[] = ['aix', 'android', 'darwin', 'freebsd', 'haiku', 'linux', 'openbsd', 'sunos', 'win32', 'cygwin', 'netbsd'];
@@ -57,7 +71,7 @@ function parseCheck(v: unknown, name: string): CheckSpec {
   return spec;
 }
 
-function parseProject(v: unknown, idx: number): ProjectConfig {
+function parseProject(v: unknown, idx: number | string): ProjectConfig {
   const name = `projects[${idx}]`;
   const o = asObj(v, name);
   const checksRaw = o['checks'] ?? [];
@@ -71,11 +85,14 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
     repo: asStr(o['repo'], `${name}.repo`),
     local_repo: resolve(asStr(o['local_repo'], `${name}.local_repo`)),
     base_branch: asStr(o['base_branch'] ?? 'main', `${name}.base_branch`),
+    git_remote: asStr(o['git_remote'] ?? 'origin', `${name}.git_remote`),
     ready_label: asStr(o['ready_label'] ?? 'agent-ready', `${name}.ready_label`),
     branch_prefix: asStr(o['branch_prefix'] ?? 'agent/issue-', `${name}.branch_prefix`),
     checks: checksRaw.map((c, i) => parseCheck(c, `${name}.checks[${i}]`)),
     review_mode: mode,
     pr_review: prReview,
+    verify_build: o['verify_build'] !== undefined ? parseCheck(o['verify_build'], `${name}.verify_build`) : undefined,
+    verify_bootstrap: o['verify_bootstrap'] !== undefined ? parseCheck(o['verify_bootstrap'], `${name}.verify_bootstrap`) : undefined,
   };
 }
 
@@ -94,8 +111,10 @@ export function loadConfig(path: string): AppConfig {
   const uiHost = asStr(uiRaw['host'] ?? '127.0.0.1', 'server.ui.host');
 
   const projectsRaw = root['projects'];
-  if (!Array.isArray(projectsRaw) || projectsRaw.length === 0) {
-    fail('projects must be a non-empty array');
+  // An empty list is legitimate: the scheduler idles and projects are added
+  // later through the UI (POST /api/projects writes back into this file).
+  if (!Array.isArray(projectsRaw)) {
+    fail('projects must be an array');
   }
 
   const agent = asObj(root['agent'] ?? {}, 'agent');
@@ -149,6 +168,7 @@ export function loadConfig(path: string): AppConfig {
       poll_interval_seconds: asNum(server['poll_interval_seconds'] ?? 30, 'server.poll_interval_seconds', 1),
       max_concurrent: asNum(server['max_concurrent'] ?? 1, 'server.max_concurrent', 1),
       retry_limit: asNum(server['retry_limit'] ?? 3, 'server.retry_limit', 0),
+      max_resumes: asNonNegInt(server['max_resumes'] ?? 2, 'server.max_resumes'),
       max_task_minutes: asNum(server['max_task_minutes'] ?? 45, 'server.max_task_minutes', 1),
       worktree_root: resolve(asStr(server['worktree_root'], 'server.worktree_root')),
       database,
@@ -176,6 +196,14 @@ export function loadConfig(path: string): AppConfig {
         enabled: asBool(autoMerge['enabled'] ?? false, 'approvals.auto_merge.enabled'),
         max_files: asNum(autoMerge['max_files'] ?? 10, 'approvals.auto_merge.max_files', 1),
         max_lines: asNum(autoMerge['max_lines'] ?? 400, 'approvals.auto_merge.max_lines', 1),
+        generated_paths: optStrArray(autoMerge['generated_paths'], 'approvals.auto_merge.generated_paths'),
+        doc_paths: optStrArray(autoMerge['doc_paths'], 'approvals.auto_merge.doc_paths'),
+        verify_build: autoMerge['verify_build'] !== undefined
+          ? parseCheck(autoMerge['verify_build'], 'approvals.auto_merge.verify_build')
+          : undefined,
+        verify_bootstrap: autoMerge['verify_bootstrap'] !== undefined
+          ? parseCheck(autoMerge['verify_bootstrap'], 'approvals.auto_merge.verify_bootstrap')
+          : undefined,
       },
     },
   };
@@ -184,4 +212,51 @@ export function loadConfig(path: string): AppConfig {
 function dirname2(p: string): string {
   const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
   return i > 0 ? p.slice(0, i) : '.';
+}
+
+/** Validate a UI/CLI-supplied project object without touching the file. */
+export function validateProject(v: unknown): ProjectConfig {
+  return parseProject(v, 'new');
+}
+
+/**
+ * Append a project to the config file and return the freshly parsed config.
+ * The YAML Document API preserves comments and formatting everywhere else.
+ * Validation runs before any write; if the re-parse somehow fails the
+ * original bytes are restored.
+ */
+export function appendProjectToConfigFile(configPath: string, raw: unknown): AppConfig {
+  validateProject(raw);
+  const before = readFileSync(configPath, 'utf8');
+  const doc = YAML.parseDocument(before);
+  const projects = doc.get('projects', true);
+  if (!isSeq(projects)) fail('projects must be a sequence');
+  // `projects: []` parses as a flow seq — appending would otherwise render
+  // the whole list inline instead of the file's block style.
+  projects.flow = false;
+  const node = doc.createNode(raw);
+  if (isMap(node)) {
+    const checks = node.get('checks', true);
+    if (isSeq(checks)) {
+      for (const c of checks.items) {
+        // Flow `[a, b]` argv keeps the file consistent with hand-written entries.
+        const argv = isMap(c) ? c.get('argv', true) : undefined;
+        if (isSeq(argv)) argv.flow = true;
+      }
+    }
+  }
+  projects.add(node);
+  const tmp = `${configPath}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, doc.toString(), 'utf8');
+    renameSync(tmp, configPath);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+  try {
+    return loadConfig(configPath);
+  } catch (err) {
+    writeFileSync(configPath, before, 'utf8');
+    throw err;
+  }
 }

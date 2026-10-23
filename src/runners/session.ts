@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { createWriteStream, mkdirSync, writeFileSync, type WriteStream } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, type WriteStream } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
-import { dirname } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { killTree, scrubEnvForAgent } from '../proc.js';
 import type { AppConfig } from '../types.js';
 import { buildRpcArgv, resolvePiInvocation, type PiInvocation } from './pi.js';
@@ -46,6 +46,11 @@ export interface CoderSessionOpts {
   lastMessagePath: string;
   onSpawn?: (pid: number | null, identity: string | null) => void;
   invocation?: PiInvocation;
+  /** Persistent session binding: resume history survives a host restart.
+   *  Must be set as a pair — one without the other throws. Unset keeps the
+   *  ephemeral --no-session behaviour. */
+  sessionId?: string;
+  sessionDir?: string;
 }
 
 interface PendingCommand {
@@ -98,6 +103,58 @@ function assistantText(message: unknown): string | null {
   return texts.length ? texts.join('\n') : null;
 }
 
+/** The persisted Pi session cannot be loaded safely — never silently replaced. */
+export class SessionRestoreError extends Error {
+  constructor(message: string) { super(message); this.name = 'SessionRestoreError'; }
+}
+
+interface SessionPreflight {
+  /** Absolute path of the pre-existing session file, null when dir is empty. */
+  file: string | null;
+  /** The file already holds conversation entries (user/assistant records). */
+  hasConversation: boolean;
+}
+
+/**
+ * Persistent-session preflight: the dir is per-run. An existing *.jsonl must
+ * be a Pi session file whose header id and cwd match this binding — anything
+ * else (corrupt head, foreign id/cwd, multiple files) means we cannot prove
+ * the history is this run's, so refuse rather than silently forking a new
+ * session over unknown files. Empty dir is fine (fresh run or upgraded run).
+ * Only the header and the presence of conversation entries are inspected —
+ * a truncated tail line Pi can repair is not our business.
+ */
+function verifySessionDir(sessionDir: string, sessionId: string, workdir: string): SessionPreflight {
+  mkdirSync(sessionDir, { recursive: true });
+  const files = readdirSync(sessionDir).filter((f) => f.endsWith('.jsonl'));
+  if (files.length === 0) return { file: null, hasConversation: false };
+  if (files.length > 1) {
+    throw new SessionRestoreError(`pi session dir ${sessionDir} holds ${files.length} session files; expected at most one`);
+  }
+  const filePath = join(sessionDir, files[0]!);
+  const lines = readFileSync(filePath, 'utf8').split('\n').filter((l) => l.trim());
+  let header: { type?: unknown; id?: unknown; cwd?: unknown } | null;
+  try { header = JSON.parse(lines[0] ?? '') as typeof header; } catch {
+    throw new SessionRestoreError(`pi session file ${files[0]} has an unreadable header; refusing to reuse`);
+  }
+  if (typeof header !== 'object' || header === null || Array.isArray(header)) {
+    throw new SessionRestoreError(`pi session file ${files[0]} has a malformed header; refusing to reuse`);
+  }
+  if (header.type !== 'session' || header.id !== sessionId) {
+    throw new SessionRestoreError(`pi session file ${files[0]} does not belong to session ${sessionId}; refusing to reuse`);
+  }
+  if (typeof header.cwd !== 'string' || resolve(header.cwd) !== resolve(workdir)) {
+    throw new SessionRestoreError(`pi session file ${files[0]} was opened in ${String(header.cwd)} not ${workdir}; refusing to reuse`);
+  }
+  const hasConversation = lines.slice(1).some((l) => {
+    try {
+      const e = JSON.parse(l) as { type?: unknown; role?: unknown; message?: { role?: unknown } };
+      return e.role === 'user' || e.role === 'assistant' || e.message?.role === 'user' || e.message?.role === 'assistant' || e.type === 'message';
+    } catch { return false; } // a torn tail line is Pi's to repair, not a rejection reason
+  });
+  return { file: filePath, hasConversation };
+}
+
 export class PiCoderSession implements CoderSession {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly log: WriteStream;
@@ -109,11 +166,21 @@ export class PiCoderSession implements CoderSession {
   private stderrTail = '';
   private seq = 0;
   private exitInfo: { code: number | null; signal: string | null } | null = null;
+  private readonly preflight: SessionPreflight | null;
+  // Cached forever once kicked off: a rejected handshake rejects every later
+  // prompt identically — never retried into a silent cold session.
+  private handshake: Promise<void> | null = null;
 
   constructor(private readonly opts: CoderSessionOpts) {
+    if ((opts.sessionId == null) !== (opts.sessionDir == null)) {
+      throw new SessionRestoreError('CoderSessionOpts.sessionId and sessionDir must be set together');
+    }
+    this.preflight = opts.sessionDir != null
+      ? verifySessionDir(opts.sessionDir, opts.sessionId!, opts.workdir)
+      : null;
     const inv = opts.invocation ?? resolvePiInvocation(process.env.PATH ?? '', opts.agentConfig.pi_path);
     const argv = buildRpcArgv(
-      { tools: opts.tools, model: opts.model, thinking: opts.thinking },
+      { tools: opts.tools, model: opts.model, thinking: opts.thinking, sessionId: opts.sessionId, sessionDir: opts.sessionDir },
       inv,
     );
     const env = scrubEnvForAgent(process.env, opts.agentConfig.env_deny);
@@ -154,6 +221,37 @@ export class PiCoderSession implements CoderSession {
     }
     if (turnOpts.signal?.aborted) return this.deadTurn('aborted before prompt', true);
 
+    if (this.preflight) {
+      this.handshake ??= this.verifyPersistentSession();
+      const handshake = this.handshake;
+      if (turnOpts.signal) {
+        // Abort during the (possibly slow) handshake must surface now, not
+        // after a 30s get_state wait — the read-only probes just finish on
+        // their own / are torn down by close().
+        let abortListener: (() => void) | undefined;
+        const aborted = new Promise<'aborted'>((res) => {
+          abortListener = () => res('aborted');
+          turnOpts.signal!.addEventListener('abort', abortListener, { once: true });
+        });
+        let outcome: 'ok' | 'aborted';
+        try {
+          outcome = await Promise.race([handshake.then(() => 'ok' as const), aborted]);
+        } finally {
+          turnOpts.signal.removeEventListener('abort', abortListener!);
+        }
+        if (outcome === 'aborted') return this.deadTurn('aborted before prompt', true);
+      } else {
+        await handshake;
+      }
+      // Anything settled while the handshake was in flight still means: do
+      // not send the prompt.
+      if (turnOpts.signal?.aborted) return this.deadTurn('aborted before prompt', true);
+      const exit = this.exitInfo as { code: number | null; signal: string | null } | null;
+      if (exit) {
+        return this.deadTurn(`session exited (${exit.code ?? exit.signal ?? 'unknown'})`);
+      }
+    }
+
     const turn = this.beginTurn();
     const settled = new Promise<CoderTurn>((resolve) => { turn.resolve = resolve; });
     const onAbort = () => this.abortTurn(turn, { aborted: true });
@@ -188,6 +286,43 @@ export class PiCoderSession implements CoderSession {
       }
     }
     this.log.end();
+  }
+
+  /**
+   * One-time proof that pi opened THE bound session before the first prompt
+   * is sent: get_state must name our id and a file inside our sessionDir
+   * (the pre-existing file when there was one — pi silently creates a new
+   * file with the same id when it cannot find the old one), and a dir that
+   * already held conversation must come back with non-empty history.
+   */
+  private async verifyPersistentSession() {
+    const { sessionId, sessionDir } = this.opts;
+    const state = await this.send({ type: 'get_state' });
+    if (state.success === false) {
+      throw new SessionRestoreError(`pi get_state failed: ${state.error ?? 'unknown'}`);
+    }
+    const data = (state.data ?? {}) as { sessionId?: unknown; sessionFile?: unknown };
+    if (data.sessionId !== sessionId) {
+      throw new SessionRestoreError(`pi opened session ${String(data.sessionId)}; expected ${sessionId}`);
+    }
+    const sessionFile = typeof data.sessionFile === 'string' ? data.sessionFile : '';
+    const rel = sessionFile ? relative(resolve(sessionDir!), resolve(sessionFile)) : '';
+    if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+      throw new SessionRestoreError(`pi session file ${sessionFile || '(none)'} is outside ${sessionDir}`);
+    }
+    if (this.preflight!.file && resolve(sessionFile) !== resolve(this.preflight!.file)) {
+      throw new SessionRestoreError(`pi opened ${sessionFile} but the persisted file is ${this.preflight!.file}`);
+    }
+    if (this.preflight!.hasConversation) {
+      const msgs = await this.send({ type: 'get_messages' });
+      if (msgs.success === false) {
+        throw new SessionRestoreError(`pi get_messages failed: ${msgs.error ?? 'unknown'}`);
+      }
+      const list = (msgs.data as { messages?: unknown } | undefined)?.messages;
+      if (!Array.isArray(list) || list.length === 0) {
+        throw new SessionRestoreError(`pi loaded an empty conversation from ${this.preflight!.file}`);
+      }
+    }
   }
 
   private beginTurn(): ActiveTurn {

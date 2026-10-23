@@ -1,18 +1,24 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { Store } from '../store/sqlite.js';
 import { RunLog, type AppLog } from '../telemetry/logging.js';
 import { approvalHash, GitHubTracker, type OpenPr } from '../tracker/github.js';
+import { runProcessRisk, type ProcessSafetyDeps } from '../proc.js';
+import { markRecoveryRequired } from './recovery.js';
 import { DiffTooLargeError, GitWorkspace } from '../workspace/git.js';
-import { openPiCoderSession, type CoderSession, type CoderSessionOpts, type CoderTurn } from '../runners/session.js';
+import { openPiCoderSession, SessionRestoreError, type CoderSession, type CoderSessionOpts, type CoderTurn } from '../runners/session.js';
 import { PI_ALL_TOOLS } from '../runners/pi.js';
 import { checksForPlatform, runChecks, skippedChecks, type ChecksSummary } from '../verify/checks.js';
 import { runReview, ReviewInfraError } from '../verify/review.js';
 import { publishDraftPr, PublishError } from '../publish/pr.js';
-import { buildCoderPrompt, buildFixPrompt, type PromptContext } from './prompts.js';
-import type { AppConfig, IssueData, PendingFix, Phase, ProjectConfig, ReviewResult, RunRow, TaskRow } from '../types.js';
+import { buildCoderPrompt, buildFixPrompt, CODER_RESUME_NOTE, type PromptContext } from './prompts.js';
+import {
+  BUILD_PATH, classifyPath, codeStats, DEFAULT_POLICY, DEPENDENCY_PATH, filterGenerated,
+  SENSITIVE_PATH, splitDiff, touchesDependencies, type PathPolicy,
+} from './diff-paths.js';
+import type { AppConfig, CheckSpec, IssueData, PendingFix, Phase, ProjectConfig, ReviewResult, RunRow, TaskRow } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
 
 export interface EngineDeps {
@@ -28,6 +34,8 @@ export interface EngineDeps {
   runChecksFn?: typeof runChecks;
   /** Settle window before re-reading claim comments for race arbitration. */
   claimArbitrationMs?: number;
+  /** Process-safety seam for the deferred-resume sweep (tests inject fakes). */
+  recoveryProcessDeps?: ProcessSafetyDeps;
 }
 
 const TERMINAL_FOR_TASK: Phase[] = [
@@ -61,10 +69,18 @@ function fmtSpan(fromIso: string, toIso: string | null): string {
 export class Engine {
   private controllers = new Map<string, AbortController>();
   private inFlight = new Set<string>(); // run_ids currently executing in this process
+  /** task:approved:head triples already proven reproducible — a merge retry
+   *  must not rebuild the same tree every tick. */
+  private verifiedBuilds = new Set<string>();
+  /** Resumable runs held back by max_concurrent: run_id -> target phase. */
+  private deferredResumes = new Map<string, Phase>();
   private openCoderSessionFn: NonNullable<EngineDeps['openCoderSessionFn']>;
   private runReviewFn: NonNullable<EngineDeps['runReviewFn']>;
   private runChecksFn: NonNullable<EngineDeps['runChecksFn']>;
   private ticking = false;
+  private stopping = false;
+  /** Runs already annotated as suspended for this shutdown (write once). */
+  private suspended = new Set<string>();
 
   constructor(private deps: EngineDeps) {
     this.openCoderSessionFn = deps.openCoderSessionFn ?? openPiCoderSession;
@@ -87,21 +103,87 @@ export class Engine {
     if (ctl) ctl.abort(why);
   }
 
+  /**
+   * Service shutdown: abort in-flight runs and stop taking new work, then
+   * wait — bounded — for the tick and every run's finally (session.close
+   * included) to finish. Returns whether the process went fully quiet;
+   * false means children may still be alive and the next boot's PID/orphan
+   * checks must decide. Never writes CANCELED or touches pids.
+   */
+  async shutdown(timeoutMs = 10_000): Promise<boolean> {
+    this.stopping = true;
+    for (const ctl of this.controllers.values()) ctl.abort('service shutdown');
+    const deadline = Date.now() + timeoutMs;
+    while ((!this.ticking && this.inFlight.size === 0) === false && Date.now() < deadline) {
+      await sleep(50);
+    }
+    return !this.ticking && this.inFlight.size === 0;
+  }
+
+  /**
+   * A code run cut short by service shutdown keeps its active DB row: the
+   * next boot's reconcile resumes it (with the persisted Pi session). Only
+   * an explicit user cancel outranks shutdown. Terminal runs are untouched.
+   */
+  private suspendForShutdown(run: RunRow) {
+    if (this.suspended.has(run.run_id)) return;
+    this.suspended.add(run.run_id);
+    try {
+      this.store.transition(run.run_id, run.phase, run.phase, { kind: 'service_shutdown', resumable: true });
+    } catch { /* db closed */ }
+    this.appLog.event('run_suspended_shutdown', { run: run.run_id, phase: run.phase });
+  }
+
+  /** True when `run` should suspend rather than take a terminal outcome. */
+  private shouldSuspend(run: RunRow): boolean {
+    if (!this.stopping || run.kind !== 'code') return false;
+    const fresh = this.store.getRun(run.run_id);
+    return !!fresh && RUN_ACTIVE_PHASES.includes(fresh.phase) && fresh.cancel_requested !== 1;
+  }
+
   // ---------------- poll cycle ----------------
 
   async tick(): Promise<void> {
+    if (this.stopping) return;
     this.sweepCancels();
     if (this.ticking) return;
     this.ticking = true;
     try {
-      await this.reconcileMergeStates();
-      await this.discover();
-      await this.dispatch();
-      await this.discoverPrs();
-      await this.dispatchReviews();
+      // Recovery first: runs a crash left behind outrank new dispatch.
+      await this.sweepDeferredResumes();
+      // A requested drain pauses all new work; already-running runs and the
+      // deferred-resume sweep still finish normally. A shutdown mid-tick
+      // also stops every further step — async claims already made stay
+      // active rows for the next boot's reconcile.
+      if (!this.stopping && !(this.store.getMeta('drain_requested') ?? '')) {
+        await this.reconcileMergeStates();
+        if (this.stopping) return;
+        await this.discover();
+        if (this.stopping) return;
+        await this.dispatch();
+        if (this.stopping) return;
+        await this.discoverPrs();
+        if (this.stopping) return;
+        await this.dispatchReviews();
+      }
     } finally {
       this.ticking = false;
+      this.maybeAckDrain();
     }
+  }
+
+  /**
+   * A drain is acknowledged only once the tick has fully unwound: the
+   * request may have landed while an async claim was in flight, so an empty
+   * DB snapshot mid-tick is not proof the host is quiet. The nonce written
+   * back is the CURRENT request — a replaced or cleared request is never acked.
+   */
+  private maybeAckDrain() {
+    try {
+      const nonce = this.store.getMeta('drain_requested');
+      if (!nonce || this.inFlight.size !== 0 || this.store.activeRuns().length !== 0) return;
+      this.store.setMeta('drain_ack', nonce);
+    } catch { /* db closed during shutdown */ }
   }
 
   /**
@@ -118,6 +200,7 @@ export class Engine {
       ...this.store.listTasks('AWAITING_HUMAN'),
       ...this.store.listTasks('MERGING'),
     ]) {
+      if (this.stopping) return; // no new merge/approval consumption mid-shutdown
       try {
         const project = this.projectFor(task.repo);
         if (!project) continue;
@@ -132,6 +215,7 @@ export class Engine {
         const state = prNum
           ? await this.tracker.getPrState(project.repo, prNum)
           : await this.tracker.findPrForBranch(project.repo, task.branch ?? '').then((p) => p?.state ?? 'OPEN');
+        if (this.stopping) return;
         if (state === 'MERGED') {
           await this.completeMergedTask(task, project);
         } else if (state === 'CLOSED') {
@@ -167,6 +251,7 @@ export class Engine {
     if (pr.state !== 'OPEN') return;
     // Self-heal: an AWAITING_HUMAN task whose current head was never reviewed
     // (e.g. a repair pushed a new head while the task was parked) must go back
+    if (this.stopping) return; // shutdown mid-approval: consume nothing
     // to the review queue — otherwise the new head can never be approved.
     if (this.reviewsPr(project, task) && !this.store.hasReviewVerdictForSha(task.id, pr.headSha)) {
       // Any pending approval covers the old head only — drop it, re-review.
@@ -245,6 +330,7 @@ export class Engine {
       this.appLog.event('merge_preflight_error', { task: task.id, error: String(err) });
       return;
     }
+    if (this.stopping) return; // shutdown mid-merge: no new merge actions
     if (pr.state === 'MERGED') { await this.completeMergedTask(task, project); return; }
     if (pr.state !== 'OPEN') {
       this.setTaskStatus(task.id, 'BLOCKED');
@@ -268,8 +354,19 @@ export class Engine {
         .catch((err) => this.appLog.event('pr_comment_error', { task: task.id, error: String(err) }));
       return;
     }
+    const verified = await this.verifyGeneratedConsistency(task, project, approvedSha, pr.headSha);
+    if (!verified.ok) {
+      this.setTaskStatus(task.id, 'AWAITING_HUMAN');
+      await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+      await this.tracker.commentPr(project.repo, prNumber,
+        `## 自动合并已阻止\n\n无法验证生成物（dist 等构建产物）与被审源码一致：\n\n\`\`\`\n${verified.detail ?? ''}\n\`\`\``)
+        .catch((err) => this.appLog.event('pr_comment_error', { task: task.id, error: String(err) }));
+      this.appLog.event('verify_build_failed', { task: task.id, detail: (verified.detail ?? '').slice(0, 300) });
+      return;
+    }
     try {
       await this.tracker.markPrReady(project.repo, prNumber);
+      if (this.stopping) return;
       await this.tracker.mergePr(project.repo, prNumber, approvedSha);
     } catch (err) {
       // A conflict can appear between the pre-check and the merge call —
@@ -433,6 +530,7 @@ export class Engine {
     const max = this.config.server.max_concurrent;
     for (const task of this.store.listTasks('DISCOVERED')) {
       if (this.activeCount() >= max) return;
+      if (this.stopping) return;
       const project = this.projectFor(task.repo);
       if (!project) continue;
       if (this.store.activeRunForTask(task.id)) continue;
@@ -515,6 +613,7 @@ export class Engine {
       this.appLog.event('dispatch_skip', { task: task.id, why: `PR exists with pending fix; claiming fix run: ${existingPr.url}` });
     }
 
+    if (this.stopping) return; // claimed rows stay DISCOVERED for next boot
     const run = this.store.claimRun(task.id);
     this.store.updateRunFields(run.run_id, { branch, pr_url: existingPr?.url ?? null });
     await this.labelQuietly(project.repo, issue.number, 'add', 'agent-running');
@@ -537,12 +636,167 @@ export class Engine {
     this.launch(run.run_id);
   }
 
-  /** Resume a run left in an active phase by a previous process. */
-  resumeRun(runId: string) {
+  /**
+   * Single entry point for resuming a run left in an active phase by a
+   * previous process. `phase` is the resume target chosen at reconciliation
+   * (legacy REVIEWING -> VERIFYING, CLAIMED -> PREPARING); it is remembered
+   * when the run has to wait for a concurrency slot so the sweep resumes to
+   * the right phase.
+   *
+   * Returns true when the run is launched (or already in flight — re-entry
+   * never consumes budget); false when it was queued for the tick sweep.
+   * Queueing spends nothing: `Store.resumeRun` (pid clear, resume_count+1,
+   * transition event) runs only when a process is actually launched.
+   */
+  resumeRun(runId: string, phase?: Phase): boolean {
+    // Shutting down: leave the row active for the next boot's reconcile —
+    // no spawn, no resume budget spent.
+    if (this.stopping) return true;
+    if (this.inFlight.has(runId)) return true;
+    const run = this.store.getRun(runId);
+    // Gone or already terminal — nothing left to resume.
+    if (!run || !RUN_ACTIVE_PHASES.includes(run.phase)) return true;
+    const to = phase ?? run.phase;
+    if (this.activeCount() >= this.config.server.max_concurrent) {
+      this.deferredResumes.set(runId, to);
+      return false;
+    }
+    this.store.resumeRun(runId, to);
     this.launch(runId);
+    return true;
+  }
+
+  /**
+   * Tick-time start of queued resumes. Every dequeue re-reads the run row —
+   * a run that ended, was cancelled, or turned risky while queued is
+   * resolved without spawning: terminal/gone drops silently, a user cancel
+   * finishes through the normal finish paths (no process, no resume budget),
+   * a proven-risky run parks on RECOVERY_REQUIRED with its claim label kept.
+   */
+  private async sweepDeferredResumes() {
+    if (this.deferredResumes.size === 0) return;
+    const max = this.config.server.max_concurrent;
+    for (const [runId, to] of [...this.deferredResumes]) {
+      if (this.inFlight.has(runId)) {
+        this.deferredResumes.delete(runId);
+        continue;
+      }
+      let run = this.store.getRun(runId);
+      let task = run ? this.store.getTaskById(run.task_id) : null;
+      if (!run || !task || !RUN_ACTIVE_PHASES.includes(run.phase)) {
+        this.deferredResumes.delete(runId);
+        continue;
+      }
+      // A queued resume that cannot launch this tick takes no slot at all:
+      // keep scanning so cancel/terminal cleanup behind a waiting entry is
+      // not starved by a full concurrency budget.
+      if (run.cancel_requested !== 1 && this.activeCount() >= max) continue;
+
+      // Re-verify the picture that made this resumable at boot — and also
+      // for a cancel, which must prove the child dead before the finish
+      // path releases the cross-instance claim label.
+      const safetyKey = JSON.stringify([run.pid, run.process_identity, run.workspace]);
+      const risk = await runProcessRisk(run, this.deps.recoveryProcessDeps ?? {});
+
+      // The scan was async: a CLI cancel or an out-of-band endRun may have
+      // landed meanwhile. Re-read and never act on the stale row; a run
+      // whose safety inputs changed mid-scan is re-evaluated next tick.
+      run = this.store.getRun(runId);
+      task = run ? this.store.getTaskById(run.task_id) : null;
+      if (!run || !task || !RUN_ACTIVE_PHASES.includes(run.phase) || this.inFlight.has(runId)) {
+        this.deferredResumes.delete(runId);
+        continue;
+      }
+      if (JSON.stringify([run.pid, run.process_identity, run.workspace]) !== safetyKey) continue;
+      // Shutdown: a cancelled queued run still finishes through the cancel
+      // path below (with its already-computed risk check); anything else
+      // stays queued for the next boot — no new parking, no budget spent.
+      if (this.stopping && run.cancel_requested !== 1) continue;
+
+      if (risk) {
+        this.deferredResumes.delete(runId);
+        await this.parkRecovery(task, run, risk);
+        continue;
+      }
+      if (run.cancel_requested === 1) {
+        this.deferredResumes.delete(runId);
+        if (run.kind === 'review') {
+          this.finishReview(run, task, 'CANCELED', 'cancelled', this.cancelTaskPhase(runId));
+        } else {
+          this.finish(run, task, 'CANCELED', 'cancelled');
+        }
+        continue;
+      }
+      const parkWhy = this.resumeParkReason(run);
+      if (parkWhy) {
+        this.deferredResumes.delete(runId);
+        // Risk just proved null: nothing alive can hold the claim label.
+        await this.parkRecovery(task, run, parkWhy, true);
+        continue;
+      }
+
+      if (this.stopping) continue; // leave queued for the next boot's reconcile
+      if (this.activeCount() >= max) continue; // capacity can close over the awaits
+      this.deferredResumes.delete(runId);
+      this.store.resumeRun(runId, to);
+      this.launch(runId);
+    }
+  }
+
+  /** Budget/workspace/sha re-check for a queued resume (risk already null). */
+  private resumeParkReason(run: RunRow): string | null {
+    if (run.resume_count >= this.config.server.max_resumes) return 'resume budget exhausted';
+    if (run.kind === 'review') {
+      return run.head_sha && (run.phase === 'CLAIMED' || run.phase === 'REVIEWING')
+        ? null
+        : `review run missing head_sha or in unexpected phase ${run.phase}`;
+    }
+    // Phases that continue agent work need the workspace the run recorded;
+    // legacy REVIEWING (a code phase) re-enters through VERIFYING and still
+    // needs it. CLAIMED/PREPARING/PUBLISHING_PR recreate what they need.
+    if (['RUNNING', 'FIXING', 'VERIFYING', 'REVIEWING'].includes(run.phase)
+      && (!run.workspace || !existsSync(run.workspace))) {
+      return 'workspace missing; cannot continue safely';
+    }
+    return null;
+  }
+
+  /**
+   * Rebuild the fix intent of a resumed run from its last persisted
+   * pending_fix_consumed event. The event is host-written evidence — a
+   * malformed payload is never guessed at (caller parks the run).
+   */
+  private consumedFixFor(run: RunRow): PendingFix | null {
+    for (const ev of [...this.store.eventsForRun(run.run_id)].reverse()) {
+      if (ev.detail_json == null || !ev.detail_json.includes('pending_fix_consumed')) continue;
+      const parsed = JSON.parse(ev.detail_json) as {
+        kind?: unknown; head_sha?: unknown; title?: unknown; summary?: unknown; findings?: unknown;
+      };
+      if (parsed.kind !== 'pending_fix_consumed') continue;
+      if (typeof parsed.head_sha !== 'string' || typeof parsed.summary !== 'string'
+        || !Array.isArray(parsed.findings) || parsed.findings.some((f) => typeof f !== 'string')
+        || (parsed.title !== undefined && typeof parsed.title !== 'string')) {
+        throw new Error(`corrupt pending_fix_consumed event on run ${run.run_id}`);
+      }
+      return {
+        head_sha: parsed.head_sha, title: parsed.title as string | undefined,
+        summary: parsed.summary, findings: parsed.findings as string[],
+      };
+    }
+    return null;
+  }
+
+  private async parkRecovery(task: TaskRow, run: RunRow, why: string, safeToReleaseClaim = false) {
+    await markRecoveryRequired(
+      { store: this.store, tracker: this.tracker, appLog: this.appLog, engine: this },
+      task, run, why, safeToReleaseClaim,
+    );
   }
 
   private launch(runId: string) {
+    // Shutdown in progress: a claimed/resumed row stays active in the DB —
+    // never spawn a process we are about to abort.
+    if (this.stopping) return;
     if (this.inFlight.has(runId)) return;
     this.inFlight.add(runId);
     const ctl = new AbortController();
@@ -551,35 +805,74 @@ export class Engine {
       .catch((err) => {
         this.appLog.event('run_crashed', { run: runId, error: String(err) });
         this.recordError('run_crashed', err);
-        try {
-          const run = this.store.getRun(runId);
-          if (run && RUN_ACTIVE_PHASES.includes(run.phase)) {
-            if (run.kind === 'review') {
-              // A crashed review leaves no verdict row; without one the same
-              // sha would be re-dispatched forever. ERROR counts as a verdict.
-              if (run.head_sha && !this.store.hasReviewVerdictForSha(run.task_id, run.head_sha)) {
-                this.store.addCheck({
-                  run_id: runId, kind: 'review', command: 'agent (review)', exit_code: null,
-                  verdict: 'ERROR', head_sha: run.head_sha,
-                });
-              }
-              this.store.endRun(runId, 'FAILED', `engine crash: ${String(err).slice(0, 500)}`);
-              const task = this.store.getTaskById(run.task_id);
-              if (task && task.status === 'REVIEWING') this.setTaskStatus(task.id, 'AWAITING_HUMAN');
-            } else {
-              this.store.endRun(runId, 'FAILED', `engine crash: ${String(err).slice(0, 500)}`);
-              const task = this.store.getTaskById(run.task_id);
-              if (task && task.status === 'RUNNING') this.setTaskStatus(task.id, 'FAILED');
-            }
-          }
-        } catch (e2) {
-          this.appLog.event('run_crashed_cleanup_failed', { run: runId, error: String(e2) });
-        }
+        // Returned, not voided: shutdown must observe parking/label cleanup
+        // finishing — inFlight is only cleared after this settles.
+        return this.handleRunCrash(runId, err);
       })
       .finally(() => {
         this.inFlight.delete(runId);
         this.controllers.delete(runId);
       });
+  }
+
+  /**
+   * runTask rejected. Resolution order: an explicit user cancel always
+   * wins (even mid-shutdown); then shutdown suspend semantics; then a
+   * session-restore failure parks on RECOVERY_REQUIRED rather than FAILED —
+   * nothing may spawn a fresh cold session over unreadable history.
+   */
+  private async handleRunCrash(runId: string, err: unknown) {
+    try {
+      const run = this.store.getRun(runId);
+      if (!run || !RUN_ACTIVE_PHASES.includes(run.phase)) return;
+      const task = this.store.getTaskById(run.task_id);
+      if (run.cancel_requested === 1) {
+        if (run.kind === 'review') {
+          this.store.endRun(runId, 'CANCELED', 'cancelled');
+          if (task && task.status === 'REVIEWING') this.setTaskStatus(task.id, this.cancelTaskPhase(runId));
+        } else if (task) {
+          // Same finish path a normal cancel takes — claim/labels are
+          // released, not just the run row ended.
+          this.finish(run, task, 'CANCELED', 'cancelled');
+        }
+        return;
+      }
+      if (this.stopping) {
+        if (run.kind === 'review') {
+          // A shutdown-cancelled round is not a verdict: the same sha
+          // gets re-reviewed next boot.
+          this.store.endRun(runId, 'CANCELED', 'service shutdown');
+          if (task && task.status === 'REVIEWING') this.setTaskStatus(task.id, this.cancelTaskPhase(runId));
+        } else {
+          this.suspendForShutdown(run);
+        }
+        return;
+      }
+      if (err instanceof SessionRestoreError && task) {
+        // Own session is already closed by runTask's finally (or never
+        // spawned); the original file is left untouched, the claim kept —
+        // nothing proves the label is safe to release.
+        await this.parkRecovery(task, run, `Pi session restore failed: ${String(err).slice(0, 300)}`);
+        return;
+      }
+      if (run.kind === 'review') {
+        // A crashed review leaves no verdict row; without one the same
+        // sha would be re-dispatched forever. ERROR counts as a verdict.
+        if (run.head_sha && !this.store.hasReviewVerdictForSha(run.task_id, run.head_sha)) {
+          this.store.addCheck({
+            run_id: runId, kind: 'review', command: 'agent (review)', exit_code: null,
+            verdict: 'ERROR', head_sha: run.head_sha,
+          });
+        }
+        this.store.endRun(runId, 'FAILED', `engine crash: ${String(err).slice(0, 500)}`);
+        if (task && task.status === 'REVIEWING') this.setTaskStatus(task.id, 'AWAITING_HUMAN');
+      } else {
+        this.store.endRun(runId, 'FAILED', `engine crash: ${String(err).slice(0, 500)}`);
+        if (task && task.status === 'RUNNING') this.setTaskStatus(task.id, 'FAILED');
+      }
+    } catch (e2) {
+      this.appLog.event('run_crashed_cleanup_failed', { run: runId, error: String(e2) });
+    }
   }
 
   // ---------------- per-run state machine ----------------
@@ -629,9 +922,39 @@ export class Engine {
       // approval source so a manual-mode human approval is not lost.
       let mergeRepair = false;
       let mergeRepairApprovedBy: 'review' | 'human' = 'review';
+      // This process resumed the run from a previous boot: the FIRST real
+      // coder turn (RUNNING or FIXING) is prefixed with the resume note —
+      // later turns in this same process are not.
+      const resumed = run.resume_count > 0;
+      let resumeNotePending = resumed;
+      const withResumeNote = (p: string) => {
+        if (!resumeNotePending) return p;
+        resumeNotePending = false;
+        return CODER_RESUME_NOTE + '\n\n' + p;
+      };
+      // Restore fix metadata for ANY resumed phase — a merge-conflict repair
+      // that restarts at VERIFYING/FIXING/PUBLISHING_PR must still land back
+      // in MERGING on publish, not bounce to review. Host-written event
+      // evidence only; corrupt payloads park instead of guessing.
+      let fixIntent: PendingFix | null = null;
+      if (resumed) {
+        try {
+          fixIntent = task.pending_fix
+            ? (JSON.parse(task.pending_fix) as PendingFix)
+            : this.consumedFixFor(run);
+        } catch (e) {
+          this.finish(run, task, 'RECOVERY_REQUIRED', `cannot restore pending fix intent: ${String(e).slice(0, 200)}`);
+          return;
+        }
+        if (fixIntent) {
+          mergeRepair = fixIntent.title ? fixIntent.title === '自动合并受阻' : task.status === 'MERGING';
+          mergeRepairApprovedBy = task.approved_by ?? 'review';
+        }
+      }
 
       const ensureCoder = () => {
         if (coderRef.current) return coderRef.current;
+        if (this.stopping) throw new Error('service shutdown');
         const artifactsDir = this.artifactsDirFor(run);
         mkdirSync(artifactsDir, { recursive: true });
         const stamp = Date.now();
@@ -650,6 +973,11 @@ export class Engine {
             spawned.identity = identity;
             this.store.updateRunFields(run.run_id, { pid, process_identity: identity });
           },
+          // One persisted Pi session per run — a restart reopens the same
+          // history. The dir lives under the run's own artifacts, never the
+          // worktree, so a new run (new run_id) is always isolated.
+          sessionId: run.run_id,
+          sessionDir: join(artifactsDir, 'pi-session'),
         });
         coderRef.current = { session, logPath, pid: spawned.pid, identity: spawned.identity };
         return coderRef.current;
@@ -688,34 +1016,44 @@ export class Engine {
             // Consume pending_fix once: the reviewed sha is pinned on the run
             // so publish-time can detect a fix that produced no new commits.
             const pendingFix = task.pending_fix ? (JSON.parse(task.pending_fix) as PendingFix) : null;
-            let prompt = buildCoderPrompt(ctx);
-            if (pendingFix) {
-              store.updateRunFields(runId, { head_sha: pendingFix.head_sha });
-              store.transition(runId, phase, phase, {
-                kind: 'pending_fix_consumed', head_sha: pendingFix.head_sha,
-                summary: pendingFix.summary, findings: pendingFix.findings,
-              });
-              // A merge-conflict repair keeps the task in MERGING (landing is
-              // still in progress); review-driven fixes read as RUNNING.
-              mergeRepair = pendingFix.title === '自动合并受阻';
-              mergeRepairApprovedBy = store.getTaskById(task.id)?.approved_by ?? 'review';
-              store.setTaskStatus(task.id, mergeRepair ? 'MERGING' : 'RUNNING', { pending_fix: null });
-              task = { ...task, pending_fix: null };
-              // Fix runs may need `git merge origin/<base>` — the child's
-              // scrubbed env cannot fetch, so the host refreshes the ref.
-              await this.workspace.fetchBranch(project.local_repo, project.base_branch)
-                .catch((err) => this.appLog.event('fetch_error', { run: runId, error: String(err) }));
-              // The work must start from the PR branch's remote head: a reused
-              // worktree may sit at a stale commit, and merging base onto it
-              // pushes a non-fast-forward that GitHub rejects.
-              const fixBranch = run.branch ?? task.branch ?? `${project.branch_prefix}${task.issue_number}`;
-              await this.workspace.fetchBranch(project.local_repo, fixBranch)
-                .then(() => this.workspace.resetHard(worktreePath, `origin/${fixBranch}`))
-                .catch((err) => this.appLog.event('fix_head_sync_error', { run: runId, error: String(err).slice(0, 300) }));
-              prompt = buildFixPrompt(ctx, `${pendingFix.title ?? 'Review BLOCK'}：${pendingFix.summary}\n${pendingFix.findings.join('\n')}`);
+            let prompt = resumed ? buildCoderPrompt(ctx, true) : buildCoderPrompt(ctx);
+            // A live pending_fix is consumed now; a resumed run also reuses
+            // the intent restored before the loop (event evidence).
+            const intent = pendingFix ?? fixIntent;
+            if (intent) {
+              store.updateRunFields(runId, { head_sha: intent.head_sha });
+              if (pendingFix) {
+                store.transition(runId, phase, phase, {
+                  kind: 'pending_fix_consumed', head_sha: pendingFix.head_sha, title: pendingFix.title,
+                  summary: pendingFix.summary, findings: pendingFix.findings,
+                });
+                if (!resumed) {
+                  // A merge-conflict repair keeps the task in MERGING;
+                  // review-driven fixes read as RUNNING.
+                  mergeRepair = pendingFix.title === '自动合并受阻';
+                  mergeRepairApprovedBy = store.getTaskById(task.id)?.approved_by ?? 'review';
+                }
+                store.setTaskStatus(task.id, mergeRepair ? 'MERGING' : 'RUNNING', { pending_fix: null });
+                task = { ...task, pending_fix: null };
+              }
+              if (pendingFix && !resumed) {
+                // Fix runs may need `git merge <remote>/<base>` — the child's
+                // scrubbed env cannot fetch, so the host refreshes the ref.
+                await this.workspace.fetchBranch(project.local_repo, project.base_branch, project.git_remote)
+                  .catch((err) => this.appLog.event('fetch_error', { run: runId, error: String(err) }));
+                // The work must start from the PR branch's remote head: a reused
+                // worktree may sit at a stale commit, and merging base onto it
+                // pushes a non-fast-forward that GitHub rejects. Resumed runs
+                // skip this reset entirely — it would wipe half-finished fixes.
+                const fixBranch = run.branch ?? task.branch ?? `${project.branch_prefix}${task.issue_number}`;
+                await this.workspace.fetchBranch(project.local_repo, fixBranch, project.git_remote)
+                  .then(() => this.workspace.resetHard(worktreePath, `${project.git_remote}/${fixBranch}`))
+                  .catch((err) => this.appLog.event('fix_head_sync_error', { run: runId, error: String(err).slice(0, 300) }));
+              }
+              prompt = buildFixPrompt(ctx, `${intent.title ?? 'Review BLOCK'}：${intent.summary}\n${intent.findings.join('\n')}`);
             }
             const turn = ensureCoder();
-            const res = await this.coderTurn(run, log, turn, prompt, 'RUNNING', signal);
+            const res = await this.coderTurn(run, log, turn, withResumeNote(prompt), 'RUNNING', signal);
             if (res.aborted) { this.finish(run, task, 'CANCELED', 'cancelled'); return; }
             if (!res.ok) {
               this.finish(run, task, 'FAILED', res.timedOut
@@ -794,7 +1132,7 @@ export class Engine {
             this.store.bumpRunFixCount(runId);
             const evidence = lastFailureEvidence;
             const turn = ensureCoder();
-            const res = await this.coderTurn(run, log, turn, buildFixPrompt(ctx, evidence), 'FIXING', signal);
+            const res = await this.coderTurn(run, log, turn, withResumeNote(buildFixPrompt(ctx, evidence)), 'FIXING', signal);
             if (res.aborted) { this.finish(run, task, 'CANCELED', 'cancelled'); return; }
             if (!res.ok) {
               this.finish(run, task, 'FAILED', res.timedOut ? 'fix turn timed out' : `fix turn failed: ${res.error ?? `exit ${res.exitCode}`}`);
@@ -892,6 +1230,7 @@ export class Engine {
     const max = this.config.server.max_concurrent;
     for (const task of this.store.listTasks('AWAITING_REVIEW')) {
       if (this.activeCount() >= max) return;
+      if (this.stopping) return;
       const project = this.projectFor(task.repo);
       if (!project) continue;
       // Manual-review projects never enter AWAITING_REVIEW — the PR parks
@@ -925,6 +1264,7 @@ export class Engine {
           continue;
         }
 
+        if (this.stopping) return; // no new review claim mid-shutdown
         // Claim + pin fields + task status in one transaction so a crash
         // cannot leave a zombie task with no active run or vice versa.
         const worktree = this.store.lastCodeWorkspace(task.id) ?? this.worktreePathFor(project, task);
@@ -1013,8 +1353,8 @@ export class Engine {
         try {
           // Refresh both the PR branch and the base ref — a stale local base
           // inflates the merge-base diff with unrelated commits.
-          await this.workspace.fetchBranch(project.local_repo, run.branch ?? task.branch ?? project.base_branch);
-          await this.workspace.fetchBranch(project.local_repo, project.base_branch);
+          await this.workspace.fetchBranch(project.local_repo, run.branch ?? task.branch ?? project.base_branch, project.git_remote);
+          await this.workspace.fetchBranch(project.local_repo, project.base_branch, project.git_remote);
           // A previous attempt may have died mid-`worktree add`; clear any
           // stale site path so the add cannot spuriously fail.
           await this.workspace.removeWorktree(project.local_repo, sitePath).catch(() => {});
@@ -1038,10 +1378,15 @@ export class Engine {
       const ctx = await this.makePromptContext(run, task, project);
       ctx.worktreePath = sitePath;
       let diffEvidence: string;
+      let reviewDiff: { patch: string; omitted: string[] };
       try {
         diffEvidence = await this.workspace.diffVsBase(sitePath, project.base_branch);
         mkdirSync(this.artifactsDirFor(run), { recursive: true });
         writeFileSync(join(this.artifactsDirFor(run), 'review-diff.patch'), diffEvidence, 'utf8');
+        reviewDiff = filterGenerated(diffEvidence, this.pathPolicy());
+        if (reviewDiff.omitted.length > 0) {
+          this.appLog.event('review_diff_generated_omitted', { run: runId, count: reviewDiff.omitted.length });
+        }
       } catch (err) {
         if (aborted()) { this.finishReview(run, task, 'CANCELED', 'cancelled during diff', this.cancelTaskPhase(runId)); return; }
         if (err instanceof DiffTooLargeError) {
@@ -1072,7 +1417,7 @@ export class Engine {
       let outcome: Awaited<ReturnType<typeof runReview>> | undefined;
       let reviewError: unknown;
       try {
-        outcome = await this.runReviewFn(ctx, this.testEvidenceFor(task, reviewedSha), diffEvidence, {
+        outcome = await this.runReviewFn(ctx, this.testEvidenceFor(task, reviewedSha), reviewDiff.patch, {
           agentConfig: this.config.agent,
           timeoutMs: this.config.server.max_task_minutes * 60_000,
           artifactsDir: this.artifactsDirFor(run), signal, headSha: reviewedSha,
@@ -1130,7 +1475,7 @@ export class Engine {
       }
 
       if (result.verdict === 'PASS') {
-        const riskReasons = this.assessRisk(diffEvidence, result.risk);
+        const riskReasons = this.assessRisk(reviewDiff.patch, result.risk);
         if (riskReasons.length > 0) {
           if (prNum) {
             await this.tracker.commentPr(project.repo, prNum, this.riskComment(result, riskReasons))
@@ -1254,7 +1599,7 @@ export class Engine {
       await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
       return false;
     }
-    const baseRef = `origin/${project.base_branch}`;
+    const baseRef = `${project.git_remote}/${project.base_branch}`;
     const payload: PendingFix = {
       head_sha: headSha,
       title: '自动合并受阻',
@@ -1504,38 +1849,130 @@ export class Engine {
   /**
    * Host-side risk escalation. Reviewer judgement alone is not enough: any
    * touch on auth/deps/build/tests forces a human look before auto-merge.
+   * Size thresholds and path rules run on the source change only — generated
+   * output and docs inflate a PR without adding review surface.
    */
   private assessRisk(diff: string, reviewerRisk: ReviewResult['risk']): string[] {
     const cfg = this.config.approvals.auto_merge;
+    const policy = this.pathPolicy();
     const reasons: string[] = [];
     if (reviewerRisk === 'high') reasons.push('reviewer marked risk=high');
-    const files = new Map<string, 'new' | 'deleted' | 'modified'>();
-    let changedLines = 0;
-    let current: string | null = null;
-    for (const line of diff.split('\n')) {
-      const header = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
-      if (header) { current = header[2]!; if (!files.has(current)) files.set(current, 'modified'); continue; }
-      if (current && line.startsWith('new file mode')) files.set(current, 'new');
-      else if (current && line.startsWith('deleted file mode')) files.set(current, 'deleted');
-      if ((line.startsWith('+') && !line.startsWith('+++')) || (line.startsWith('-') && !line.startsWith('---'))) {
-        changedLines++;
+    const files = splitDiff(diff);
+    const source = codeStats(files, policy);
+    if (source.files > cfg.max_files) reasons.push(`${source.files} source files changed > ${cfg.max_files}`);
+    if (source.lines > cfg.max_lines) reasons.push(`${source.lines} source lines changed > ${cfg.max_lines}`);
+    for (const file of files) {
+      const kind = classifyPath(file.path, policy);
+      if (kind === 'generated' || kind === 'docs') continue;
+      if (SENSITIVE_PATH.test(file.path)) reasons.push(`sensitive path: ${file.path}`);
+      else if (DEPENDENCY_PATH.test(file.path)) {
+        if (touchesDependencies(file)) reasons.push(`dependency change: ${file.path}`);
+      } else if (BUILD_PATH.test(file.path)) reasons.push(`build or migration change: ${file.path}`);
+      // Weakened coverage is the risk, not tests moving with the code they
+      // cover: only deleting a suite or shrinking assertions counts.
+      else if (kind === 'tests') {
+        if (file.status === 'deleted') reasons.push(`test file deleted: ${file.path}`);
+        else if (file.deleted > file.added + 10) reasons.push(`test coverage weakened: ${file.path} (-${file.deleted}/+${file.added})`);
       }
     }
-    if (files.size > cfg.max_files) reasons.push(`${files.size} files changed > ${cfg.max_files}`);
-    if (changedLines > cfg.max_lines) reasons.push(`${changedLines} changed lines > ${cfg.max_lines}`);
-    const sensitive = /(^|\/)(auth|security|secrets?|crypto|permissions?)(\/|\.|$)|(^|\/)\.github\/workflows\//i;
-    const dependency = /(^|\/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|requirements\.txt|poetry\.lock|Pipfile\.lock|Cargo\.lock|go\.sum|composer\.lock)$/i;
-    const build = /(^|\/)(Dockerfile|docker-compose\.ya?ml|Makefile)$|(^|\/)(migrations?|schema)\//i;
-    const tests = /(^|\/)(tests?|__tests__|spec)\/|\.(test|spec)\.[cm]?[jt]sx?$/i;
-    for (const [file, status] of files) {
-      if (sensitive.test(file)) reasons.push(`sensitive path: ${file}`);
-      else if (dependency.test(file)) reasons.push(`dependency change: ${file}`);
-      else if (build.test(file)) reasons.push(`build or migration change: ${file}`);
-      // Weakened coverage is the risk — deleting or editing existing tests —
-      // not a newly added test file accompanying the change it covers.
-      else if (tests.test(file) && status !== 'new') reasons.push(`test change (${status}): ${file}`);
-    }
     return reasons;
+  }
+
+  private pathPolicy(): PathPolicy {
+    const cfg = this.config.approvals.auto_merge;
+    return {
+      generated: cfg.generated_paths ?? DEFAULT_POLICY.generated,
+      docs: cfg.doc_paths ?? DEFAULT_POLICY.docs,
+    };
+  }
+
+  /**
+   * Generated files are excluded from review, so the host must prove they are
+   * still reproducible from the reviewed source before landing: rebuild the
+   * approved head and refuse if `dist` (or any other generated path) drifts
+   * from the commit. A hand-edited build output is the one thing the reviewer
+   * can no longer see.
+   *
+   * The coding worktree is preferred (deps already installed). When it is
+   * unusable — no code run for an existing-PR task, head moved, or the path
+   * vanished — the approved sha is materialized as a detached worktree and
+   * `verify_bootstrap` (e.g. `npm ci`) installs deps first. The detached site
+   * proves the same invariant and is clean by construction, so only the
+   * coding-worktree path needs the pre-build drift check.
+   */
+  private async verifyGeneratedConsistency(
+    task: TaskRow, project: ProjectConfig, approvedSha: string, headSha: string,
+  ): Promise<{ ok: boolean; detail?: string }> {
+    const build = project.verify_build ?? this.config.approvals.auto_merge.verify_build;
+    if (!build) return { ok: true };
+    const key = `${task.id}:${approvedSha}:${headSha}`;
+    if (this.verifiedBuilds.has(key)) return { ok: true };
+    // Fail-closed below: a configured verify_build that cannot run proves
+    // nothing, so the merge goes to a human rather than proceeding unverified.
+    const fail = (detail: string) => ({ ok: false, detail });
+    const globs = this.pathPolicy().generated;
+
+    let site: string;
+    let detached = false;
+    const checks: CheckSpec[] = [];
+    const code = this.store.lastCodeWorkspace(task.id);
+    const codeHead = code && existsSync(code) ? await this.workspace.head(code).catch(() => null) : null;
+    if (code && codeHead === approvedSha) {
+      // Dirt under generated paths before the build is tampering evidence —
+      // dirt elsewhere does not weaken the drift check.
+      let pre: string;
+      try { pre = await this.workspace.dirtyUnder(code, globs); }
+      catch (err) { return fail(`无法检查生成物状态：${String(err).slice(0, 300)}`); }
+      if (pre) {
+        return fail(`生成物在构建前已有未提交改动（可能被人为修改）：\n${pre.slice(0, 800)}`);
+      }
+      site = code;
+    } else {
+      const bootstrap = project.verify_bootstrap ?? this.config.approvals.auto_merge.verify_bootstrap;
+      if (bootstrap) checks.push(bootstrap);
+      const verifyDir = resolve(this.config.server.worktree_root, '_verify', `${task.id}-${approvedSha.slice(0, 12)}`);
+      try {
+        site = await this.workspace.addDetachedWorktree(project.local_repo, approvedSha, verifyDir);
+      } catch {
+        // A crashed earlier attempt can leave the path or its registration
+        // behind; both sit inside our own `_verify` namespace — clean & retry.
+        rmSync(verifyDir, { recursive: true, force: true });
+        await this.workspace.pruneWorktrees(project.local_repo).catch(() => {});
+        try {
+          site = await this.workspace.addDetachedWorktree(project.local_repo, approvedSha, verifyDir);
+        } catch (err) {
+          return fail(`无法物化被批准 SHA 的工作树：${String(err).slice(0, 300)}`);
+        }
+      }
+      detached = true;
+    }
+    checks.push(build);
+    try {
+      const dir = join(this.config.server.logs_dir, 'artifacts', `merge-verify-${task.id}`);
+      mkdirSync(dir, { recursive: true });
+      const summary = await this.runChecksFn(
+        checks, site, (i) => join(dir, `check-${i}-${Date.now()}.log`),
+      );
+      if (!summary.ok) {
+        return fail((summary.infraError ?? summary.failureEvidence ?? '构建未通过').slice(0, 800));
+      }
+      if (summary.outcomes.length === 0) {
+        return fail('verify_build 因平台限制被跳过，无法验证生成物与源码一致');
+      }
+      let drifted = '';
+      try { drifted = await this.workspace.dirtyUnder(site, globs); }
+      catch (err) { return fail(`无法检查构建产物：${String(err).slice(0, 300)}`); }
+      if (drifted) {
+        return fail(`构建后生成物与提交不一致：\n${drifted.slice(0, 800)}`);
+      }
+      this.verifiedBuilds.add(key);
+      this.appLog.event('verify_build_ok', { task: task.id, head_sha: headSha, site: detached ? 'detached' : 'worktree' });
+      return { ok: true };
+    } finally {
+      if (detached) {
+        await this.workspace.removeWorktree(project.local_repo, site).catch(() => {});
+      }
+    }
   }
 
   private riskComment(result: ReviewResult, reasons: string[]): string {
@@ -1568,6 +2005,10 @@ export class Engine {
   }
 
   private finish(run: RunRow, task: TaskRow, finalPhase: Phase, reason?: string, taskFields?: { pr_url?: string; merge_attempts?: number; approved_sha?: string; approved_by?: 'review' | 'human' }, taskPhase: Phase = finalPhase) {
+    // Service shutdown never writes a terminal state for a code run — it
+    // suspends so the next boot's reconcile can resume it. An explicit user
+    // cancel (cancel_requested) still takes the normal terminal path.
+    if (this.shouldSuspend(run)) { this.suspendForShutdown(this.store.getRun(run.run_id) ?? run); return; }
     if (!TERMINAL_FOR_TASK.includes(finalPhase)) throw new Error(`finish() requires terminal phase, got ${finalPhase}`);
     try {
       this.store.tx(() => {
@@ -1669,7 +2110,7 @@ export class Engine {
     const branch = task.branch;
     if (branch && branch.startsWith(project.branch_prefix)) {
       await step('local-branch', () => this.workspace.deleteLocalBranch(project.local_repo, branch));
-      await step('remote-branch', () => this.workspace.deleteRemoteBranch(project.local_repo, branch));
+      await step('remote-branch', () => this.workspace.deleteRemoteBranch(project.local_repo, branch, project.git_remote));
     }
     this.appLog.event('cleanup_done', { task: task.id, steps: done });
   }

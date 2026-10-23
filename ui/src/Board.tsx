@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Clock, GitPullRequest, Search } from 'lucide-react';
 import type { TaskSummary } from './api';
 import { fmtDur, fmtTime, GROUPS, groupOf, isActivePhase, phaseLabel, phaseTextClass, type GroupKey } from './groups';
+import { buildRepoCounts } from './repo-filters';
 import StatusIcon from './StatusIcon';
 
 const EMPTY_HINT: Partial<Record<GroupKey, string>> = {
@@ -16,12 +17,13 @@ const FILTER_KEY = 'ac-repo-filter';
 
 export default function Board(props: {
   tasks: TaskSummary[] | null;
+  projectRepos: string[];
   tick: number;
   selected: number | null;
   onSelect: (id: number) => void;
   onStop: (task: TaskSummary) => void;
 }) {
-  const { tasks, tick, selected, onSelect, onStop } = props;
+  const { tasks, projectRepos, tick, selected, onSelect, onStop } = props;
   const [repoFilter, setRepoFilter] = useState<string | null>(() => localStorage.getItem(FILTER_KEY));
   const [keyword, setKeyword] = useState('');
   const [draggingId, setDraggingId] = useState<number | null>(null);
@@ -44,10 +46,9 @@ export default function Board(props: {
     );
   }
 
-  const repos = new Map<string, number>();
-  for (const t of tasks) repos.set(t.repo, (repos.get(t.repo) ?? 0) + 1);
+  const repos = buildRepoCounts(tasks, projectRepos);
   const repoNames = [...repos.keys()].sort();
-  // A stored filter for a repo with no tasks left falls back to all.
+  // A stored filter for a repo that's neither configured nor has tasks falls back to all.
   const activeFilter = repoFilter && repos.has(repoFilter) ? repoFilter : null;
 
   const setFilter = (repo: string | null) => {
@@ -82,36 +83,34 @@ export default function Board(props: {
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
-      {repoNames.length > 0 && (
-        <div className="flex shrink-0 flex-wrap items-center gap-1.5 px-4 pt-3">
-          <Chip active={activeFilter === null} onClick={() => setFilter(null)}>
-            全部
-            <Count n={tasks.length} />
+      <div className="flex shrink-0 flex-wrap items-center gap-1.5 px-4 pt-3">
+        <Chip active={activeFilter === null} onClick={() => setFilter(null)}>
+          全部
+          <Count n={tasks.length} />
+        </Chip>
+        {repoNames.map((repo) => (
+          <Chip key={repo} active={activeFilter === repo} onClick={() => setFilter(repo)}>
+            {repo}
+            <Count n={repos.get(repo)!} />
           </Chip>
-          {repoNames.map((repo) => (
-            <Chip key={repo} active={activeFilter === repo} onClick={() => setFilter(repo)}>
-              {repo}
-              <Count n={repos.get(repo)!} />
-            </Chip>
-          ))}
-          <div className="relative ml-auto">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3 -translate-y-1/2 text-fg-dim" />
-            <input
-              ref={searchRef}
-              value={keyword}
-              onChange={(e) => setKeyword(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') {
-                  setKeyword('');
-                  e.currentTarget.blur();
-                }
-              }}
-              placeholder="搜索  /"
-              className="w-52 rounded-md border border-edge bg-card py-1 pl-7.5 pr-2.5 text-[11px] text-fg outline-none transition-colors placeholder:text-fg-dim focus:border-edge-strong"
-            />
-          </div>
+        ))}
+        <div className="relative ml-auto">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3 -translate-y-1/2 text-fg-dim" />
+          <input
+            ref={searchRef}
+            value={keyword}
+            onChange={(e) => setKeyword(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                setKeyword('');
+                e.currentTarget.blur();
+              }
+            }}
+            placeholder="搜索  /"
+            className="w-52 rounded-md border border-edge bg-card py-1 pl-7.5 pr-2.5 text-[11px] text-fg outline-none transition-colors placeholder:text-fg-dim focus:border-edge-strong"
+          />
         </div>
-      )}
+      </div>
       {visible.length === 0 && tasks.length > 0 && (
         <div className="px-4 pt-3 text-[11px] text-fg-dim">没有匹配当前筛选或搜索的任务。</div>
       )}
@@ -255,7 +254,16 @@ function TaskCard(props: {
           className="truncate font-mono"
           title={`${task.repo}${task.source === 'pr' ? ' PR#' : '#'}${task.issue_number}`}
         >
-          {shortRepo(task.repo)}
+          <a
+            href={`https://github.com/${task.repo}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={`https://github.com/${task.repo}`}
+            onClick={(e) => e.stopPropagation()}
+            className="text-info/80 hover:text-info hover:underline"
+          >
+            {shortRepo(task.repo)}
+          </a>
           {task.source === 'pr' ? ' PR#' : '#'}
           {task.issue_number}
         </div>

@@ -72,6 +72,36 @@ export interface TaskDetail {
   retryable: boolean;
 }
 
+export interface ProjectInfo {
+  repo: string;
+  local_repo: string;
+  base_branch: string;
+  git_remote: string;
+  ready_label: string;
+  branch_prefix: string;
+  review_mode: 'auto' | 'manual';
+  pr_review: 'auto' | 'manual';
+  checks: { argv: string[]; timeout_seconds?: number; platforms?: string[] }[];
+}
+
+export interface ProjectsPayload {
+  projects: ProjectInfo[];
+  config_path: string | null;
+  editable: boolean;
+}
+
+export interface NewProjectInput {
+  repo: string;
+  local_repo: string;
+  base_branch?: string;
+  git_remote?: string;
+  ready_label?: string;
+  branch_prefix?: string;
+  review_mode?: 'auto' | 'manual';
+  pr_review?: 'auto' | 'manual';
+  checks?: { argv: string[]; timeout_seconds?: number }[];
+}
+
 export interface HealthInfo {
   pid: number;
   uptime_s: number;
@@ -106,6 +136,19 @@ async function get<T>(url: string): Promise<T> {
 export const fetchTasks = () => get<{ tasks: TaskSummary[] }>('/api/tasks');
 export const fetchTask = (id: number) => get<TaskDetail>(`/api/tasks/${id}`);
 export const fetchHealth = () => get<HealthInfo>('/api/health');
+export const fetchProjects = () => get<ProjectsPayload>('/api/projects');
+
+export async function addProject(input: NewProjectInput): Promise<{ message: string; warnings: string[] }> {
+  const r = await fetch('/api/projects', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const d = (await r.json().catch(() => ({}))) as { message?: string; warnings?: string[]; error?: string };
+  if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+  return { message: d.message ?? 'done', warnings: d.warnings ?? [] };
+}
+
 export const fetchArtifact = (path: string) =>
   get<Artifact>(`/api/artifact?path=${encodeURIComponent(path)}`);
 export const fetchTail = (runId: string, offset: number | null, file: string | null) => {
