@@ -1,3 +1,4 @@
+import { acceptsAllIssues, type IntakeState } from './triage/intake.js';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { approvalHash } from './tracker/github.js';
@@ -168,9 +169,11 @@ export async function retryTask(
   if (!project) throw new OpsError(`项目 ${task.repo} 不在配置中`);
   const issue = await tracker.getIssue(task.repo, task.issue_number);
   if (!issue || issue.state !== 'OPEN') throw new OpsError('issue 已关闭或不存在');
-  if (!issue.labels.includes(project.ready_label)) {
+  if (!acceptsAllIssues(project) && !issue.labels.includes(project.ready_label)) {
     throw new OpsError(`issue 缺少 ${project.ready_label} 标签`);
   }
+  const intake = store.getIntake<IntakeState>(task.repo, task.issue_number);
+  if (acceptsAllIssues(project) && (intake && (!intake.imported || intake.kind || intake.locked || intake.pending || intake.error) || issue.labels.some(l => ['agent-human-hold', 'agent-needs-human'].includes(l)))) throw new OpsError('Issue 仍有人工门禁或同步未完成');
   if (issue.labels.includes('agent-running')) {
     throw new OpsError('issue 带有 agent-running 标签；请先确认没有调度器持有它，再移除过期标签并重试');
   }
@@ -185,6 +188,8 @@ export async function retryTask(
     if (!current || !RETRYABLE.includes(current.status) || store.activeRunForTask(task.id)) {
       throw new OpsError('检查重试期间任务已变化，请刷新后重试');
     }
+    const latestIntake = store.getIntake<IntakeState>(task.repo, task.issue_number);
+    if (acceptsAllIssues(project) && latestIntake && (latestIntake.kind || latestIntake.locked || latestIntake.pending || latestIntake.error)) throw new OpsError('重试期间人工状态已变化');
     // A retry means "judge the current state again". Dropping the recorded
     // verdicts is what makes that true: a task whose branch already has an
     // OPEN PR goes DISCOVERED → existing-PR → AWAITING_REVIEW, and the sha

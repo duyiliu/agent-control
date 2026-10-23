@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { isIP } from 'node:net';
 import { resolve } from 'node:path';
 import YAML from 'yaml';
 import { isMap, isSeq } from 'yaml';
@@ -81,7 +82,11 @@ function parseProject(v: unknown, idx: number | string): ProjectConfig {
   if (mode !== 'auto' && mode !== 'manual') fail(`${name}.review_mode: expected auto or manual`);
   const prReview = o['pr_review'] ?? 'auto';
   if (prReview !== 'auto' && prReview !== 'manual') fail(`${name}.pr_review: expected auto or manual`);
+  const triage = asObj(o['issue_triage'] ?? {}, `${name}.issue_triage`);
+  const intake = o['issue_intake'];
+  if (intake !== undefined && intake !== 'all' && intake !== 'labeled') fail(`${name}.issue_intake: expected all or labeled`);
   return {
+    issue_intake: intake as ProjectConfig['issue_intake'],
     repo: asStr(o['repo'], `${name}.repo`),
     local_repo: resolve(asStr(o['local_repo'], `${name}.local_repo`)),
     base_branch: asStr(o['base_branch'] ?? 'main', `${name}.base_branch`),
@@ -91,6 +96,10 @@ function parseProject(v: unknown, idx: number | string): ProjectConfig {
     checks: checksRaw.map((c, i) => parseCheck(c, `${name}.checks[${i}]`)),
     review_mode: mode,
     pr_review: prReview,
+    issue_triage: {
+      enabled: asBool(triage['enabled'] ?? false, `${name}.issue_triage.enabled`),
+      timeout_seconds: asNum(triage['timeout_seconds'] ?? 180, `${name}.issue_triage.timeout_seconds`, 1),
+    },
     verify_build: o['verify_build'] !== undefined ? parseCheck(o['verify_build'], `${name}.verify_build`) : undefined,
     verify_bootstrap: o['verify_bootstrap'] !== undefined ? parseCheck(o['verify_bootstrap'], `${name}.verify_bootstrap`) : undefined,
   };
@@ -109,6 +118,8 @@ export function loadConfig(path: string): AppConfig {
 
   const uiRaw = asObj(server['ui'] ?? {}, 'server.ui');
   const uiHost = asStr(uiRaw['host'] ?? '127.0.0.1', 'server.ui.host');
+  const uiEnabled = asBool(uiRaw['enabled'] ?? true, 'server.ui.enabled');
+  const uiToken = uiRaw['token'] !== undefined ? asStr(uiRaw['token'], 'server.ui.token') : undefined;
 
   const projectsRaw = root['projects'];
   // An empty list is legitimate: the scheduler idles and projects are added
@@ -163,6 +174,14 @@ export function loadConfig(path: string): AppConfig {
     fail('approvals.allow_auto_deploy was removed — agent-control never deploys');
   }
 
+  const projects = projectsRaw.map(parseProject);
+  const normalizedUiHost = uiHost.toLowerCase().replace(/^\[|\]$/g, '');
+  const loopbackUi = normalizedUiHost === 'localhost' || normalizedUiHost === '::1'
+    || normalizedUiHost === '::ffff:127.0.0.1' || isIP(normalizedUiHost) === 4 && normalizedUiHost.split('.')[0] === '127';
+  if (uiEnabled && projects.some(p => p.issue_intake === 'all' || p.issue_intake === undefined && p.issue_triage?.enabled) && !loopbackUi && !uiToken) {
+    fail('server.ui.token is required when Issue triage is enabled on a non-loopback UI host');
+  }
+
   return {
     server: {
       poll_interval_seconds: asNum(server['poll_interval_seconds'] ?? 30, 'server.poll_interval_seconds', 1),
@@ -175,13 +194,13 @@ export function loadConfig(path: string): AppConfig {
       logs_dir: logsDir,
       cancel_poll_seconds: asNum(server['cancel_poll_seconds'] ?? 5, 'server.cancel_poll_seconds', 1),
       ui: {
-        enabled: asBool(uiRaw['enabled'] ?? true, 'server.ui.enabled'),
+        enabled: uiEnabled,
         host: uiHost,
         port: asNum(uiRaw['port'] ?? 8787, 'server.ui.port', 1),
-        token: uiRaw['token'] !== undefined ? asStr(uiRaw['token'], 'server.ui.token') : undefined,
+        token: uiToken,
       },
     },
-    projects: projectsRaw.map(parseProject),
+    projects,
     agent: {
       provider: 'pi',
       model: asStr(agent['model'], 'agent.model'),

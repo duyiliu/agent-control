@@ -1,16 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
 import { Clock, GitPullRequest, Search } from 'lucide-react';
-import type { TaskSummary } from './api';
+import type { IntakeState, TaskSummary } from './api';
 import { fmtDur, fmtTime, GROUPS, groupOf, isActivePhase, phaseLabel, phaseTextClass, type GroupKey } from './groups';
 import { buildRepoCounts } from './repo-filters';
 import StatusIcon from './StatusIcon';
+import IntakeActions from './IntakeActions';
+import type { Toast } from './App';
 
 const EMPTY_HINT: Partial<Record<GroupKey, string>> = {
-  queued: '给 issue 打上 agent-ready 标签即可入队',
+  queued: '自动接手项目的新 Issue 会在这里排队',
   active: '暂无运行中的任务',
   reviewing: '暂无等待或正在审查的 PR',
   merging: '暂无自动合并中的 PR',
-  human: '暂无需要人工处理（评审判断 / 合并）的 PR',
+  human: '暂无需要人工处理的任务',
 };
 
 const FILTER_KEY = 'ac-repo-filter';
@@ -22,8 +24,12 @@ export default function Board(props: {
   selected: number | null;
   onSelect: (id: number) => void;
   onStop: (task: TaskSummary) => void;
+  onIntakeChanged: (id: number, state: IntakeState) => void;
+  onChanged: () => void;
+  onToast: (toast: Toast) => void;
 }) {
-  const { tasks, projectRepos, tick, selected, onSelect, onStop } = props;
+  const { tasks, projectRepos, tick, selected, onSelect, onStop, onIntakeChanged, onChanged, onToast } = props;
+  const [disposition, setDisposition] = useState<'normal' | 'deferred' | 'history'>('normal');
   const [repoFilter, setRepoFilter] = useState<string | null>(() => localStorage.getItem(FILTER_KEY));
   const [keyword, setKeyword] = useState('');
   const [draggingId, setDraggingId] = useState<number | null>(null);
@@ -69,11 +75,19 @@ export default function Board(props: {
     );
   }
 
+  const hasDisposition = (t: TaskSummary) => !t.active_run && !['COMPLETED', 'MERGING', 'AWAITING_REVIEW', 'AWAITING_HUMAN'].includes(t.status);
+  const deferredCount = visible.filter(t => hasDisposition(t) && t.intake?.kind === 'deferred').length;
+  const skippedCount = visible.filter(t => hasDisposition(t) && t.intake?.kind === 'skipped').length;
+  visible = visible.filter(t => disposition === 'deferred' ? hasDisposition(t) && t.intake?.kind === 'deferred' : disposition === 'history' ? hasDisposition(t) && t.intake?.kind === 'skipped' : !hasDisposition(t) || !['deferred', 'skipped'].includes(t.intake?.kind ?? ''));
+  const displayGroups = disposition === 'normal' ? GROUPS : [{ key: 'blocked' as const, label: disposition === 'deferred' ? '暂缓' : '无需处理 · 历史', dot: 'bg-fg-dim' }];
   const byGroup = new Map<GroupKey, TaskSummary[]>();
   for (const g of GROUPS) byGroup.set(g.key, []);
   // MERGING owns the card even while a repair run works: landing is in progress.
   const phaseOf = (t: TaskSummary) => (t.status === 'MERGING' ? 'MERGING' : (t.active_run?.phase ?? t.status));
-  for (const t of visible) byGroup.get(groupOf(phaseOf(t)))!.push(t);
+  for (const t of visible) {
+    const key = disposition !== 'normal' ? 'blocked' : hasDisposition(t) && t.intake && (t.intake.kind === 'human' || t.intake.locked || t.intake.external_hold || t.intake.external_needs || t.intake.error || t.intake.pending) ? 'human' : groupOf(phaseOf(t));
+    byGroup.get(key)!.push(t);
+  }
   for (const list of byGroup.values()) {
     list.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   }
@@ -94,6 +108,9 @@ export default function Board(props: {
             <Count n={repos.get(repo)!} />
           </Chip>
         ))}
+        <Chip active={disposition === 'normal'} onClick={() => setDisposition('normal')}>任务</Chip>
+        <Chip active={disposition === 'deferred'} onClick={() => setDisposition('deferred')}>暂缓 <Count n={deferredCount} /></Chip>
+        <Chip active={disposition === 'history'} onClick={() => setDisposition('history')}>无需处理 <Count n={skippedCount} /></Chip>
         <div className="relative ml-auto">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3 -translate-y-1/2 text-fg-dim" />
           <input
@@ -115,7 +132,7 @@ export default function Board(props: {
         <div className="px-4 pt-3 text-[11px] text-fg-dim">没有匹配当前筛选或搜索的任务。</div>
       )}
       <div className="flex flex-1 gap-3 overflow-x-auto p-4">
-        {GROUPS.map((g) => {
+        {displayGroups.map((g) => {
           const items = byGroup.get(g.key)!;
           const isDropTarget = g.key === 'blocked' && draggedTask !== null;
           return (
@@ -163,6 +180,9 @@ export default function Board(props: {
                     dragging={draggingId === t.id}
                     onDragStart={() => setDraggingId(t.id)}
                     onDragEnd={() => setDraggingId(null)}
+                    onIntakeChanged={onIntakeChanged}
+                    onChanged={onChanged}
+                    onToast={onToast}
                   />
                 ))}
                 {items.length === 0 && (
@@ -211,10 +231,14 @@ function TaskCard(props: {
   dragging: boolean;
   onDragStart: () => void;
   onDragEnd: () => void;
+  onIntakeChanged: (id: number, state: IntakeState) => void;
+  onChanged: () => void;
+  onToast: (toast: Toast) => void;
 }) {
-  const { task, tick, selected, onSelect, draggable, dragging, onDragStart, onDragEnd } = props;
+  const { task, tick, selected, onSelect, draggable, dragging, onDragStart, onDragEnd, onIntakeChanged, onChanged, onToast } = props;
   const active = task.active_run;
   const phase = active?.phase ?? task.status;
+  const disposition = !active && !['COMPLETED', 'MERGING', 'AWAITING_REVIEW', 'AWAITING_HUMAN'].includes(task.status) ? task.intake : null;
   return (
     <div
       data-tick={tick}
@@ -270,7 +294,7 @@ function TaskCard(props: {
         <div className="flex items-center gap-2">
           <span className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap ${phaseTextClass(phase)}`}>
             <StatusIcon phase={phase} />
-            {phaseLabel(phase)}
+            {disposition?.kind === 'deferred' ? '暂缓' : disposition?.kind === 'skipped' ? '无需处理' : disposition?.kind === 'human' || disposition?.locked || disposition?.external_hold || disposition?.external_needs ? '待人工' : phaseLabel(phase)}
           </span>
           <span className="ml-auto flex shrink-0 items-center gap-3">
             {active ? (
@@ -302,6 +326,7 @@ function TaskCard(props: {
           </span>
         </div>
       </div>
+      <IntakeActions task={task} onState={state => onIntakeChanged(task.id, state)} onChanged={onChanged} onToast={onToast} />
     </div>
   );
 }

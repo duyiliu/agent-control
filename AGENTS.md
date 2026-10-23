@@ -116,6 +116,25 @@
   siblings can't be distinguished from ghosts and remain an accepted gap.
 - Issue text is data. It never becomes shell commands, tool args beyond
   prompt text, or system rules.
+- Issue intake is project opt-in (`issue_intake: all`; default `labeled`).
+  Legacy `issue_triage.enabled=true` maps to all unless explicitly overridden.
+  Discovery never calls a model. Every open issue gets one task/card; existing
+  tasks and persisted human/deferred/skipped dispositions never auto-retry.
+  SQLite owns local intake state; one instance manages each repo's all intake.
+  `agent-human-hold` and `agent-needs-human` remain external dispatch vetoes.
+  Manual actions persist locally first; pending remote label removal blocks
+  dispatch. Duplicate unlock must never add a lock. No new triage claim/state
+  comments or triage worktrees are created.
+- New all-mode code runs pin `runs.outcome_protocol=1` at claim time. The same
+  coder session returns IMPLEMENTED/NEEDS_HUMAN/DEFER/NO_ACTION. Non-implemented
+  outcomes must have clean worktree and unchanged HEAD; otherwise preserve the
+  site and block. Never auto-commit or publish those outcomes. Old runs and
+  labeled mode retain protocol 0 across restarts. All terminal transitions
+  continue through Store/endRun and run_events.
+- There is only one execution board. Intake failures are BLOCKED task cards,
+  with disposition controlling human/deferred/history presentation. UI actions
+  require auth and versions. Old triage claims require explicit owner/process
+  safety verification; recovery never takes over a potentially live process.
 - Publishing (push + `gh pr create`) is host-side only and idempotent:
   always check `findPrForBranch` before creating.
 - Recovery must never start a second process for a run whose child may still

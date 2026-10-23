@@ -54,7 +54,7 @@ test('projects api', async (t) => {
   const store = makeStore(dir);
   const tracker = makeFakeTracker();
   const checked: string[] = [];
-  const provisioned: string[] = [];
+  const provisioned: { repo: string; triageEnabled: boolean }[] = [];
 
   const ui = await startUiServer({
     deps: {
@@ -62,7 +62,7 @@ test('projects api', async (t) => {
       configPath,
       checkRepoExists: async (repo) => { checked.push(repo); },
       resolveRepo: async (repo) => (repo === 'old-org/repo' ? 'me/renamed' : repo),
-      provisionRepo: async (repo) => { provisioned.push(repo); return []; },
+      provisionRepo: async (repo, _readyLabel, triageEnabled) => { provisioned.push({ repo, triageEnabled }); return []; },
     },
     host: '127.0.0.1', port: 0, appLog: nullLog,
   });
@@ -112,15 +112,17 @@ test('projects api', async (t) => {
       local_repo: local,
       review_mode: 'manual',
       checks: [{ argv: ['node', '--test'], timeout_seconds: 300 }],
+      issue_triage: { enabled: true },
     });
     assert.equal(r.status, 200);
     assert.match(String(r.body.message), /已添加 me\/new/);
     assert.deepEqual(checked, ['me/new']);
-    assert.deepEqual(provisioned, ['me/new']);
+    assert.deepEqual(provisioned, [{ repo: 'me/new', triageEnabled: true }]);
 
     // In-memory config updated in place — same array the engine iterates.
     assert.deepEqual(config.projects.map((p) => p.repo), ['me/sandbox', 'me/new']);
     assert.equal(config.projects[1]!.review_mode, 'manual');
+    assert.equal(config.projects[1]!.issue_triage?.enabled, true);
 
     const text = readFileSync(configPath, 'utf8');
     assert.match(text, /seed config — 注释必须保留/);
@@ -137,6 +139,8 @@ test('projects api', async (t) => {
     assert.equal(r.status, 200);
     const warnings = r.body.warnings as string[];
     assert.ok(warnings.some((w) => /origin/.test(w)));
+    assert.deepEqual(provisioned.at(-1), { repo: 'me/third', triageEnabled: false });
+    assert.equal(config.projects.find(p => p.repo === 'me/third')!.issue_triage?.enabled, false);
   });
 
   await t.test('POST honours git_remote and resolves a renamed remote URL', async () => {

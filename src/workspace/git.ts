@@ -91,6 +91,10 @@ export class GitWorkspace {
     return res.stdoutTail.trim();
   }
 
+  async refSha(repoDir: string, ref: string): Promise<string> {
+    return (await this.git(['rev-parse', '--verify', `${ref}^{commit}`], repoDir)).stdoutTail.trim();
+  }
+
   /** Host-side fallback: commit leftover agent changes verbatim. */
   async commitAll(worktreePath: string, message: string): Promise<boolean> {
     if (!(await this.isDirty(worktreePath))) return false;

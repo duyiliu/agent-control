@@ -118,6 +118,7 @@ function ProjectCard({ project: p }: { project: ProjectInfo }) {
         <span className="ml-auto flex items-center gap-1.5">
           <Badge>{p.review_mode === 'auto' ? '自动评审' : '人工评审'}</Badge>
           <Badge>{p.pr_review === 'auto' ? '外部PR自动评审' : '外部PR需召唤'}</Badge>
+          {p.issue_intake === 'all' && <Badge>自动接手 Issue</Badge>}
         </span>
       </div>
       <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-fg-muted">
@@ -162,6 +163,7 @@ function AddProjectForm(props: {
   const [branchPrefix, setBranchPrefix] = useState('agent/issue-');
   const [reviewMode, setReviewMode] = useState<'auto' | 'manual'>('auto');
   const [prReview, setPrReview] = useState<'auto' | 'manual'>('auto');
+  const [issueTriage, setIssueTriage] = useState(false);
   const [checkLines, setCheckLines] = useState('');
   const [checkTimeout, setCheckTimeout] = useState('300');
   const [busy, setBusy] = useState(false);
@@ -194,6 +196,7 @@ function AddProjectForm(props: {
       branch_prefix: branchPrefix.trim() || 'agent/issue-',
       review_mode: reviewMode,
       pr_review: prReview,
+      issue_intake: issueTriage ? 'all' : 'labeled',
       ...(checks.length > 0 ? { checks } : {}),
     };
     setBusy(true);
@@ -273,6 +276,13 @@ function AddProjectForm(props: {
                 <option value="manual">manual — 仅 agent-review 召唤</option>
               </select>
             </Field>
+            <Field label="自动接手 Issue" hint="新 Issue 默认排队，同一个 Agent 判断并处理；人工锁定和暂缓项不会启动">
+              <div className="flex h-[31px] items-center gap-2 text-[11.5px] text-fg-muted">
+                <input type="checkbox" checked={issueTriage} onChange={e => setIssueTriage(e.target.checked)} className="accent-brand" />
+                开启全量扫描
+              </div>
+            </Field>
+
           </div>
           <Field label="检查命令" hint="可选，每行一条；空格分词，含空格参数用引号包住">
             <textarea

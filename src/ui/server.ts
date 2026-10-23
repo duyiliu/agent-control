@@ -1,3 +1,4 @@
+import { acceptsAllIssues } from '../triage/intake.js';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createReadStream, statSync } from 'node:fs';
 import { timingSafeEqual } from 'node:crypto';
@@ -5,6 +6,7 @@ import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppLog } from '../telemetry/logging.js';
 import { approveMergeTask, OpsError, retryTask, stopTask } from '../ops.js';
+import type { TriageAction } from '../triage/service.js';
 import {
   addProjectPayload,
   artifactPayload,
@@ -182,6 +184,40 @@ async function handle(deps: UiDeps, req: IncomingMessage, res: ServerResponse): 
   const method = req.method ?? 'GET';
 
   if (!checkAuth(deps, req, res, url)) return;
+
+  if (method === 'GET' && path === '/api/triage') {
+    json(res, 200, { issues: deps.triage?.list() ?? [], projects: deps.config.projects.map(p => ({ repo: p.repo, enabled: acceptsAllIssues(p) })) });
+    return;
+  }
+  if (method === 'POST' && path === '/api/triage/actions') {
+    const remote = req.socket.remoteAddress ?? '';
+    if (!deps.config.server.ui.token && !['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote)) {
+      json(res, 403, { error: '远程分流操作必须配置访问令牌' }); return;
+    }
+    if (!deps.triage) { json(res, 503, { error: '分流服务未连接' }); return; }
+    let actionBody: Record<string, unknown> | null = null;
+    try {
+      const body = await readBody(req) as Record<string, unknown> | null;
+      actionBody = body;
+      const actions = ['sync', 'approve', 'defer', 'reevaluate', 'lock', 'unlock', 'recover', 'reset', 'release-claim'];
+      if (!body || typeof body !== 'object' || typeof body.repo !== 'string' || !Number.isSafeInteger(body.number) || (body.number as number) < 1
+        || body.expected_version !== undefined && (!Number.isSafeInteger(body.expected_version) || (body.expected_version as number) < 1)
+        || !actions.includes(String(body.action)) || body.defer_until !== undefined && typeof body.defer_until !== 'string'
+        || body.claim_id !== undefined && typeof body.claim_id !== 'string' || body.confirm_owner_exited !== undefined && typeof body.confirm_owner_exited !== 'boolean') {
+        json(res, 400, { error: '分流操作参数无效' }); return;
+      }
+      const state = await deps.triage.action(body.repo, body.number as number, body.action as TriageAction, {
+        expected_version: body.expected_version as number | undefined,
+        defer_until: body.defer_until as string | undefined, claim_id: body.claim_id as string | undefined,
+        confirm_owner_exited: body.confirm_owner_exited as boolean | undefined,
+      });
+      json(res, 200, { message: state.pending ? '操作已保存，正在同步' : '操作已保存', state });
+    } catch (err) {
+      const state = actionBody && typeof actionBody.repo === 'string' && Number.isSafeInteger(actionBody.number) ? deps.triage.state(actionBody.repo, actionBody.number as number) : null;
+      json(res, 409, { error: err instanceof Error ? err.message : String(err), state });
+    }
+    return;
+  }
 
   if (method === 'GET' && path === '/api/tasks') {
     json(res, 200, tasksPayload(deps.store));

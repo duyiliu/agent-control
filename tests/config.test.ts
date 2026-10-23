@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ConfigError, loadConfig } from '../src/config.js';
+import { ConfigError, loadConfig, validateProject } from '../src/config.js';
 import { cleanup, tmpDir } from './helpers.js';
 
 function withConfig(agent: string, run: (path: string) => void) {
@@ -122,6 +122,38 @@ test('config: an empty projects list is allowed — scheduler idles until the UI
   } finally { cleanup(dir); }
 });
 
+test('config: issue triage defaults off with a bounded model-call timeout', () => {
+  withConfig('  model: test/coder', path => {
+    assert.deepEqual(loadConfig(path).projects[0]!.issue_triage, { enabled: false, timeout_seconds: 180 });
+  });
+});
+
+test('config: enabled triage on a non-loopback UI host requires a token', () => {
+  const dir = tmpDir('ac-config-triage-');
+  const path = join(dir, 'config.yaml');
+  const write = (token = '') => writeFileSync(path, [
+    'server:',
+    `  database: '${join(dir, 'agent.db').replace(/\\/g, '/')}'`,
+    `  worktree_root: '${join(dir, 'worktrees').replace(/\\/g, '/')}'`,
+    '  ui:',
+    '    host: 0.0.0.0',
+    ...(token ? [`    token: ${token}`] : []),
+    'projects:',
+    '  - repo: owner/repo',
+    `    local_repo: '${dir.replace(/\\/g, '/')}'`,
+    '    issue_triage:',
+    '      enabled: true',
+    'agent:',
+    '  model: test/coder',
+  ].join('\n'), 'utf8');
+  try {
+    write();
+    assert.throws(() => loadConfig(path), (err) => err instanceof ConfigError && /server\.ui\.token is required/.test(err.message));
+    write("'test-token'");
+    assert.equal(loadConfig(path).server.ui.token, 'test-token');
+  } finally { cleanup(dir); }
+});
+
 test('config: check platforms are parsed and passed through', () => {
   withCheck(['      - argv: [node, --test]', '        platforms: [win32, linux]'], (path) => {
     const config = loadConfig(path);
@@ -139,4 +171,12 @@ test('config: an empty platforms list is rejected', () => {
   withCheck(['      - argv: [node, --test]', '        platforms: []'], (path) => {
     assert.throws(() => loadConfig(path), (err) => err instanceof ConfigError && /platforms must be a non-empty array/.test(err.message));
   });
+});
+
+test('config: explicit issue intake overrides the deprecated triage switch', async () => {
+  const { acceptsAllIssues } = await import('../src/triage/intake.js');
+  const raw = { repo: 'o/r', local_repo: '.', issue_triage: { enabled: true }, issue_intake: 'labeled' };
+  assert.equal(acceptsAllIssues(validateProject(raw)), false);
+  assert.equal(acceptsAllIssues(validateProject({ ...raw, issue_intake: 'all' })), true);
+  assert.throws(() => validateProject({ ...raw, issue_intake: 'random' }), /issue_intake/);
 });

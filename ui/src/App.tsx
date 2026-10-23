@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Activity, Check, FolderGit2, Palette, RefreshCw, TriangleAlert } from 'lucide-react';
-import { fetchHealth, fetchProjects, fetchTasks, postAction, type HealthInfo, type TaskSummary } from './api';
+import { fetchHealth, fetchProjects, fetchTasks, postAction, type HealthInfo, type TaskSummary, type IntakeState } from './api';
 import { fmtDur } from './groups';
 import Board from './Board';
 import DetailDrawer from './DetailDrawer';
@@ -45,7 +45,9 @@ export default function App() {
   const [toast, setToast] = useState<Toast | null>(null);
   const [theme, setTheme] = useTheme();
 
+  const refreshSequence = useRef(0);
   const refresh = useCallback(async () => {
+    const sequence = ++refreshSequence.current;
     // Projects feed the board's repo filter; a failure keeps the last list
     // and must not block the task/health update.
     fetchProjects()
@@ -53,6 +55,7 @@ export default function App() {
       .catch(() => {});
     try {
       const [t, h] = await Promise.all([fetchTasks(), fetchHealth()]);
+      if (sequence !== refreshSequence.current) return;
       setTasks(t.tasks);
       setHealth(h);
     } catch { /* transient — next cycle retries */ }
@@ -94,6 +97,11 @@ export default function App() {
     return () => clearTimeout(id);
   }, [toast]);
 
+  const updateIntake = useCallback((id: number, state: IntakeState) => {
+    ++refreshSequence.current;
+    setTasks(current => current?.map(t => t.id === id && (!t.intake || state.version >= t.intake.version) ? { ...t, intake: state } : t) ?? null);
+  }, []);
+
   return (
     <div className="flex h-full flex-col">
       <header className="flex min-h-11 shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-edge px-4 py-2 md:h-11 md:flex-nowrap md:py-0">
@@ -125,6 +133,9 @@ export default function App() {
         selected={selected}
         onSelect={setSelected}
         onStop={stopByDrag}
+        onIntakeChanged={updateIntake}
+        onChanged={refresh}
+        onToast={setToast}
       />
       {selected !== null && (
         <DetailDrawer

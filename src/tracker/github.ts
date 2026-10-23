@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { IssueData, PrInfo } from '../types.js';
 import { runProc, which, type ProcResult } from '../proc.js';
+import type { IssueComment } from '../triage/state.js';
 
 export class TrackerError extends Error {
   constructor(
@@ -34,7 +35,13 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export const SYSTEM_LABELS = [
   'agent-running', 'agent-blocked', 'agent-pr', 'agent-reviewing',
   'agent-high-risk', 'agent-merge', 'agent-review',
+  'agent-needs-human', 'agent-human-hold', 'agent-triage-managed',
 ];
+export const TRIAGE_LABELS = ['agent-needs-human', 'agent-human-hold', 'agent-triage-managed'];
+
+export function requiredLabelsForProject(readyLabel: string, triageEnabled: boolean): string[] {
+  return [...new Set([...(triageEnabled ? [] : [readyLabel]), ...SYSTEM_LABELS.filter(label => label !== 'agent-triage-managed' && (triageEnabled || !TRIAGE_LABELS.includes(label)))])];
+}
 
 /**
  * GitHub access via the `gh` CLI. Returns structured data; throws
@@ -63,8 +70,12 @@ export class GitHubTracker {
         argv: [this.ghPath, ...args],
         timeoutMs: 60_000,
         streamStdoutToLog: false,
+        stdoutLimit: 8 * 1024 * 1024,
       });
-      if (res.exitCode === 0) return res;
+      if (res.exitCode === 0) {
+        if (res.stdoutTruncated) throw new TrackerError('GitHub response exceeded capture limit', res);
+        return res;
+      }
       last = res;
       const tail = `${res.stdoutTail}\n${res.stderrTail}`;
       const retryable = res.timedOut || TRANSIENT.test(tail);
@@ -90,6 +101,42 @@ export class GitHubTracker {
       url: r.url,
       updatedAt: r.updatedAt,
     })).filter((r) => !r.labels.includes('agent-running'));
+  }
+
+  async listOpenIssues(repo: string): Promise<IssueData[]> {
+    const rows = await this.pages<Record<string, unknown>>(`repos/${repo}/issues?state=open&per_page=50`);
+    return rows.filter(r => !r.pull_request).map(r => ({
+      number: r.number as number, title: r.title as string, body: (r.body as string) ?? '',
+      labels: (r.labels as { name: string }[]).map(l => l.name), state: 'OPEN', url: r.html_url as string,
+      updatedAt: r.updated_at as string, createdAt: r.created_at as string,
+    }));
+  }
+
+  private async pages<T>(endpoint: string): Promise<T[]> {
+    const result: T[] = [];
+    for (let page = 1; ; page++) {
+      const rows = await this.ghJson<T[]>(['api', `${endpoint}&page=${page}`]);
+      if (!Array.isArray(rows)) throw new TrackerError('Expected paginated GitHub array');
+      result.push(...rows);
+      if (rows.length < 50) return result;
+    }
+  }
+
+  async issueComments(repo: string, number: number): Promise<IssueComment[]> {
+    const rows = await this.pages<{ id: number; body: string; user: { login: string; type: string }; created_at: string; updated_at: string }>(`repos/${repo}/issues/${number}/comments?per_page=50`);
+    return rows.map(r => ({ id: r.id, body: r.body, author: r.user.login, authorType: r.user.type, createdAt: r.created_at, updatedAt: r.updated_at }));
+  }
+
+  async authLogin(): Promise<string> {
+    return (await this.ghJson<{ login: string }>(['api', 'user'])).login;
+  }
+
+  async createIssueComment(repo: string, number: number, body: string): Promise<number> {
+    return (await this.ghJson<{ id: number }>(['api', `repos/${repo}/issues/${number}/comments`, '-X', 'POST', '-f', `body=${body}`])).id;
+  }
+
+  async editIssueComment(repo: string, id: number, body: string): Promise<void> {
+    await this.gh(['api', `repos/${repo}/issues/comments/${id}`, '-X', 'PATCH', '-f', `body=${body}`]);
   }
 
   /**

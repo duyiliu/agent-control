@@ -53,7 +53,7 @@ function fakeCoderSession(get: () => Promise<AgentCallResult>): CoderSession {
       const ok = r.exitCode === 0 && !r.timedOut && !r.aborted;
       return {
         ok, aborted: r.aborted, timedOut: r.timedOut, exitCode: r.exitCode,
-        lastMessage: null, durationMs: r.durationMs, stderrTail: r.stderrTail,
+        lastMessage: (r as AgentCallResult & { lastMessage?: string }).lastMessage ?? null, durationMs: r.durationMs, stderrTail: r.stderrTail,
         ...(ok ? {} : { error: `exit ${r.exitCode}` }),
       };
     },
@@ -1516,5 +1516,52 @@ test('claim race: an earlier claim from this same host is a ghost, not a rival',
     const { store, engine } = makeEngine(env);
     await tickAndDrain(engine);
     assert.equal(store.getTask('me/sandbox', 65)!.status, 'AWAITING_REVIEW');
+  } finally { env.done(); }
+});
+
+for (const outcome of ['IMPLEMENTED', 'NEEDS_HUMAN', 'DEFER', 'NO_ACTION', 'INVALID']) {
+  test(`all intake uses one coder session and handles ${outcome} without ready`, async () => {
+    const env = setup();
+    try {
+      env.config.projects[0]!.issue_intake = 'all';
+      env.tracker.issues.set(81, { ...ISSUE, labels: [] });
+      Object.assign(env.tracker, {
+        listOpenIssues: async () => [...env.tracker.issues.entries()].map(([number, issue]) => ({ number, ...issue })),
+        issueComments: async () => [], authLogin: async () => 'agent-control',
+      });
+      let coderCalls = 0; let checkCalls = 0;
+      const { store, engine } = makeEngine(env, {
+        coder: async () => { coderCalls++; return { ...okCoder(), lastMessage: outcome === 'INVALID' ? 'done' : JSON.stringify({ outcome, reason: 'concrete reason' }) }; },
+        checks: async () => { checkCalls++; return checksOk(); },
+      });
+      await tickAndDrain(engine);
+      const task = store.getTask('me/sandbox', 81)!;
+      assert.equal(coderCalls, 1);
+      assert.equal(store.runsForTask(task.id)[0]!.outcome_protocol, 1);
+      if (outcome === 'IMPLEMENTED') {
+        assert.equal(task.status, 'AWAITING_REVIEW'); assert.equal(checkCalls, 1); assert.equal(env.tracker.prCreated, 1);
+      } else {
+        assert.equal(task.status, 'BLOCKED'); assert.equal(checkCalls, 0); assert.equal(env.tracker.prCreated, 0);
+        const intake = engine.triage.state(task.repo, 81)!;
+        assert.equal(intake.kind, outcome === 'DEFER' ? 'deferred' : outcome === 'NO_ACTION' ? 'skipped' : 'human');
+        await tickAndDrain(engine); assert.equal(coderCalls, 1, 'blocked results must not auto-retry');
+      }
+      assert.ok(!env.tracker.labelsAdded.some(([, label]) => label === 'agent-ready'));
+    } finally { env.done(); }
+  });
+}
+
+test('all intake non-implementation result with edits preserves workspace and never publishes', async () => {
+  const env = setup();
+  try {
+    env.config.projects[0]!.issue_intake = 'all';
+    env.tracker.issues.set(82, { ...ISSUE, labels: [] });
+    Object.assign(env.tracker, { listOpenIssues: async () => [{ number: 82, ...env.tracker.issues.get(82)! }], issueComments: async () => [], authLogin: async () => 'agent-control' });
+    let dirty = false; let commits = 0;
+    const workspace = fakeWorkspace(); workspace.isDirty = async () => dirty; workspace.commitAll = async () => { commits++; return true; };
+    const { store, engine } = makeEngine(env, { workspace, coder: async () => { dirty = true; return { ...okCoder(), lastMessage: JSON.stringify({ outcome: 'DEFER', reason: 'waiting' }) }; } });
+    await tickAndDrain(engine);
+    assert.equal(store.getTask('me/sandbox', 82)!.status, 'BLOCKED'); assert.equal(commits, 0); assert.equal(env.tracker.prCreated, 0);
+    assert.match(engine.triage.state('me/sandbox', 82)!.reason, /已有代码改动/); assert.equal(dirty, true);
   } finally { env.done(); }
 });

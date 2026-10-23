@@ -22,6 +22,8 @@ projects:
     branch_prefix: agent/issue-
     review_mode: auto                # auto（默认）：每个 PR head 自动派独立评审 run；manual：不派评审，PR 停在 AWAITING_HUMAN 等人审人合
     pr_review: auto                  # auto（默认）：没有 issue 的 PR 也自动评审；manual：只评审打了 agent-review 标签的 PR
+    # issue_intake: all                # 全部开放 Issue 默认排队；同一 Agent 判断并处理
+    # 默认 labeled：仍需 ready_label；旧 issue_triage.enabled=true 兼容为 all
     checks:
       - argv: [node, --test]
         timeout_seconds: 300

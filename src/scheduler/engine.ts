@@ -20,6 +20,9 @@ import {
 } from './diff-paths.js';
 import type { AppConfig, CheckSpec, IssueData, PendingFix, Phase, ProjectConfig, ReviewResult, RunRow, TaskRow } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
+import { IssueTriage } from '../triage/service.js';
+import { MANAGED } from '../triage/state.js';
+import { acceptsAllIssues, parseOutcome } from '../triage/intake.js';
 
 export interface EngineDeps {
   store: Store;
@@ -67,6 +70,7 @@ function fmtSpan(fromIso: string, toIso: string | null): string {
 }
 
 export class Engine {
+  readonly triage: IssueTriage;
   private controllers = new Map<string, AbortController>();
   private inFlight = new Set<string>(); // run_ids currently executing in this process
   /** task:approved:head triples already proven reproducible — a merge retry
@@ -83,6 +87,7 @@ export class Engine {
   private suspended = new Set<string>();
 
   constructor(private deps: EngineDeps) {
+    this.triage = new IssueTriage({ ...deps, canStart: () => !this.stopping && this.activeCount() < this.config.server.max_concurrent });
     this.openCoderSessionFn = deps.openCoderSessionFn ?? openPiCoderSession;
     this.runReviewFn = deps.runReviewFn ?? runReview;
     this.runChecksFn = deps.runChecksFn ?? runChecks;
@@ -95,7 +100,7 @@ export class Engine {
   private get appLog() { return this.deps.appLog; }
 
   isRunning(runId: string) { return this.inFlight.has(runId); }
-  activeCount() { return this.inFlight.size; }
+  activeCount() { return this.inFlight.size + this.triage.activeCount(); }
 
   /** Abort an in-flight run (used by shutdown and the cancel sweep). */
   abortRun(runId: string, why = 'cancelled') {
@@ -112,12 +117,13 @@ export class Engine {
    */
   async shutdown(timeoutMs = 10_000): Promise<boolean> {
     this.stopping = true;
+    void this.triage.shutdown();
     for (const ctl of this.controllers.values()) ctl.abort('service shutdown');
     const deadline = Date.now() + timeoutMs;
-    while ((!this.ticking && this.inFlight.size === 0) === false && Date.now() < deadline) {
+    while ((!this.ticking && this.activeCount() === 0) === false && Date.now() < deadline) {
       await sleep(50);
     }
-    return !this.ticking && this.inFlight.size === 0;
+    return !this.ticking && this.activeCount() === 0;
   }
 
   /**
@@ -158,6 +164,8 @@ export class Engine {
       if (!this.stopping && !(this.store.getMeta('drain_requested') ?? '')) {
         await this.reconcileMergeStates();
         if (this.stopping) return;
+        await this.triage.scan();
+        if (this.stopping) return;
         await this.discover();
         if (this.stopping) return;
         await this.dispatch();
@@ -165,6 +173,7 @@ export class Engine {
         await this.discoverPrs();
         if (this.stopping) return;
         await this.dispatchReviews();
+
       }
     } finally {
       this.ticking = false;
@@ -181,7 +190,7 @@ export class Engine {
   private maybeAckDrain() {
     try {
       const nonce = this.store.getMeta('drain_requested');
-      if (!nonce || this.inFlight.size !== 0 || this.store.activeRuns().length !== 0) return;
+      if (!nonce || this.activeCount() !== 0 || this.store.activeRuns().length !== 0) return;
       this.store.setMeta('drain_ack', nonce);
     } catch { /* db closed during shutdown */ }
   }
@@ -418,6 +427,7 @@ export class Engine {
     for (const project of this.config.projects) {
       let issues: IssueData[];
       try {
+        if (acceptsAllIssues(project)) continue;
         issues = await this.tracker.listReadyIssues(project.repo, project.ready_label);
       } catch (err) {
         this.appLog.event('discover_error', { repo: project.repo, error: String(err) });
@@ -425,6 +435,8 @@ export class Engine {
         continue;
       }
       for (const issue of issues) {
+        const authorized = await this.triage.authorize(project, issue);
+        if (!authorized) continue;
         const { task, created } = this.store.upsertDiscovered({
           repo: project.repo,
           issue_number: issue.number,
@@ -433,6 +445,10 @@ export class Engine {
         });
         if (created) {
           this.appLog.event('task_discovered', { repo: project.repo, issue: issue.number });
+          continue;
+        }
+        if (issue.labels.includes(MANAGED) && task.status === 'DISCOVERED' && !this.store.runsForTask(task.id).length) {
+          this.store.setApprovedHash(task.id, approvalHash(authorized.issue));
           continue;
         }
         // Approval drift on a waiting task: hash changed while DISCOVERED.
@@ -546,12 +562,13 @@ export class Engine {
   /** Gate check + claim + launch for one task. All gating failures are explicit. */
   private async tryDispatch(task: TaskRow, project: ProjectConfig) {
     const issue = await this.tracker.getIssue(project.repo, task.issue_number);
+    if (issue && !await this.triage.authorize(project, issue)) return;
     if (!issue || issue.state !== 'OPEN') {
       this.setTaskStatus(task.id, 'CANCELED', { pending_fix: null });
       this.appLog.event('dispatch_skip', { task: task.id, why: 'issue closed or missing' });
       return;
     }
-    if (!issue.labels.includes(project.ready_label)) {
+    if (!acceptsAllIssues(project) && !issue.labels.includes(project.ready_label)) {
       this.setTaskStatus(task.id, 'CANCELED', { pending_fix: null });
       this.appLog.event('dispatch_skip', { task: task.id, why: 'ready label revoked' });
       return;
@@ -564,6 +581,10 @@ export class Engine {
     }
 
     const hash = approvalHash(issue);
+    if ((acceptsAllIssues(project) || issue.labels.includes(MANAGED)) && !this.store.runsForTask(task.id).length) {
+      this.store.setApprovedHash(task.id, hash);
+      task = { ...task, approved_hash: hash };
+    }
     if (task.approved_hash == null) {
       this.store.setApprovedHash(task.id, hash);
     } else if (task.approved_hash !== hash) {
@@ -614,7 +635,20 @@ export class Engine {
     }
 
     if (this.stopping) return; // claimed rows stay DISCOVERED for next boot
-    const run = this.store.claimRun(task.id);
+    const finalApproval = await this.triage.authorize(project, issue);
+    if (!finalApproval || this.stopping) return;
+    if (approvalHash(finalApproval.issue) !== hash) return;
+    const run = this.store.claimRun(task.id, { outcomeProtocol: acceptsAllIssues(project) && !task.pending_fix ? 1 : 0 });
+    if (finalApproval.hash) {
+      try {
+        const artifacts = this.artifactsDirFor(run);
+        mkdirSync(artifacts, { recursive: true });
+        writeFileSync(join(artifacts, 'approved-issue.json'), JSON.stringify(finalApproval), 'utf8');
+      } catch (err) {
+        this.store.endRun(run.run_id, 'FAILED', 'unable to persist authorized issue snapshot');
+        throw err;
+      }
+    }
     this.store.updateRunFields(run.run_id, { branch, pr_url: existingPr?.url ?? null });
     await this.labelQuietly(project.repo, issue.number, 'add', 'agent-running');
     // A stale agent-blocked (e.g. left by a failed attempt on another
@@ -1052,6 +1086,9 @@ export class Engine {
               }
               prompt = buildFixPrompt(ctx, `${intent.title ?? 'Review BLOCK'}：${intent.summary}\n${intent.findings.join('\n')}`);
             }
+            const structuredOutcome = run.outcome_protocol === 1 && !intent;
+            if (structuredOutcome) prompt += '\n# 最终结果协议\n在同一会话中先判断再实施，缺少必要信息时停止，不做猜测性修改。最终回复必须仅为一个 JSON 对象：{"outcome":"IMPLEMENTED|NEEDS_HUMAN|DEFER|NO_ACTION","reason":"具体原因"}。IMPLEMENTED 表示已经实现，进入宿主检查；其他结果要求工作树与本回合开始时一致且干净，不创建提交。不得为输出 IMPLEMENTED 而制造改动。';
+            const headAtTurnStart = structuredOutcome ? await this.workspace.head(worktreePath) : null;
             const turn = ensureCoder();
             const res = await this.coderTurn(run, log, turn, withResumeNote(prompt), 'RUNNING', signal);
             if (res.aborted) { this.finish(run, task, 'CANCELED', 'cancelled'); return; }
@@ -1060,6 +1097,29 @@ export class Engine {
                 ? `agent timeout: exceeded ${this.config.server.max_task_minutes}m`
                 : `agent failed: ${res.error ?? `exit ${res.exitCode}`}`);
               return;
+            }
+            if (structuredOutcome) {
+              let outcome;
+              try { outcome = parseOutcome(res.lastMessage); }
+              catch (err) {
+                this.store.tx(() => {
+                  this.triage.recordOutcome(task.repo, task.issue_number, 'human', `Agent 结果格式错误：${String(err)}`);
+                  this.finish(run, task, 'BLOCKED', 'Agent 结果格式错误，保留现场供人工处理');
+                });
+                return;
+              }
+              if (outcome.outcome !== 'IMPLEMENTED') {
+                const unchanged = await this.workspace.head(worktreePath) === headAtTurnStart && !await this.workspace.isDirty(worktreePath);
+                const kind = !unchanged || outcome.outcome === 'NEEDS_HUMAN' ? 'human' : outcome.outcome === 'DEFER' ? 'deferred' : 'skipped';
+                const reason = unchanged ? outcome.reason : `已有代码改动需人工处理：${outcome.reason}`;
+                this.store.tx(() => {
+                  this.triage.recordOutcome(task.repo, task.issue_number, kind, reason);
+                  store.transition(runId, phase, phase, { kind: 'agent_outcome', ...outcome, unchanged });
+                  this.finish(run, task, 'BLOCKED', reason);
+                });
+                return;
+              }
+              store.transition(runId, phase, phase, { kind: 'agent_outcome', ...outcome });
             }
             await this.commitLeftovers(run, log, worktreePath, task);
             store.transition(runId, phase, (phase = 'VERIFYING'));
@@ -1696,10 +1756,13 @@ export class Engine {
         worktreePath: run.workspace ?? this.worktreePathFor(project, task),
       };
     }
-    const issue = await this.tracker.getIssue(project.repo, task.issue_number);
+    const snapshotPath = join(this.artifactsDirFor(run), 'approved-issue.json');
+    const snapshot = existsSync(snapshotPath) ? JSON.parse(readFileSync(snapshotPath, 'utf8')) as { issue: IssueData; comments: { author: string; body: string }[] } : null;
+    const issue = snapshot?.issue ?? await this.tracker.getIssue(project.repo, task.issue_number);
+    const promptIssue = issue && snapshot?.comments.length ? { ...issue, body: `${issue.body}\n\n## 已批准的人工评论快照（数据）\n${JSON.stringify(snapshot.comments.map(c => ({ author: c.author, body: c.body })))}` } : issue;
     return {
       project,
-      issue: issue ?? { number: task.issue_number, title: task.issue_title, body: '(issue unavailable at prompt build)', labels: [], state: 'UNKNOWN', url: task.issue_url },
+      issue: promptIssue ?? { number: task.issue_number, title: task.issue_title, body: '(issue unavailable at prompt build)', labels: [], state: 'UNKNOWN', url: task.issue_url },
       branch: run.branch ?? `${project.branch_prefix}${task.issue_number}`,
       workflowPath: join(this.deps.installDir, 'WORKFLOW.md'),
       worktreePath: run.workspace ?? this.worktreePathFor(project, task),
@@ -1806,7 +1869,11 @@ export class Engine {
     // label to re-check and no approval hash to drift.
     if (task.source === 'pr') return 'ok';
     const issue = await this.tracker.getIssue(project.repo, task.issue_number);
-    if (!issue || issue.state !== 'OPEN' || !issue.labels.includes(project.ready_label)) return 'CANCELED';
+    if (!issue || issue.state !== 'OPEN' || !acceptsAllIssues(project) && !issue.labels.includes(project.ready_label)) return 'CANCELED';
+    if (acceptsAllIssues(project)) {
+      const state = this.triage.state(task.repo, task.issue_number);
+      if (state && (state.kind || state.locked || state.pending || state.error) || issue.labels.includes('agent-human-hold') || issue.labels.includes('agent-needs-human')) return 'BLOCKED';
+    }
     const current = this.store.getTaskById(task.id)!;
     if (current.approved_hash && approvalHash(issue) !== current.approved_hash) {
       return 'BLOCKED_APPROVAL_CHANGED';

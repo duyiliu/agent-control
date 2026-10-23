@@ -19,7 +19,14 @@ export type Phase =
 
 export type TaskSource = 'issue' | 'pr';
 
+export interface IntakeState {
+  external_hold?: boolean; external_needs?: boolean;
+  kind: 'human' | 'deferred' | 'skipped' | null; reason: string; locked: boolean; defer_until: string | null;
+  version: number; updated_at: string; pending: { remove: string[]; retry: boolean } | null; error: string | null; imported: boolean;
+}
+
 export interface TaskSummary {
+  intake?: IntakeState | null;
   id: number;
   repo: string;
   issue_number: number;
@@ -73,6 +80,8 @@ export interface TaskDetail {
 }
 
 export interface ProjectInfo {
+  issue_intake: 'all' | 'labeled';
+  issue_triage: { enabled: boolean; timeout_seconds: number };
   repo: string;
   local_repo: string;
   base_branch: string;
@@ -91,6 +100,8 @@ export interface ProjectsPayload {
 }
 
 export interface NewProjectInput {
+  issue_intake?: 'all' | 'labeled';
+  issue_triage?: { enabled: boolean; timeout_seconds?: number };
   repo: string;
   local_repo: string;
   base_branch?: string;
@@ -136,6 +147,25 @@ async function get<T>(url: string): Promise<T> {
 export const fetchTasks = () => get<{ tasks: TaskSummary[] }>('/api/tasks');
 export const fetchTask = (id: number) => get<TaskDetail>(`/api/tasks/${id}`);
 export const fetchHealth = () => get<HealthInfo>('/api/health');
+export interface TriageHistory {
+  generation: number; decision: string; reason_code: string; at: string;
+}
+export interface TriageItem {
+  repo: string;
+  issue: { number: number; title: string; body: string; url: string; labels: string[]; createdAt?: string; updatedAt?: string };
+  status: 'pending' | 'evaluating' | 'human' | 'deferred' | 'skipped' | 'routed';
+  locked: boolean; error: string | null; claim_id: string | null; comment_id: number | null; observed_at: string;
+  state: { decision: string | null; reason_code: string; at: string; base_sha: string | null; defer_until: string | null; history: TriageHistory[] } | null;
+}
+export interface TriagePayload { issues: TriageItem[]; projects: { repo: string; enabled: boolean }[] }
+export type TriageAction = 'sync' | 'approve' | 'defer' | 'reevaluate' | 'lock' | 'unlock' | 'recover' | 'reset' | 'release-claim';
+export const fetchTriage = () => get<TriagePayload>('/api/triage');
+export async function actOnTriage(repo: string, number: number, action: TriageAction, params: Record<string, unknown> = {}): Promise<{ message: string; state: IntakeState }> {
+  const r = await fetch('/api/triage/actions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ repo, number, action, ...params }) });
+  const d = await r.json() as { error?: string; message?: string; state: IntakeState };
+  if (!r.ok) throw Object.assign(new Error(d.error ?? `HTTP ${r.status}`), { state: d.state });
+  return { message: d.message ?? '已保存', state: d.state };
+}
 export const fetchProjects = () => get<ProjectsPayload>('/api/projects');
 
 export async function addProject(input: NewProjectInput): Promise<{ message: string; warnings: string[] }> {

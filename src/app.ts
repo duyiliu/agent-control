@@ -1,3 +1,4 @@
+import { acceptsAllIssues } from './triage/intake.js';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -5,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { Store } from './store/sqlite.js';
 import { Engine } from './scheduler/engine.js';
 import { reconcile } from './scheduler/recovery.js';
-import { GitHubTracker, SYSTEM_LABELS } from './tracker/github.js';
+import { GitHubTracker, requiredLabelsForProject } from './tracker/github.js';
 import { GitWorkspace } from './workspace/git.js';
 import { AppLog } from './telemetry/logging.js';
 import { pidAlive, processStartedAt, runProc, which } from './proc.js';
@@ -137,9 +138,10 @@ export async function startService(app: App): Promise<void> {
         deps: {
           store, config, tracker, activeCount: () => engine.activeCount(),
           configPath: app.configPath,
+          triage: engine.triage,
           checkRepoExists: (repo) => tracker.checkRepoExists(repo),
           resolveRepo: (repo) => tracker.resolveRepo(repo),
-          provisionRepo: (repo, readyLabel) => provisionLabels(tracker, repo, readyLabel),
+          provisionRepo: (repo, readyLabel, triageEnabled) => provisionLabels(tracker, repo, readyLabel, triageEnabled),
         },
         host: config.server.ui.host,
         port: config.server.ui.port,
@@ -210,9 +212,9 @@ export async function startService(app: App): Promise<void> {
 }
 
 /** Best-effort label provisioning for a UI-added project; returns warnings. */
-async function provisionLabels(tracker: GitHubTracker, repo: string, readyLabel: string): Promise<string[]> {
+async function provisionLabels(tracker: GitHubTracker, repo: string, readyLabel: string, triageEnabled: boolean): Promise<string[]> {
   const warnings: string[] = [];
-  const wanted = [...new Set([readyLabel, ...SYSTEM_LABELS])];
+  const wanted = requiredLabelsForProject(readyLabel, triageEnabled);
   let missing: string[];
   try {
     missing = (await tracker.ensureLabels(repo, wanted)).missing;
@@ -288,7 +290,7 @@ export async function runDoctor(config: AppConfig | null, configError?: string):
       ? { name: `project:${p.repo}`, status: 'PASS', detail: `local repo ${p.local_repo}` }
       : { name: `project:${p.repo}`, status: 'FAIL', detail: `${p.local_repo} is not a git repo` });
     try {
-      const labels = await tracker.ensureLabels(p.repo, ['agent-ready', 'agent-running', 'agent-blocked', 'agent-pr', 'agent-reviewing', 'agent-high-risk', 'agent-merge']);
+      const labels = await tracker.ensureLabels(p.repo, requiredLabelsForProject(p.ready_label, acceptsAllIssues(p)));
       items.push(labels.ok
         ? { name: `labels:${p.repo}`, status: 'PASS', detail: 'required labels exist' }
         : { name: `labels:${p.repo}`, status: 'UNVERIFIED', detail: `missing: ${labels.missing.join(', ')}` });

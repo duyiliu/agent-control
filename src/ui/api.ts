@@ -1,3 +1,4 @@
+import { acceptsAllIssues, type IntakeState } from '../triage/intake.js';
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import type { Store } from '../store/sqlite.js';
@@ -5,9 +6,11 @@ import type { AppConfig, CheckResultRow, Phase, ProjectConfig, RunRow, TaskRow, 
 import type { OpsTracker } from '../ops.js';
 import { appendProjectToConfigFile, ConfigError } from '../config.js';
 import { runProc } from '../proc.js';
-import { SYSTEM_LABELS } from '../tracker/github.js';
+import { requiredLabelsForProject } from '../tracker/github.js';
+import type { IssueTriage } from '../triage/service.js';
 
 export interface TaskSummary {
+  intake?: IntakeState | null;
   id: number;
   repo: string;
   issue_number: number;
@@ -30,7 +33,7 @@ export interface RunDetail extends RunRow {
 }
 
 export interface TaskDetail {
-  task: TaskRow;
+  task: TaskRow & { intake?: IntakeState | null };
   runs: RunDetail[];
   has_active_run: boolean;
   retryable: boolean;
@@ -46,6 +49,7 @@ export interface HealthInfo {
 }
 
 export interface UiDeps {
+  triage?: IssueTriage;
   store: Store;
   config: AppConfig;
   activeCount(): number;
@@ -58,10 +62,12 @@ export interface UiDeps {
   /** Optional canonical-name resolution (follows rename redirects). */
   resolveRepo?: (repo: string) => Promise<string>;
   /** Optional label provisioning; returns warnings. */
-  provisionRepo?: (repo: string, readyLabel: string) => Promise<string[]>;
+  provisionRepo?: (repo: string, readyLabel: string, triageEnabled: boolean) => Promise<string[]>;
 }
 
 export interface ProjectInfo {
+  issue_intake: 'all' | 'labeled';
+  issue_triage: { enabled: boolean; timeout_seconds: number };
   repo: string;
   local_repo: string;
   base_branch: string;
@@ -78,6 +84,7 @@ export function projectsPayload(deps: UiDeps): { projects: ProjectInfo[]; config
     config_path: deps.configPath ?? null,
     editable: deps.configPath !== undefined,
     projects: deps.config.projects.map((p) => ({
+      issue_intake: acceptsAllIssues(p) ? 'all' : 'labeled',
       repo: p.repo,
       local_repo: p.local_repo,
       base_branch: p.base_branch,
@@ -86,6 +93,7 @@ export function projectsPayload(deps: UiDeps): { projects: ProjectInfo[]; config
       branch_prefix: p.branch_prefix,
       review_mode: p.review_mode,
       pr_review: p.pr_review,
+      issue_triage: p.issue_triage ?? { enabled: false, timeout_seconds: 180 },
       checks: p.checks.map((c) => ({ argv: c.argv, timeout_seconds: c.timeout_seconds, platforms: c.platforms })),
     })),
   };
@@ -210,6 +218,8 @@ export async function addProjectPayload(
     pr_review: optStr(o, 'pr_review') ?? 'auto',
   };
   if (Array.isArray(o['checks']) && o['checks'].length > 0) raw['checks'] = o['checks'];
+  if (o['issue_intake'] !== undefined) raw['issue_intake'] = o['issue_intake'];
+  if (o['issue_triage'] !== undefined) raw['issue_triage'] = o['issue_triage'];
 
   let fresh: AppConfig;
   try {
@@ -224,12 +234,12 @@ export async function addProjectPayload(
 
   if (deps.provisionRepo) {
     try {
-      warnings.push(...await deps.provisionRepo(repo, project?.ready_label ?? 'agent-ready'));
+      warnings.push(...await deps.provisionRepo(repo, project?.ready_label ?? 'agent-ready', project ? acceptsAllIssues(project) : false));
     } catch (e) {
       warnings.push(`标签准备失败：${String(e).slice(0, 160)}`);
     }
   } else {
-    warnings.push(`请确认 ${repo} 存在标签：${SYSTEM_LABELS.join(', ')}（ac doctor 可检查）`);
+    warnings.push(`请确认 ${repo} 存在标签：${requiredLabelsForProject(project?.ready_label ?? 'agent-ready', project ? acceptsAllIssues(project) : false).join(', ')}（ac doctor 可检查）`);
   }
 
   return {
@@ -251,6 +261,7 @@ export function tasksPayload(store: Store): { tasks: TaskSummary[] } {
       const active = store.activeRunForTask(t.id);
       const last = runs[runs.length - 1];
       return {
+        intake: store.getIntake<IntakeState>(t.repo, t.issue_number),
         id: t.id,
         repo: t.repo,
         issue_number: t.issue_number,
@@ -280,7 +291,7 @@ export function taskPayload(store: Store, id: number): TaskDetail | null {
     checks: store.checksForRun(r.run_id),
   }));
   return {
-    task,
+    task: { ...task, intake: store.getIntake<IntakeState>(task.repo, task.issue_number) },
     runs,
     has_active_run: store.activeRunForTask(id) !== null,
     retryable: [...RED_PHASES, 'CANCELED'].includes(task.status),

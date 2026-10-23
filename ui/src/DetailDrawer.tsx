@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, ChevronLeft, ExternalLink, FileText, RotateCw, Square } from 'lucide-react';
 import {
   fetchArtifact,
@@ -11,6 +11,7 @@ import {
 import { fmtDur, fmtTime, isActivePhase, phaseLabel, phaseTextClass } from './groups';
 import StatusIcon from './StatusIcon';
 import LiveLog from './LiveLog';
+import IntakeActions from './IntakeActions';
 import type { Toast } from './App';
 
 export default function DetailDrawer(props: {
@@ -24,9 +25,13 @@ export default function DetailDrawer(props: {
   const [error, setError] = useState<string | null>(null);
   const [artifact, setArtifact] = useState<{ path: string; data: Artifact | null; error: string | null } | null>(null);
 
+  const refreshSequence = useRef(0);
   const refresh = useCallback(async () => {
+    const sequence = ++refreshSequence.current;
     try {
-      setDetail(await fetchTask(taskId));
+      const next = await fetchTask(taskId);
+      if (sequence !== refreshSequence.current) return;
+      setDetail(current => current?.task.id === next.task.id && (current.task.intake?.version ?? 0) > (next.task.intake?.version ?? 0) ? { ...next, task: { ...next.task, intake: current.task.intake } } : next);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -142,7 +147,7 @@ export default function DetailDrawer(props: {
                   停止
                 </button>
               )}
-              {detail!.retryable && (
+              {detail!.retryable && !t.intake && (
                 <button
                   onClick={() => act('retry')}
                   className="flex items-center gap-1.5 rounded-md border border-info/30 px-2.5 py-1.5 text-[11px] font-medium text-info hover:bg-info/10"
@@ -170,7 +175,7 @@ export default function DetailDrawer(props: {
               {error}
             </div>
           )}
-          {t && <MetaGrid detail={detail!} />}
+          {t && <><MetaGrid detail={detail!} /><IntakeActions task={t} active={detail!.has_active_run} onState={state => { ++refreshSequence.current; setDetail(current => current && state.version >= (current.task.intake?.version ?? 0) ? { ...current, task: { ...current.task, intake: state } } : current); }} onChanged={() => { refresh(); onChanged(); }} onToast={onToast} /></>}
           {detail && (
             <div className="mt-4 space-y-3">
               {detail.runs.length === 0 && (

@@ -1,6 +1,6 @@
 # agent-control
 
-个人 AI 研发调度中心：在 GitHub Issue 上打 `agent-ready`，常驻调度器自动完成
+个人 AI 研发调度中心：配置项目自动接手 GitHub Issue，常驻调度器自动完成
 
 ```
 领取 → git worktree 隔离 → Pi agent 实现 → 受信 checks → push + Draft PR
@@ -16,14 +16,14 @@
 | Node ≥ 22.13 | 使用内置 `node:sqlite`，低于此版本起不来 |
 | git + GitHub CLI | `gh auth login` 完成认证；发布 PR、探测合并状态、读写标签都在宿主侧执行 |
 | Pi | `npm i -g @earendil-works/pi-coding-agent`，并确认 `pi --version` 在 PATH 上；模型配置在 `~/.pi/agent/models.json` |
-| 仓库标签 | 七个标签需预先存在：`agent-ready`、`agent-running`、`agent-blocked`、`agent-pr`、`agent-reviewing`、`agent-high-risk`、`agent-merge`。doctor **只验不建**，缺失时显示 `UNVERIFIED` |
+| 仓库标签 | `labeled` 模式需 `agent-ready`；`all` 不要求 ready；系统标签由 doctor 检查。doctor **只验不建**，缺失时显示 `UNVERIFIED`。从 UI 添加项目时会尝试创建缺失标签 |
 
 ```powershell
-'agent-ready','agent-running','agent-blocked','agent-pr','agent-reviewing','agent-high-risk','agent-merge' |
+'agent-ready','agent-running','agent-blocked','agent-pr','agent-reviewing','agent-high-risk','agent-merge','agent-review','agent-needs-human','agent-human-hold' |
   ForEach-Object { gh label create $_ -R owner/repo --force }
 ```
 
-`agent-ready`、`agent-running`、`agent-blocked`、`agent-pr`、`agent-high-risk` 打在 Issue 上；`agent-reviewing`、`agent-merge` 打在 PR 上。
+`agent-ready`、`agent-running`、`agent-blocked`、`agent-pr`、`agent-high-risk`、`agent-needs-human`、`agent-human-hold` 打在 Issue 上；`agent-reviewing`、`agent-merge`、`agent-review` 打在 PR 上。
 
 `~/.pi/agent/models.json` 最小形态（OpenAI 兼容网关示例）：
 
@@ -95,6 +95,8 @@ npm run ac -- undrain         # 恢复派单
 | `server.ui.port` | `8787` | 内嵌 Web 面板端口 |
 | `server.ui.token` | 未设置 | 配置后所有路由（含静态资源）要求鉴权；暴露到非 loopback 前必须设置 |
 | `projects[].review_mode` | `auto` | `auto`：每个 PR head 自动派独立评审 run；`manual`：不派评审 |
+| `projects[].issue_intake` | `labeled` | `all` 自动接手全部开放 Issue，无需 ready；`labeled` 保留标签入口 |
+| `projects[].issue_triage.enabled` | `false` | 旧配置兼容：true 映射到 all；显式 issue_intake 优先，timeout_seconds 已弃用 |
 | `projects[].checks[].argv` | — | 无 shell 执行；`timeout_seconds` 默认 `600` |
 | `agent.model` | 必填 | `<provider>/<model id>`，来自 `~/.pi/agent/models.json` |
 | `agent.review_model` | 同 `agent.model` | 评审模型，可用来做异构评审 |
@@ -112,15 +114,25 @@ npm run ac -- undrain         # 恢复派单
 
 ## 使用流程
 
-一条主线：**提 Issue → 打 `agent-ready` → 等 Draft PR → 评审 → 合并（自动或人工）**。
+一条主线：**提 Issue → 排队 → 同一个 Agent 判断并实现 → Draft PR → 评审 → 合并（自动或人工）**。
 
 ### 1. 下任务
 
-在托管仓提 Issue，正文写清背景、范围、验收标准、测试命令和依赖，打 `agent-ready` 标签。无标签的 Issue 永远不会被执行。
+在托管仓提 Issue，正文写清背景、范围、验收标准、测试命令和依赖。
 
-- **依赖**：正文里写 `Depends-On: #12` 或 `依赖: #12`，依赖未完成（任务未 `COMPLETED` 且 Issue 未关闭）时不会领取。
-- **批准快照**：首次领取时对 Issue 标题 + 规范化正文做 SHA-256 快照。之后在 `DISCOVERED` 对账以及每个 code/review run 的 phase gate 中发现内容变化 → `BLOCKED_APPROVAL_CHANGED`，需 `retry` 重新批准。
-- **多实例**：`agent-running` 标签是跨实例的领取标记。领取后调度器会发一条 `已领取` 评论，等待约 4 秒重读评论，最早的领取者胜出；竞争失败方在启动前自行退出。
+### Issue 自动接手
+
+项目配置 `issue_intake: all` 后，程序分页发现所有开放 Issue 并创建唯一任务卡，无需 `agent-ready`；扫描不调用 AI。同一个编码 Agent 读取需求和必要代码，能实现则继续，缺信息则转人工，等待条件则暂缓，无需处理则进入历史。
+
+只保留执行看板。卡片显示原因、人工锁定和同步状态，提供“继续处理、暂缓、人工锁定”。暂缓及无需处理通过同一看板的筛选查看。修改 Issue 不会自动解除人工处置，需显式继续。
+
+处置保存在本机 SQLite，每个仓库由一个实例管理自动入口。GitHub 的 `agent-human-hold`、`agent-needs-human` 仍会阻止启动。人工操作先保存，需移除远端门禁时后台同步，成功前不会派发；重复解锁不会重新加锁。
+
+`issue_intake: labeled`（默认）保留原来的 ready 标签入口。旧 `issue_triage.enabled: true` 兼容为 all，不再运行独立 AI 评估，旧 timeout_seconds 不再使用。首次切换保留旧 HUMAN/DEFER/SKIP 和任务历史；损坏或未结束的旧认领显示为阻塞卡，核验后恢复。
+
+自动接手新 run 的最终消息使用 JSON `{"outcome":"IMPLEMENTED|NEEDS_HUMAN|DEFER|NO_ACTION","reason":"具体原因"}`。非实现结果必须没有代码修改或提交；否则保留现场交人工，绝不直接发布。旧 run 与 labeled 模式保持旧输出协议。
+
+若 UI 绑定非 loopback，自动接手必须配置 `server.ui.token`。
 
 ### 2. 自动执行
 

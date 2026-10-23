@@ -53,6 +53,8 @@ export interface CheckSpec {
 }
 
 export interface ProjectConfig {
+  issue_intake?: 'all' | 'labeled';
+  issue_triage?: { enabled: boolean; timeout_seconds: number };
   repo: string;
   local_repo: string;
   base_branch: string;
@@ -160,6 +162,7 @@ export interface IssueData {
   state: string;
   url: string;
   updatedAt?: string;
+  createdAt?: string;
 }
 
 export interface PrInfo {
@@ -213,6 +216,7 @@ export interface TaskRow {
 }
 
 export interface RunRow {
+  outcome_protocol: number;
   id: number;
   run_id: string;
   task_id: number;

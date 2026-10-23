@@ -10,7 +10,7 @@ import type {
 } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 11;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -221,6 +221,68 @@ export class Store {
           .run(9, now());
       });
     }
+    if (current < 10) {
+      this.tx(() => {
+        this.db.exec(`
+          CREATE TABLE triage_cache (repo TEXT NOT NULL, issue_number INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(repo, issue_number));
+          CREATE TABLE triage_jobs (job_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+        `);
+        this.db.prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)').run(10, now());
+      });
+    }
+    if (current < 11) {
+      this.tx(() => {
+        this.db.exec(`CREATE TABLE issue_intake (repo TEXT NOT NULL, issue_number INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(repo, issue_number));
+          ALTER TABLE runs ADD COLUMN outcome_protocol INTEGER NOT NULL DEFAULT 0;`);
+        this.db.prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)').run(11, now());
+      });
+    }
+
+  }
+
+  getIntake<T>(repo: string, number: number): T | null {
+    const row = this.db.prepare('SELECT data FROM issue_intake WHERE repo=? AND issue_number=?').get(repo, number) as { data: string } | undefined;
+    return row ? JSON.parse(row.data) as T : null;
+  }
+
+  saveIntake(repo: string, number: number, value: unknown) {
+    this.db.prepare('INSERT INTO issue_intake VALUES (?, ?, ?) ON CONFLICT(repo, issue_number) DO UPDATE SET data=excluded.data').run(repo, number, JSON.stringify(value));
+  }
+
+  setOutcomeProtocol(runId: string, version: number) {
+    this.db.prepare('UPDATE runs SET outcome_protocol=? WHERE run_id=?').run(version, runId);
+  }
+
+  cacheTriage(repo: string, issue: number, value: unknown) {
+    this.db.prepare('INSERT INTO triage_cache VALUES (?, ?, ?) ON CONFLICT(repo, issue_number) DO UPDATE SET data=excluded.data')
+      .run(repo, issue, JSON.stringify(value));
+  }
+
+  listTriage<T>(): T[] {
+    return (this.db.prepare('SELECT data FROM triage_cache').all() as { data: string }[]).map(r => JSON.parse(r.data) as T);
+  }
+
+  forgetTriage(repo: string, issue: number) {
+    this.db.prepare('DELETE FROM triage_cache WHERE repo=? AND issue_number=?').run(repo, issue);
+  }
+
+  saveTriageJob(id: string, value: unknown) {
+    this.db.prepare('INSERT INTO triage_jobs VALUES (?, ?) ON CONFLICT(job_id) DO UPDATE SET data=excluded.data').run(id, JSON.stringify(value));
+  }
+
+  triageJobs<T>(): T[] {
+    return (this.db.prepare('SELECT data FROM triage_jobs').all() as { data: string }[]).map(r => JSON.parse(r.data) as T);
+  }
+
+  dropTriageJob(id: string) { this.db.prepare('DELETE FROM triage_jobs WHERE job_id=?').run(id); }
+
+  deleteUnstartedTriageTask(repo: string, issue: number): boolean {
+    return this.tx(() => {
+      const task = this.getTask(repo, issue);
+      if (!task || task.source !== 'issue' || task.status !== 'DISCOVERED' || this.runsForTask(task.id).length) return false;
+      this.db.prepare('DELETE FROM tasks WHERE id=?').run(task.id);
+      return true;
+    });
   }
 
   private txDepth = 0;
@@ -378,7 +440,7 @@ export class Store {
   // ---------- runs ----------
 
   /** Atomically verify no active run exists and create a new attempt. */
-  claimRun(taskId: number, opts?: { kind?: 'code' | 'review'; headSha?: string }): RunRow {
+  claimRun(taskId: number, opts?: { kind?: 'code' | 'review'; headSha?: string; outcomeProtocol?: number }): RunRow {
     return this.tx(() => {
       const active = this.activeRunForTask(taskId);
       if (active) throw new Error(`task ${taskId} already has active run ${active.run_id}`);
@@ -394,6 +456,7 @@ export class Store {
            VALUES (?, ?, ?, ?, 'CLAIMED', ?, ?, ?)`,
         )
         .run(runId, taskId, opts?.kind ?? 'code', attempt, opts?.headSha ?? null, t, t);
+      if (opts?.outcomeProtocol) this.setOutcomeProtocol(runId, opts.outcomeProtocol);
       this.insertEvent(runId, null, 'CLAIMED', { attempt, kind: opts?.kind ?? 'code', head_sha: opts?.headSha ?? null });
       return this.getRun(runId)!;
     });

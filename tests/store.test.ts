@@ -9,7 +9,7 @@ test('migrations are idempotent and schema_version recorded', () => {
     s1.close();
     const s2 = makeStore(dir); // reopen same db
     const v = s2.db.prepare('SELECT MAX(version) v FROM schema_version').get() as { v: number };
-    assert.equal(v.v, 9);
+    assert.equal(v.v, 11);
     // v4 columns exist with sane defaults
     const runCols = s2.db.prepare("PRAGMA table_info(runs)").all() as { name: string }[];
     assert.ok(runCols.some((c) => c.name === 'kind') && runCols.some((c) => c.name === 'head_sha'));
@@ -21,6 +21,44 @@ test('migrations are idempotent and schema_version recorded', () => {
     assert.ok(taskCols.some((c) => c.name === 'pending_fix') && taskCols.some((c) => c.name === 'merge_attempts') && taskCols.some((c) => c.name === 'approved_sha'));
     assert.ok(taskCols.some((c) => c.name === 'source'));
     s2.close();
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('triage snapshots and process jobs survive store reopen', () => {
+  const dir = tmpDir();
+  try {
+    const s = makeStore(dir);
+    s.cacheTriage('owner/repo', 9, { status: 'human', issue: { number: 9 } });
+    s.saveTriageJob('claim-9', { id: 'claim-9', repo: 'owner/repo', number: 9, pid: null });
+    assert.deepEqual(s.listTriage(), [{ status: 'human', issue: { number: 9 } }]);
+    assert.deepEqual(s.triageJobs(), [{ id: 'claim-9', repo: 'owner/repo', number: 9, pid: null }]);
+    s.close();
+    const reopened = makeStore(dir);
+    assert.equal(reopened.triageJobs().length, 1);
+    reopened.dropTriageJob('claim-9');
+    reopened.close();
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('triage can remove only an unstarted DISCOVERED task with no run', () => {
+  const dir = tmpDir();
+  try {
+    const s = makeStore(dir);
+    const { task: first } = s.upsertDiscovered({ repo: 'a/b', issue_number: 9, issue_title: 't', issue_url: 'u' });
+    assert.equal(s.deleteUnstartedTriageTask('a/b', 9), true);
+    assert.equal(s.getTaskById(first.id), null);
+
+    const { task: second } = s.upsertDiscovered({ repo: 'a/b', issue_number: 10, issue_title: 't', issue_url: 'u' });
+    const run = s.claimRun(second.id);
+    assert.equal(s.deleteUnstartedTriageTask('a/b', 10), false);
+    assert.equal(s.getTaskById(second.id)?.status, 'DISCOVERED');
+    assert.equal(s.runsForTask(second.id).length, 1);
+    assert.ok(s.getRun(run.run_id));
+    s.close();
   } finally {
     cleanup(dir);
   }
@@ -140,4 +178,19 @@ test('resumeRun refuses a terminal run or a non-active target without touching t
   } finally {
     cleanup(dir);
   }
+});
+
+test('intake decisions and protocol version survive reopen while old runs remain protocol zero', () => {
+  const dir = tmpDir();
+  try {
+    const store = makeStore(dir);
+    const { task } = store.upsertDiscovered({ repo: 'o/r', issue_number: 1, issue_title: 't', issue_url: 'u' });
+    const old = store.claimRun(task.id); assert.equal(old.outcome_protocol, 0); store.endRun(old.run_id, 'BLOCKED');
+    const next = store.claimRun(task.id, { outcomeProtocol: 1 }); assert.equal(next.outcome_protocol, 1);
+    store.saveIntake('o/r', 1, { kind: 'deferred', version: 3 }); store.close();
+    const reopened = makeStore(dir);
+    assert.deepEqual(reopened.getIntake('o/r', 1), { kind: 'deferred', version: 3 });
+    assert.equal(reopened.getRun(old.run_id)!.outcome_protocol, 0); assert.equal(reopened.getRun(next.run_id)!.outcome_protocol, 1);
+    reopened.close();
+  } finally { cleanup(dir); }
 });
