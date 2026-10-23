@@ -336,6 +336,7 @@ npm run build         # → dist/ + ui/dist（ui/dist 不入库，发版必须�
 
 ## 相关文档
 
+- [`ROADMAP.md`](ROADMAP.md) — 当前单机优先级与未来 Controller / Worker 分布式演进规划（未排期）。
 - `WORKFLOW.md` — 注入到每次编码 prompt 的可信执行契约。
 - `config.example.yaml` — 带注释的配置示例。
 - `docs/design-workflow.md` — 设计与执行分离的流程约定（合并语义以本 README 为准）。
