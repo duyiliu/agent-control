@@ -84,6 +84,10 @@ export async function runReview(
         // On a protocol break the narration itself is the evidence a human
         // needs, so point the artifact at it instead of the agent jsonl.
         const parsed = parseReviewResult(readFileSync(lastMessagePath, 'utf8'));
+        if (parsed.protocolBroken && attempt === 0) {
+          strictReminder = true;
+          continue;
+        }
         return { result: parsed.result, logPath: parsed.protocolBroken ? lastMessagePath : logPath };
       } catch (err) {
         failure = `invalid review output: ${String(err)}`;
@@ -115,9 +119,8 @@ function parseReviewResult(text: string): { result: ReviewResult; protocolBroken
     try {
       const checked = checkReviewShape(JSON.parse(objects[0]!));
       if (checked) {
-        // A protocol-breaking model does not get auto-merge rights: force
-        // risk=high so a recovered PASS still lands on the human path, while
-        // recovered BLOCK findings keep feeding the fix loop.
+        // If the strict retry still breaks the protocol, a recovered PASS
+        // cannot authorize auto-merge; BLOCK findings can still feed fixes.
         checked.risk = 'high';
         checked.summary = `[protocol-recovered] ${checked.summary}`;
         return { result: checked, protocolBroken: true };

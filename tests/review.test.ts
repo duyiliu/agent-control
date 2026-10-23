@@ -53,7 +53,48 @@ test('review: malformed output retries reviewer once, then accepts valid output'
   } finally { cleanup(env.dir); }
 });
 
-test('review: narration around one valid verdict is recovered but forced high-risk', async () => {
+test('review: narrated verdict retries as strict JSON before allowing a low-risk PASS', async () => {
+  const env = setup();
+  try {
+    const prompts: string[] = [];
+    const artifacts: string[] = [];
+    const out = await runReview(env.ctx, '(no checks recorded)', 'diff', { ...env.deps, headSha: 'reviewed-sha' }, async (opts) => {
+      prompts.push(opts.prompt);
+      artifacts.push(opts.lastMessagePath);
+      writeFileSync(opts.lastMessagePath, prompts.length === 1
+        ? `已核实源码，结论如下：\n${JSON.stringify(passed)}`
+        : JSON.stringify(passed));
+      return ok();
+    });
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[1]!, /上次输出违反了 JSON-only 协议/);
+    assert.match(prompts[1]!, /本轮待审查提交 SHA：reviewed-sha/);
+    assert.notEqual(artifacts[0], artifacts[1]);
+    assert.match(readFileSync(artifacts[0]!, 'utf8'), /已核实源码/);
+    assert.deepEqual(out.result, passed);
+    assert.doesNotMatch(out.result.summary, /protocol-recovered/);
+  } finally { cleanup(env.dir); }
+});
+
+for (const verdict of ['PASS', 'BLOCK', 'HUMAN_REVIEW_REQUIRED']) {
+  test(`review: protocol retry respects the new ${verdict} instead of the recovered PASS`, async () => {
+    const env = setup();
+    try {
+      const final = { verdict, risk: 'high', summary: 'new review identified a risk', findings: ['file.ts:1: confirmed risk'] };
+      let calls = 0;
+      const out = await runReview(env.ctx, 'tests pass', 'diff', env.deps, async (opts) => {
+        writeFileSync(opts.lastMessagePath, ++calls === 1
+          ? `结论如下：${JSON.stringify(passed)}`
+          : JSON.stringify(final));
+        return ok();
+      });
+      assert.equal(calls, 2);
+      assert.deepEqual(out.result, final);
+    } finally { cleanup(env.dir); }
+  });
+}
+
+test('review: repeated narration is recovered but forced high-risk after retry', async () => {
   const env = setup();
   try {
     let calls = 0;
@@ -62,14 +103,14 @@ test('review: narration around one valid verdict is recovered but forced high-ri
       writeFileSync(opts.lastMessagePath, `已根据 worktree 文件核实证据。改动仅 index.html，符合范围。\n\n${JSON.stringify(passed)}`);
       return ok();
     });
-    assert.equal(calls, 1);
+    assert.equal(calls, 2);
     assert.equal(out.result.verdict, 'PASS');
     assert.equal(out.result.risk, 'high'); // protocol break never earns auto-merge
     assert.match(out.result.summary, /^\[protocol-recovered\]/);
   } finally { cleanup(env.dir); }
 });
 
-test('review: two objects in narration stay ambiguous → human review', async () => {
+test('review: two objects in repeated narration stay ambiguous after retry', async () => {
   const env = setup();
   try {
     let calls = 0;
@@ -78,7 +119,7 @@ test('review: two objects in narration stay ambiguous → human review', async (
       writeFileSync(opts.lastMessagePath, `示例格式：{"note":"not a verdict"}\n\n${JSON.stringify(passed)}`);
       return ok();
     });
-    assert.equal(calls, 1);
+    assert.equal(calls, 2);
     assert.equal(out.result.verdict, 'HUMAN_REVIEW_REQUIRED');
   } finally { cleanup(env.dir); }
 });
@@ -164,7 +205,7 @@ test('review: one shape-valid object is recovered even amid example-ish prose (f
       writeFileSync(opts.lastMessagePath, `I could not review. Example only: ${JSON.stringify(passed)}`);
       return ok();
     });
-    assert.equal(calls, 1);
+    assert.equal(calls, 2);
     assert.equal(out.result.verdict, 'PASS');
     // Recovery is deliberately lossy: marker + forced high risk keep it off auto-merge.
     assert.equal(out.result.risk, 'high');
