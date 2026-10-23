@@ -2,6 +2,8 @@ server:
   poll_interval_seconds: 30
   max_concurrent: 1
   retry_limit: 3
+  max_resumes: 2                  # 单个 run 崩溃后允许自动恢复的次数（非负整数）；0 = 不启动恢复执行，
+                                  # 需执行的 run 一律转 RECOVERY_REQUIRED（已有 PR 的发布仍可对账收尾）
   max_task_minutes: 45
   worktree_root: C:/path/to/agent-control-data/worktrees
   database: C:/path/to/agent-control-data/agent-control.db
@@ -47,3 +49,18 @@ agent:
 approvals:
   auto_merge:
     enabled: false                   # 低危 PASS 自动合并（仅 review_mode: auto 的项目）；关闭则一律转人工处理
+    max_files: 10                    # 只统计源码文件：生成物、文档、测试不计入
+    max_lines: 400                   # 只统计源码增删行：生成物、文档、测试不计入
+    # 生成物与文档不参与风险统计，也不进入评审 diff（避免大 diff 直接把评审短路成人工）
+    generated_paths: [dist/**, "**/dist/**", "*.generated.*", "*.min.*", "*.map"]
+    doc_paths: [docs/**, "**/*.md"]
+    # 合并前重建一次并比对：生成物与提交不一致则阻止自动合并（排除生成物评审后的对冲）
+    # 项目级 projects[].verify_build / verify_bootstrap 优先，这里配的是全局兜底
+    # verify_build:
+    #   argv: [npm, run, build]
+    #   timeout_seconds: 600
+    # 无可用编码 worktree 时（existing-PR 任务等），在被批准 SHA 的 detached
+    # 工作树上先跑 bootstrap 装依赖再构建；不配则 detached 构建多半失败转人工
+    # verify_bootstrap:
+    #   argv: [npm, ci]
+    #   timeout_seconds: 600

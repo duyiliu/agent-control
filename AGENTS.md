@@ -37,6 +37,18 @@
   task in `BLOCKED` (retryable) instead of leaving it looking alive.
   A low-risk PASS parks the task in `MERGING` — a host-side sweep
   (`reconcileMergeStates`/`driveMerge`) owns landing, never the review run.
+  "Low-risk" is measured on the source change only: `max_files`/`max_lines`
+  count `code` paths, and generated output (`dist/**`, `*.generated.*`) and
+  docs are excluded from both the risk gate and the reviewer diff (the diff
+  carries an explicit "已省略 N 个生成物文件" header). That exclusion is only
+  safe because `projects[].verify_build` (global fallback
+  `approvals.auto_merge.verify_build`), when configured, rebuilds the approved
+  head before landing and refuses the merge if the generated paths drift from
+  the commit. The rebuild site is the coding worktree when it still sits on
+  the approved sha; otherwise the sha is materialized detached and
+  `verify_bootstrap` (e.g. `npm ci`) installs deps first — every failure mode
+  (no site, build failure, drift) goes to the human path, never merges blind.
+  Reviewer `risk=high` and sensitive paths remain hard human gates.
   The cleared sha is recorded on the task (`approved_sha`, `approved_by`).
   Each tick the sweep re-verifies PR head == `approved_sha` (a moved head
   returns to AWAITING_REVIEW for a fresh review), runs
@@ -44,7 +56,7 @@
   `merge_attempts < 20` before parking on the human path with
   `agent-high-risk`. A `CONFLICTING` mergeable instead spawns a fix run via
   `tasks.pending_fix` (same budget as review-BLOCK fixes): the fix merges
-  `origin/<base_branch>` — the host fetches it because the child's
+  `<git_remote>/<base_branch>` — the host fetches it because the child's
   scrubbed env cannot — resolves conflicts and pushes a new head. The task
   stays in MERGING for the whole repair, and on publish it returns straight
   to MERGING with the new head cleared (`approved_sha`/`approved_by` carried
@@ -61,12 +73,21 @@
 - Only the Pi runner is supported. The coder is one long-lived `pi --mode rpc`
   session per run (`runners/session.ts`): RUNNING and every FIXING turn share the
   same conversation, and that child **is** the run's `pid` — it must be closed in
-  the run's `finally`, never left to the next phase. Review stays a one-shot
-  `pi -p` call (`runners/pi.ts`) with a read-only tool allowlist (no
-  bash/edit/write). `review_model` and `review_reasoning_effort` may select a
-  different Pi model/settings for review. `agent.model` is required — no
-  implicit model default; `reasoning_effort` is optional (unset = runner
-  default). All children get the scrubbed env.
+  the run's `finally`, never left to the next phase. 按 run 持久化：绑定
+  `--session-id <run_id>` 与 `--session-dir <run artifacts>/pi-session`，
+  服务重启后由启动对账重开同一份历史；会话目录只认与该 run id、工作目录
+  匹配的 session 头，外来或歧义文件一律拒绝复用。
+  Review stays a one-shot `pi -p` call (`runners/pi.ts`) with a read-only tool
+  allowlist (no bash/edit/write) and stays ephemeral. `review_model` and
+  `review_reasoning_effort` may select a different Pi model/settings for review.
+  `agent.model` is required — no implicit model default; `reasoning_effort` is
+  optional (unset = runner default). All children get the scrubbed env.
+- 优雅停机挂起而非取消：`Engine.shutdown` 中止在途 run 并有界等待其
+  `finally`/`session.close` 收尾；被切断的编码 run 保持原相位
+  （记 `service_shutdown` 事件、`cancel_requested` 仍为 0、不摘
+  `agent-running`），下次启动对账自动恢复。显式 `stop` 仍然落
+  `CANCELED` 且优先于停机。被停机取消的评审轮次不写 verdict，任务回
+  `AWAITING_REVIEW`。
 - A PR with no issue behind it is still a review input (`pr_review`, default
   `auto`; `manual` reviews only `agent-review`-summoned PRs). Such a task has
   `source='pr'` and lands directly in `AWAITING_REVIEW` — never `DISCOVERED`,
