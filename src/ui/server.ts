@@ -5,7 +5,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppLog } from '../telemetry/logging.js';
-import { approveMergeTask, OpsError, retryTask, stopTask } from '../ops.js';
+import { approveMergeTask, OpsError, rereviewTask, retryTask, stopTask } from '../ops.js';
 import type { TriageAction } from '../triage/service.js';
 import {
   addProjectPayload,
@@ -276,16 +276,23 @@ async function handle(deps: UiDeps, req: IncomingMessage, res: ServerResponse): 
     return;
   }
 
-  const action = /^\/api\/tasks\/(\d+)\/(stop|retry|approve-merge)$/.exec(path);
+  const action = /^\/api\/tasks\/(\d+)\/(stop|retry|rereview|approve-merge)$/.exec(path);
   if (action && method === 'POST') {
     const task = deps.store.getTaskById(Number(action[1]));
     if (!task) { json(res, 404, { error: 'no such task' }); return; }
     try {
+      if (action[2] === 'rereview' || action[2] === 'approve-merge') {
+        const body = await readBody(req) as { expected_updated_at?: unknown } | null;
+        if (!body || typeof body.expected_updated_at !== 'string' || !body.expected_updated_at) throw new OpsError('操作需要当前任务版本，请刷新后重试');
+        const message = action[2] === 'rereview'
+          ? await rereviewTask(deps.store, deps.config, deps.tracker, task, body.expected_updated_at)
+          : await approveMergeTask(deps.store, deps.tracker, task, body.expected_updated_at);
+        json(res, 200, { message });
+        return;
+      }
       const message = action[2] === 'stop'
         ? stopTask(deps.store, task)
-        : action[2] === 'retry'
-          ? await retryTask(deps.store, deps.config, deps.tracker, task)
-          : await approveMergeTask(deps.store, deps.tracker, task);
+        : await retryTask(deps.store, deps.config, deps.tracker, task);
       json(res, 200, { message });
     } catch (err) {
       const status = err instanceof OpsError ? 400 : 500;

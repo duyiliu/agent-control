@@ -20,6 +20,57 @@ const RETRYABLE: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'RECOVERY_REQ
 
 export class OpsError extends Error {}
 
+const taskOperations = new WeakMap<Store, Map<number, Promise<void>>>();
+
+async function withTaskOperation<T>(store: Store, taskId: number, operation: () => Promise<T>): Promise<T> {
+  let tasks = taskOperations.get(store);
+  if (!tasks) { tasks = new Map(); taskOperations.set(store, tasks); }
+  const previous = tasks.get(taskId) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const queued = previous.then(() => gate);
+  tasks.set(taskId, queued);
+  await previous;
+  try { return await operation(); }
+  finally { release(); if (tasks.get(taskId) === queued) tasks.delete(taskId); }
+}
+
+export function rereviewTask(store: Store, config: AppConfig, tracker: OpsTracker, task: TaskRow, expectedUpdatedAt: string): Promise<string> {
+  return withTaskOperation(store, task.id, () => doRereviewTask(store, config, tracker, task, expectedUpdatedAt));
+}
+
+async function doRereviewTask(store: Store, config: AppConfig, tracker: OpsTracker, task: TaskRow, expectedUpdatedAt: string): Promise<string> {
+  const project = config.projects.find(p => p.repo === task.repo);
+  if (!project || task.source === 'issue' && project.review_mode !== 'auto') throw new OpsError('项目使用人工评审，请在 GitHub 处理');
+  const assertCurrent = () => {
+    const current = store.getTaskById(task.id);
+    if (!current || current.status !== 'AWAITING_HUMAN' || current.updated_at !== expectedUpdatedAt || store.activeRunForTask(task.id)) throw new OpsError('任务状态已变化，请刷新后重新评审');
+    const intake = store.getIntake<IntakeState>(task.repo, task.issue_number);
+    if (task.source === 'issue' && intake && (!intake.imported || intake.kind || intake.locked || intake.pending || intake.error || intake.external_hold || intake.external_needs)) throw new OpsError('Issue 仍有人工门禁或同步未完成');
+    return current;
+  };
+  assertCurrent();
+  const prNumber = Number(task.pr_url?.match(/\/pull\/(\d+)/)?.[1]);
+  if (!prNumber || await tracker.getPrState(task.repo, prNumber) !== 'OPEN') throw new OpsError('关联 PR 已关闭、已合并或不存在');
+  if (task.source === 'issue') {
+    const issue = await tracker.getIssue(task.repo, task.issue_number);
+    if (!issue || issue.state !== 'OPEN') throw new OpsError('Issue 已关闭或不存在');
+    if (issue.labels.some(l => ['agent-human-hold', 'agent-needs-human', 'agent-running'].includes(l))) throw new OpsError('Issue 仍被人工锁定或其他运行持有');
+    if (!acceptsAllIssues(project) && !issue.labels.includes(project.ready_label)) throw new OpsError(`Issue 缺少 ${project.ready_label} 标签`);
+    if (task.approved_hash && task.approved_hash !== approvalHash(issue)) throw new OpsError('Issue 内容已变化，请先重新确认需求');
+  }
+  assertCurrent();
+  await tracker.removePrLabel(task.repo, prNumber, 'agent-merge');
+  store.tx(() => {
+    assertCurrent();
+    const last = store.runsForTask(task.id).at(-1);
+    if (last) store.transition(last.run_id, last.phase, last.phase, { kind: 'review_requeued', reason: 'operator_request' });
+    store.deleteReviewVerdicts(task.id);
+    store.setTaskStatus(task.id, 'AWAITING_REVIEW', { pending_fix: null, approved_sha: null, approved_by: null, merge_attempts: 0 });
+  });
+  return `PR #${prNumber} 已重新排队评审，将复核当前提交`;
+}
+
 // ---------------- drain (pause dispatch, wait for in-flight runs) ----------------
 
 /**
@@ -109,12 +160,17 @@ export function stopTask(store: Store, task: TaskRow): string {
  * the `agent-merge` label — the same signal a human would add by hand — so
  * the merge sweep keeps its sha check, one-shot consumption and retry loop.
  */
-export async function approveMergeTask(store: Store, tracker: OpsTracker, task: TaskRow): Promise<string> {
+export function approveMergeTask(store: Store, tracker: OpsTracker, task: TaskRow, expectedUpdatedAt = task.updated_at): Promise<string> {
+  return withTaskOperation(store, task.id, () => doApproveMergeTask(store, tracker, task, expectedUpdatedAt));
+}
+
+async function doApproveMergeTask(store: Store, tracker: OpsTracker, task: TaskRow, expectedUpdatedAt: string): Promise<string> {
   const current = store.getTaskById(task.id);
   if (!current) throw new OpsError('任务不存在');
   if (current.status !== 'AWAITING_HUMAN') {
     throw new OpsError(`只有待人工处理（AWAITING_HUMAN）的任务可以批准合并，当前状态 ${current.status}`);
   }
+  if (current.updated_at !== expectedUpdatedAt) throw new OpsError('任务状态已变化，请刷新后批准合并');
   // A bare PR was never coded by the agent and its review is advisory; the
   // host must not land someone else's branch.
   if (current.source === 'pr') {
@@ -122,7 +178,14 @@ export async function approveMergeTask(store: Store, tracker: OpsTracker, task: 
   }
   const prNum = current.pr_url?.match(/\/pull\/(\d+)/)?.[1];
   if (!prNum) throw new OpsError('任务没有关联 PR，无法批准合并');
+  const reviewRun = store.runsForTask(task.id).at(-1)?.run_id;
   await tracker.addPrLabel(current.repo, Number(prNum), 'agent-merge');
+  const after = store.getTaskById(task.id);
+  const consumed = after && ['MERGING', 'COMPLETED'].includes(after.status) && after.approved_by === 'human' && store.runsForTask(task.id).at(-1)?.run_id === reviewRun;
+  if (!consumed && (!after || after.status !== 'AWAITING_HUMAN' || after.updated_at !== expectedUpdatedAt)) {
+    await tracker.removePrLabel(current.repo, Number(prNum), 'agent-merge');
+    throw new OpsError('批准期间任务状态已变化，已撤销旧批准；请刷新');
+  }
   return `已提交批准：PR #${prNum} 标记为 agent-merge；调度器将在下个 tick 校验被审 sha 后自动合并`;
 }
 
