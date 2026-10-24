@@ -10,7 +10,7 @@ import type { GitHubTracker } from '../src/tracker/github.js';
 import type { AgentCallResult } from '../src/runners/types.js';
 import type { CoderSession, CoderTurn } from '../src/runners/session.js';
 import { runChecks, type ChecksSummary } from '../src/verify/checks.js';
-import { stopTask } from '../src/ops.js';
+import { rereviewTask, stopTask } from '../src/ops.js';
 import type { AppConfig, CheckSpec, ReviewResult } from '../src/types.js';
 import { makeConfig, makeFakeTracker, makeStore, nullLog, teardown } from './helpers.js';
 import type { Store } from '../src/store/sqlite.js';
@@ -129,6 +129,90 @@ async function tickAndDrain(engine: Engine) {
 }
 
 const ISSUE = { title: 'Fix parser', body: 'Fix the parsing bug.\n\nAC: test passes', labels: ['agent-ready'], state: 'OPEN', url: 'https://x/1' };
+
+for (const state of ['pass', 'fail', 'install-error', 'changed-head'] as const) {
+  test(`review fills missing SHA-bound automatic check evidence: ${state}`, async () => {
+    const env = setup();
+    try {
+      env.config.projects[0]!.checks = [];
+      env.tracker.issues.set(90, { ...ISSUE });
+      const site = join(env.dir, 'code-site');
+      mkdirSync(site);
+      writeFileSync(join(site, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }));
+      if (state === 'install-error') writeFileSync(join(site, 'package-lock.json'), '{}');
+      let head = 'head-sha'; let reviews = 0; let checkCalls = 0;
+      const workspace = fakeWorkspace(); workspace.head = async () => head;
+      const { store, engine } = makeEngine(env, {
+        workspace,
+        runChecksFn: async (checks, workdir, logPathFor) => {
+          checkCalls++;
+          assert.equal(workdir, site);
+          const outcomes = checks.map((spec, index) => {
+            const logPath = logPathFor(index);
+            writeFileSync(logPath, state === 'fail' ? 'assertion failed' : 'test suite passed');
+            return { spec, command: spec.argv.join(' '), logPath, exitCode: state === 'fail' || state === 'install-error' ? 1 : 0, timedOut: false, tail: 'check output' };
+          });
+          if (state === 'changed-head' && checkCalls === 1) head = 'unexpected-head';
+          return { ok: state !== 'fail' && state !== 'install-error', outcomes, skipped: [], failureEvidence: 'test assertion failed' };
+        },
+        review: async (_ctx, evidence) => {
+          reviews++;
+          assert.match(evidence, /npm run test/);
+          assert.match(evidence, /test suite passed/);
+          assert.match(evidence, /提交 SHA: head-sha/);
+          return reviewPass(_ctx, evidence, undefined);
+        },
+      });
+      const { task } = store.upsertDiscovered({ repo: 'me/sandbox', issue_number: 90, issue_title: 't', issue_url: 'u' });
+      const code = store.claimRun(task.id);
+      store.updateRunFields(code.run_id, { workspace: site });
+      store.endRun(code.run_id, 'AWAITING_REVIEW');
+      store.setTaskStatus(task.id, 'AWAITING_REVIEW', { pr_url: 'https://x/pull/90', branch: 'agent/issue-90' });
+      await tickAndDrain(engine);
+      const after = store.getTaskById(task.id)!;
+      assert.equal(reviews, state === 'pass' ? 1 : 0);
+      assert.equal(after.status, state === 'fail' ? 'DISCOVERED' : 'AWAITING_HUMAN');
+      assert.equal(!!after.pending_fix, state === 'fail');
+      assert.equal(store.checkEvidenceForSha(task.id, 'head-sha').length > 0, state !== 'changed-head');
+      if (state === 'install-error' || state === 'changed-head') {
+        const review = store.runsForTask(task.id).at(-1)!;
+        assert.ok(store.checksForRun(review.run_id).some(row => row.kind === 'review' && row.verdict === 'ERROR'));
+      }
+      if (state === 'changed-head') {
+        const firstReview = store.runsForTask(task.id).at(-1)!;
+        assert.ok(store.checksForRun(firstReview.run_id).some(row => row.kind === 'check' && row.verdict === 'ERROR' && row.head_sha === null));
+        // Historical releases recorded PASS before the workspace guard.
+        store.addCheck({ run_id: firstReview.run_id, kind: 'check', command: 'npm run test', exit_code: 0, verdict: 'PASS', head_sha: 'head-sha' });
+        head = 'head-sha';
+        await rereviewTask(store, env.config, env.tracker, after, after.updated_at);
+        await tickAndDrain(engine);
+        assert.equal(checkCalls, 2, 'a refused batch must not suppress fresh verification');
+        assert.equal(reviews, 1);
+        assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
+      }
+    } finally { env.done(); }
+  });
+}
+
+test('coding discovers npm verification without configured checks and records its SHA', async () => {
+  const env = setup();
+  try {
+    env.config.projects[0]!.checks = [];
+    env.tracker.issues.set(91, { ...ISSUE });
+    const site = join(env.config.server.worktree_root, 'me_sandbox', 'issue-91');
+    mkdirSync(site, { recursive: true });
+    writeFileSync(join(site, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }));
+    const { store, engine } = makeEngine(env, { runChecksFn: async (checks, workdir, logPathFor) => {
+      assert.equal(workdir, site);
+      assert.deepEqual(checks.map(c => c.argv), [['npm', 'run', 'test']]);
+      return { ...checksOk(), outcomes: [{ ...checksOk().outcomes[0]!, spec: checks[0]!, command: 'npm run test', logPath: logPathFor(0) }] };
+    } });
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 91)!;
+    assert.equal(task.status, 'AWAITING_REVIEW');
+    assert.equal(store.checkEvidenceForSha(task.id, 'head-sha')[0]!.command, 'npm run test');
+  } finally { env.done(); }
+});
 
 test('stranded AWAITING_REVIEW parks for a human instead of showing forever', async () => {
   const env = setup();
@@ -308,7 +392,13 @@ test('AC5: review BLOCK → fix run → re-review → PASS', async () => {
     };
     const ws = fakeWorkspace();
     ws.head = async () => env.tracker.headSha;
-    const { store, engine } = makeEngine(env, { review, checks: async () => { checks++; return checksOk(); }, workspace: ws });
+    const { store, engine } = makeEngine(env, { review, checks: async () => {
+      checks++;
+      const summary = checksOk();
+      const spec = env.config.projects[0]!.checks[0]!;
+      summary.outcomes[0] = { ...summary.outcomes[0]!, spec, command: spec.argv.join(' ') };
+      return summary;
+    }, workspace: ws });
     await tickAndDrain(engine); // code run → publish → AWAITING_HUMAN
     await tickAndDrain(engine); // review #1 → BLOCK → pending_fix → DISCOVERED
     let task = store.getTask('me/sandbox', 6)!;

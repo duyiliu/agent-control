@@ -11,6 +11,7 @@ import { DiffTooLargeError, GitWorkspace } from '../workspace/git.js';
 import { openPiCoderSession, SessionRestoreError, type CoderSession, type CoderSessionOpts, type CoderTurn } from '../runners/session.js';
 import { PI_ALL_TOOLS } from '../runners/pi.js';
 import { checksForPlatform, runChecks, skippedChecks, type ChecksSummary } from '../verify/checks.js';
+import { resolveCheckPlan, type CheckPlan } from '../verify/discovery.js';
 import { runReview, ReviewInfraError } from '../verify/review.js';
 import { publishDraftPr, PublishError } from '../publish/pr.js';
 import { buildCoderPrompt, buildFixPrompt, CODER_RESUME_NOTE, type PromptContext } from './prompts.js';
@@ -1130,12 +1131,14 @@ export class Engine {
             const gate = await this.gateApproval(project, task);
             if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed before checks'); return; }
             const headBeforeChecks = await this.workspace.head(worktreePath);
+            const checkPlan = resolveCheckPlan(project.checks, worktreePath);
             store.transition(runId, phase, phase, {
               kind: 'checks_started', head_sha: headBeforeChecks,
-              commands: checksForPlatform(project.checks).map((check) => check.argv.join(' ')),
-              skipped: skippedChecks(project.checks),
+              source: checkPlan.source,
+              commands: checksForPlatform(checkPlan.checks).map((check) => check.argv.join(' ')),
+              skipped: skippedChecks(checkPlan.checks),
             });
-            const summary = await this.callChecks(run, log, worktreePath, signal, headBeforeChecks);
+            const summary = await this.callChecks(run, log, worktreePath, signal, headBeforeChecks, checkPlan);
             // runChecks borrowed runs.pid for its transient check child. Point
             // it back at the long-lived session process before FIXING or
             // PUBLISHING_PR, or a crash there sees a dead pid and resume spawns
@@ -1146,6 +1149,7 @@ export class Engine {
             }
             const headAfterChecks = await this.workspace.head(worktreePath).catch(() => null);
             const checksWorktreeClean = !(await this.workspace.isDirty(worktreePath));
+            this.recordChecks(run, summary, headAfterChecks === headBeforeChecks && checksWorktreeClean ? headBeforeChecks : null);
             store.transition(runId, phase, phase, {
               kind: 'checks_completed', head_sha: headBeforeChecks, head_sha_after: headAfterChecks,
               worktree_clean: checksWorktreeClean, ok: summary.ok, aborted: summary.aborted,
@@ -1440,7 +1444,7 @@ export class Engine {
       let diffEvidence: string;
       let reviewDiff: { patch: string; omitted: string[] };
       try {
-        diffEvidence = await this.workspace.diffVsBase(sitePath, project.base_branch);
+        diffEvidence = await this.workspace.diffVsBase(sitePath, project.base_branch, Number.POSITIVE_INFINITY);
         mkdirSync(this.artifactsDirFor(run), { recursive: true });
         writeFileSync(join(this.artifactsDirFor(run), 'review-diff.patch'), diffEvidence, 'utf8');
         reviewDiff = filterGenerated(diffEvidence, this.pathPolicy());
@@ -1477,7 +1481,24 @@ export class Engine {
       let outcome: Awaited<ReturnType<typeof runReview>> | undefined;
       let reviewError: unknown;
       try {
-        outcome = await this.runReviewFn(ctx, this.testEvidenceFor(task, reviewedSha), reviewDiff.patch, {
+        const plan: CheckPlan = task.source === 'issue' ? resolveCheckPlan(project.checks, sitePath) : { checks: [], source: 'none' };
+        const evidence = this.guardedCheckEvidence(task.id, reviewedSha);
+        const missing = checksForPlatform(plan.checks).some(check => !evidence.some(row => row.command === check.argv.join(' ') && row.verdict === 'PASS'));
+        if (plan.error || plan.checks.length && (!evidence.length || missing)) {
+          const summary = await this.callChecks(run, new RunLog(this.config.server.logs_dir, runId), sitePath, signal, reviewedSha, plan);
+          const checkedHead = await this.workspace.head(sitePath).catch(() => null);
+          const checksClean = await this.workspace.isDirty(sitePath).then(dirty => !dirty).catch(() => false);
+          this.recordChecks(run, summary, checkedHead === reviewedSha && checksClean ? reviewedSha : null);
+          store.transition(runId, 'REVIEWING', 'REVIEWING', { kind: 'checks_completed', head_sha: reviewedSha, head_sha_after: checkedHead, worktree_clean: checksClean, ok: summary.ok });
+          if (summary.aborted || aborted()) { this.finishReview(run, task, 'CANCELED', 'cancelled during review checks', this.cancelTaskPhase(runId)); return; }
+          if (checkedHead !== reviewedSha || !checksClean) throw new Error('review checks changed HEAD or tracked files; verification does not match the approved head');
+          if (summary.infraError) throw new Error(`checks infra: ${summary.infraError}`);
+          if (!summary.ok) outcome = {
+            result: { verdict: 'BLOCK', risk: 'low', summary: '宿主自动检查未通过，需要修复', findings: [summary.failureEvidence] },
+            logPath: summary.outcomes.at(-1)!.logPath,
+          };
+        }
+        if (!outcome) outcome = await this.runReviewFn(ctx, this.testEvidenceFor(task, reviewedSha), reviewDiff.patch, {
           agentConfig: this.config.agent,
           timeoutMs: this.config.server.max_task_minutes * 60_000,
           artifactsDir: this.artifactsDirFor(run), signal, headSha: reviewedSha,
@@ -1794,19 +1815,28 @@ export class Engine {
     return res;
   }
 
-  private async callChecks(run: RunRow, log: RunLog, worktreePath: string, signal: AbortSignal, headSha?: string | null): Promise<ChecksSummary> {
+  private async callChecks(run: RunRow, log: RunLog, worktreePath: string, signal: AbortSignal, headSha?: string | null, plan?: CheckPlan): Promise<ChecksSummary> {
     const project = this.projectFor((this.store.getTaskById(run.task_id))!.repo)!;
-    const summary = await this.runChecksFn(
-      project.checks, worktreePath,
+    const resolved = plan ?? resolveCheckPlan(project.checks, worktreePath);
+    const summary: ChecksSummary = resolved.error ? { ok: false, outcomes: [], skipped: [], infraError: resolved.error, failureEvidence: resolved.error } : await this.runChecksFn(
+      resolved.checks, worktreePath,
       (i) => join(this.artifactsDirFor(run), `check-${i}-${Date.now()}.log`),
       undefined, signal,
       (pid) => this.store.updateRunFields(run.run_id, { pid, process_identity: pid ? `${pid}:${Date.now()}` : null }),
     );
+    if (resolved.bootstrap && !summary.aborted && summary.outcomes[0] && summary.outcomes[0].exitCode !== 0 && !summary.infraError) {
+      summary.infraError = 'npm ci 依赖安装失败，请检查依赖安装日志与网络环境';
+    }
+    log.event('checks', { run: run.run_id, head_sha: headSha, source: resolved.source, commands: resolved.checks.map(c => c.argv.join(' ')), ok: summary.ok, count: summary.outcomes.length, skipped: summary.skipped.length, infra_error: summary.infraError });
+    return summary;
+  }
+
+  private recordChecks(run: RunRow, summary: ChecksSummary, headSha: string | null) {
     summary.outcomes.forEach((o) => {
       this.store.addCheck({
         run_id: run.run_id, kind: 'check', command: o.command,
         exit_code: o.exitCode, artifact_path: o.logPath,
-        verdict: summary.aborted ? 'CANCELED' : summary.infraError ? 'ERROR' : o.exitCode === 0 ? 'PASS' : 'FAIL',
+        verdict: summary.aborted ? 'CANCELED' : !headSha || summary.infraError ? 'ERROR' : o.exitCode === 0 ? 'PASS' : 'FAIL',
         head_sha: headSha,
       });
     });
@@ -1819,8 +1849,24 @@ export class Engine {
         exit_code: null, artifact_path: undefined, verdict: 'SKIP', head_sha: headSha,
       });
     });
-    log.event('checks', { run: run.run_id, ok: summary.ok, count: summary.outcomes.length, skipped: summary.skipped.length });
-    return summary;
+  }
+
+  private guardedCheckEvidence(taskId: number, headSha: string) {
+    const guards = new Map<string, { at: string; valid: boolean }>();
+    return this.store.checkEvidenceForSha(taskId, headSha).filter(row => {
+      if (!guards.has(row.run_id)) {
+        let guard = { at: '', valid: false };
+        for (const event of this.store.eventsForRun(row.run_id)) {
+          try {
+            const detail = JSON.parse(event.detail_json ?? 'null');
+            if (detail?.kind === 'checks_completed' && detail.head_sha === headSha) guard = { at: event.at, valid: detail.ok === true && detail.head_sha_after === headSha && detail.worktree_clean === true };
+          } catch { /* Unstructured historical events cannot attest a check. */ }
+        }
+        guards.set(row.run_id, guard);
+      }
+      const guard = guards.get(row.run_id)!;
+      return guard.valid && row.created_at <= guard.at;
+    });
   }
 
   private testEvidenceFor(task: TaskRow, headSha: string): string {
@@ -1829,12 +1875,12 @@ export class Engine {
         .map((c) => `命令: ${c.command}\n结果: ${c.verdict} (exit ${c.exit_code ?? 'n/a'})\n日志: ${c.artifact_path ?? '-'}\n日志尾部:\n${this.checkLogTail(c.artifact_path)}`)
         .join('\n\n');
     const prefix = `提交 SHA: ${headSha}\n`;
-    const scoped = this.store.checkEvidenceForSha(task.id, headSha);
+    const scoped = this.guardedCheckEvidence(task.id, headSha);
     if (scoped.length > 0) return prefix + render(scoped);
     // Legacy rows predate head_sha binding: the evidence is still real
     // (usually produced by the run that authored this very head), but the
     // reviewer must be told it is not sha-scoped rather than given nothing.
-    const fallback = this.store.latestCheckEvidence(task.id);
+    const fallback = this.store.latestCheckEvidence(task.id).filter(row => row.head_sha === null);
     if (fallback.length === 0) return `${prefix}(no checks recorded)`;
     return `${prefix}注意：以下检查证据来自更早的 run，未绑定此 SHA（历史数据无 head_sha 列）。通常它验证的正是本次被审提交，但请以 <diff> 自行核对，证据可信度按弱一等对待。\n` + render(fallback);
   }
