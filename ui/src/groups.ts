@@ -20,9 +20,9 @@ export function groupOf(status: Phase): GroupKey {
 }
 
 export const GROUPS: { key: GroupKey; label: string; dot: string }[] = [
-  { key: 'queued', label: '排队中', dot: 'bg-fg-dim' },
-  { key: 'active', label: '进行中', dot: 'bg-ok' },
-  { key: 'reviewing', label: '审查中', dot: 'bg-info' },
+  { key: 'queued', label: '等待派发', dot: 'bg-fg-dim' },
+  { key: 'active', label: '执行中', dot: 'bg-ok' },
+  { key: 'reviewing', label: '评审中', dot: 'bg-info' },
   { key: 'merging', label: '合并中', dot: 'bg-ok' },
   { key: 'human', label: '待人工处理', dot: 'bg-warn' },
   { key: 'done', label: '已完成', dot: 'bg-fg-dim' },
@@ -69,15 +69,15 @@ const TONE_TEXT: Record<Tone, string> = {
 
 /** Human labels — the raw enum stays in the API/DB, the UI speaks Chinese. */
 const PHASE_LABEL: Record<Phase, string> = {
-  DISCOVERED: '排队中',
+  DISCOVERED: '等待派发',
   CLAIMED: '已领取',
   PREPARING: '准备中',
-  RUNNING: '运行中',
+  RUNNING: '执行中',
   VERIFYING: '校验中',
-  REVIEWING: '审查中',
+  REVIEWING: '评审中',
   FIXING: '修复中',
   PUBLISHING_PR: '创建 PR',
-  AWAITING_REVIEW: '待审查',
+  AWAITING_REVIEW: '等待评审',
   AWAITING_HUMAN: '待人工处理',
   MERGING: '合并中',
   COMPLETED: '已完成',
