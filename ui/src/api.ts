@@ -27,7 +27,7 @@ export interface IntakeState {
 
 export interface TaskSummary {
   actions?: { stop: boolean; retry: boolean; rereview: boolean; approve_merge: boolean };
-  attention?: { kind?: 'decision' | 'approval' | 'execution_error' | 'recovery' | 'advisory'; summary: string; detail: string; next_step: string; next_attempt_at?: string | null; decision_version?: string; head_sha?: string; decisions?: { request_id?: string; question: string; options: string[]; impact: string; reason: string; file?: string; line?: number }[] } | null;
+  attention?: { kind?: 'decision' | 'approval' | 'execution_error' | 'recovery' | 'advisory' | 'hold'; summary: string; detail: string; next_step: string; next_attempt_at?: string | null; decision_version?: string; head_sha?: string; decisions?: { request_id?: string; question: string; options: string[]; impact: string; reason: string; file?: string; line?: number }[] } | null;
   intake?: IntakeState | null;
   id: number;
   repo: string;

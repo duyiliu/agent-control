@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Clock, GitPullRequest, Search } from 'lucide-react';
 import type { IntakeState, TaskSummary } from './api';
-import { fmtDur, fmtTime, GROUPS, groupOf, isActivePhase, phaseLabel, phaseTextClass, type GroupKey } from './groups';
+import { fmtDur, fmtTime, GROUPS, groupOf, phaseLabel, phaseTextClass, type GroupKey } from './groups';
 import { buildRepoCounts } from './repo-filters';
 import HistoryList from './HistoryList';
 import StatusIcon from './StatusIcon';
@@ -11,15 +11,17 @@ import { isDeferredDue } from './deferred';
 import type { Toast } from './App';
 
 const EMPTY_HINT: Partial<Record<GroupKey, string>> = {
-  queued: '自动接手项目的新 Issue 会在这里排队',
-  active: '暂无运行中的任务',
-  reviewing: '暂无等待或正在审查的 PR',
-  merging: '暂无自动合并中的 PR',
-  human: '暂无需要人工处理的任务',
-  done: '最近 7 天暂无完成的任务',
+  queued: '自动接手的项目里 Issue 正在排队',
+  active: '正在执行的任务',
+  reviewing: '等待或正在评审的 PR',
+  merging: '正在自动合并的 PR',
+  human: '需要你决策或批准的任务',
+  blocked: '执行失败或需要介入的任务',
 };
 
 const FILTER_KEY = 'ac-repo-filter';
+
+type View = 'attention' | 'active' | 'parked' | 'errors' | 'history';
 
 export default function Board(props: {
   tasks: TaskSummary[] | null;
@@ -32,14 +34,12 @@ export default function Board(props: {
   onChanged: () => void;
   onToast: (toast: Toast) => void;
 }) {
-  const { tasks, projectRepos, tick, selected, onSelect, onStop, onIntakeChanged, onChanged, onToast } = props;
-  const [disposition, setDisposition] = useState<'normal' | 'attention' | 'errors' | 'history'>('normal');
+  const { tasks, projectRepos, tick, selected, onSelect, onIntakeChanged, onChanged, onToast } = props;
+  const [disposition, setDisposition] = useState<View>('active');
   const [historyResult, setHistoryResult] = useState('all');
-  const [includeDeferred, setIncludeDeferred] = useState(false);
   const [mobileGroup, setMobileGroup] = useState<GroupKey | null>(null);
   const [repoFilter, setRepoFilter] = useState<string | null>(() => localStorage.getItem(FILTER_KEY));
   const [keyword, setKeyword] = useState('');
-  const [draggingId, setDraggingId] = useState<number | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -70,61 +70,76 @@ export default function Board(props: {
   const matching = tasks.filter(t => !kw || t.issue_title.toLowerCase().includes(kw) || String(t.issue_number).includes(kw) || t.repo.toLowerCase().includes(kw));
   const hasDisposition = (t: TaskSummary) => !t.active_run && !['COMPLETED', 'MERGING', 'AWAITING_REVIEW', 'AWAITING_HUMAN'].includes(t.status);
   const phaseOf = (t: TaskSummary) => (t.status === 'MERGING' ? 'MERGING' : (t.active_run?.phase ?? t.status));
-  const deferred = (t: TaskSummary) => !['COMPLETED', 'CANCELED'].includes(t.status) && hasDisposition(t) && t.intake?.kind === 'deferred';
+  const parked = (t: TaskSummary) => !['COMPLETED', 'CANCELED'].includes(t.status) && hasDisposition(t) && (t.intake?.kind === 'deferred' || t.attention?.kind === 'hold');
   const history = (t: TaskSummary) => t.attention?.kind === 'advisory' || groupOf(phaseOf(t)) === 'done' || hasDisposition(t) && t.intake?.kind === 'skipped';
   const taskGroup = (t: TaskSummary): GroupKey => hasDisposition(t) && t.intake && (t.intake.kind === 'human' || t.intake.locked || t.intake.external_hold || t.intake.external_needs || t.intake.error || t.intake.pending) ? 'human' : groupOf(phaseOf(t));
-  const executionError = (t: TaskSummary) => !deferred(t) && !history(t) && (['execution_error', 'recovery'].includes(t.attention?.kind ?? '') || !t.attention?.kind && taskGroup(t) === 'blocked');
-  const attention = (t: TaskSummary) => !deferred(t) && !history(t) && (['decision', 'approval'].includes(t.attention?.kind ?? '') || !t.attention?.kind && taskGroup(t) === 'human');
-  const recentlyCompleted = (t: TaskSummary) => t.status === 'COMPLETED' && Date.parse(t.updated_at) >= Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const executionError = (t: TaskSummary) => !parked(t) && !history(t) && (['execution_error', 'recovery'].includes(t.attention?.kind ?? '') || !t.attention?.kind && taskGroup(t) === 'blocked');
+  const attention = (t: TaskSummary) => !parked(t) && !history(t) && (['decision', 'approval'].includes(t.attention?.kind ?? '') || !t.attention?.kind && taskGroup(t) === 'human');
+  const activeTask = (t: TaskSummary) => !parked(t) && !history(t) && !attention(t) && !executionError(t);
   const scoped = matching.filter(t => !activeFilter || t.repo === activeFilter);
-  const deferredCount = scoped.filter(deferred).length;
-  const overdueCount = scoped.filter(t => deferred(t) && isDeferredDue(t.intake)).length;
-  const attentionCount = scoped.filter(attention).length;
-  const executionCount = scoped.filter(t => !deferred(t) && !history(t) && !attention(t) && !executionError(t)).length;
-  const historyCount = scoped.filter(history).length;
-  const recentCompletedCount = scoped.filter(recentlyCompleted).length;
-  const inView = matching.filter(t => disposition === 'history'
-    ? history(t) && (historyResult === 'all' || (historyResult === 'skipped' ? t.intake?.kind === 'skipped' && !['COMPLETED', 'CANCELED'].includes(t.status) : t.status === historyResult))
-    : deferred(t) ? includeDeferred : disposition === 'attention' ? attention(t) : disposition === 'errors' ? executionError(t) : recentlyCompleted(t) || !history(t) && !attention(t) && !executionError(t));
+  const counts = {
+    attention: scoped.filter(attention).length,
+    active: scoped.filter(activeTask).length,
+    parked: scoped.filter(parked).length,
+    errors: scoped.filter(executionError).length,
+    history: scoped.filter(history).length,
+  };
+  const overdueCount = scoped.filter(t => parked(t) && isDeferredDue(t.intake)).length;
+  const inView = matching.filter(t => {
+    if (disposition === 'history') return history(t) && (historyResult === 'all' || (historyResult === 'skipped' ? t.intake?.kind === 'skipped' && !['COMPLETED', 'CANCELED'].includes(t.status) : t.status === historyResult));
+    if (disposition === 'attention') return attention(t);
+    if (disposition === 'parked') return parked(t);
+    if (disposition === 'errors') return executionError(t);
+    return activeTask(t);
+  });
   const repos = buildRepoCounts(inView, []);
   const repoNames = [...repos.keys()].sort();
   if (activeFilter && !repos.has(activeFilter)) repoNames.push(activeFilter);
   const visible = inView.filter(t => !activeFilter || t.repo === activeFilter);
-  const displayGroups = disposition === 'history'
-    ? [{ key: 'done' as const, label: '历史记录', dot: 'bg-fg-dim' }]
-    : GROUPS.filter(g => disposition === 'attention' ? g.key === 'human' : disposition === 'errors' ? g.key === 'blocked' : ['queued', 'active', 'reviewing', 'merging', 'done'].includes(g.key));
-  const deferredGroup: GroupKey = disposition === 'normal' ? 'blocked' : 'done';
-  if (disposition !== 'history' && includeDeferred) displayGroups.push({ key: deferredGroup, label: '暂缓', dot: 'bg-fg-dim' });
+  const displayGroups: { key: GroupKey; label: string; dot: string }[] = disposition === 'attention'
+    ? [{ key: 'human', label: '待我处理', dot: 'bg-warn' }]
+    : disposition === 'parked'
+      ? [{ key: 'blocked', label: '已暂停', dot: 'bg-fg-dim' }]
+      : disposition === 'errors'
+        ? [{ key: 'blocked', label: '执行受阻', dot: 'bg-danger' }]
+        : disposition === 'history'
+          ? []
+          : GROUPS.filter(g => ['queued', 'active', 'reviewing', 'merging'].includes(g.key));
   const byGroup = new Map<GroupKey, TaskSummary[]>();
   for (const g of GROUPS) byGroup.set(g.key, []);
   for (const t of visible) {
-    byGroup.get(disposition === 'history' ? 'done' : deferred(t) ? deferredGroup : disposition === 'errors' ? 'blocked' : disposition === 'attention' ? 'human' : taskGroup(t))!.push(t);
+    const key: GroupKey = disposition === 'attention' ? 'human' : disposition === 'parked' || disposition === 'errors' ? 'blocked' : taskGroup(t);
+    byGroup.get(key)!.push(t);
   }
   for (const list of byGroup.values()) {
     list.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   }
 
-  const defaultMobileGroup = displayGroups.find(g => byGroup.get(g.key)!.length)?.key ?? displayGroups[0]!.key;
+  const defaultMobileGroup = displayGroups.find(g => byGroup.get(g.key)!.length)?.key ?? displayGroups[0]?.key;
   const selectedMobileGroup = mobileGroup && displayGroups.some(g => g.key === mobileGroup) ? mobileGroup : defaultMobileGroup;
-
-  // Only active cards are draggable, and only into Needs Attention (= stop).
-  const draggedTask = draggingId !== null ? (visible.find((t) => t.id === draggingId) ?? null) : null;
+  const summary = [
+    counts.attention ? `${counts.attention} 项待你处理` : null,
+    counts.active ? `${counts.active} 项进行中` : null,
+    counts.parked ? `${counts.parked} 项已暂停` : null,
+    counts.errors ? `${counts.errors} 项异常` : null,
+  ].filter(Boolean).join(' · ') || '当前没有需要你介入的任务';
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       <div className="shrink-0 border-b border-edge px-3 pt-4 sm:px-4">
         <div className="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1">
           <h1 className="text-base font-semibold text-fg">执行工作台</h1>
-          <p className="text-xs text-fg-muted">{attentionCount > 0 ? `${attentionCount} 项待你处理${executionCount > 0 ? `，${executionCount} 项正在推进` : '，当前没有执行任务'}` : executionCount > 0 ? `${executionCount} 项任务由 Agent 推进` : '当前没有需要你介入的任务'}</p>
+          <p className="text-xs text-fg-muted">{summary}</p>
         </div>
         <nav aria-label="工作台视图" className="flex gap-3 overflow-x-auto sm:gap-6">
           {([
-            { id: 'normal', label: '执行看板', count: executionCount + recentCompletedCount },
-            { id: 'attention', label: '待我处理', count: attentionCount },
-            { id: 'errors', label: '执行受阻', count: scoped.filter(executionError).length },
-            { id: 'history', label: '历史记录', count: historyCount },
+            { id: 'attention', label: '待我处理', count: counts.attention },
+            { id: 'active', label: '进行中', count: counts.active },
+            { id: 'parked', label: '已暂停', count: counts.parked },
+            { id: 'errors', label: '执行受阻', count: counts.errors },
+            { id: 'history', label: '历史记录', count: counts.history },
           ] as const).map(view => <button key={view.id} type="button" aria-pressed={disposition === view.id} onClick={() => { setDisposition(view.id); setMobileGroup(null); }} className={`flex min-h-11 shrink-0 items-center gap-2 border-b-2 text-xs font-medium focus-visible:outline-2 focus-visible:outline-brand ${disposition === view.id ? 'border-brand text-fg' : 'border-transparent text-fg-muted hover:text-fg'}`}>
-            {view.label}<span className={`rounded px-1.5 py-0.5 text-[10px] tabular-nums ${view.id === 'attention' && view.count > 0 ? 'bg-warn/15 text-warn' : 'bg-elevated text-fg-muted'}`}>{view.count}</span>
+            {view.label}<span className={`rounded px-1.5 py-0.5 text-[10px] tabular-nums ${view.id === 'attention' && view.count > 0 ? 'bg-warn/15 text-warn' : view.id === 'errors' && view.count > 0 ? 'bg-danger/15 text-danger' : 'bg-elevated text-fg-muted'}`}>{view.count}</span>
           </button>)}
         </nav>
       </div>
@@ -145,13 +160,9 @@ export default function Board(props: {
         </div>
         <div className="flex min-w-0 items-center gap-1.5 pt-1 lg:flex-wrap">
           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-fg-muted">
-            {disposition !== 'history' ? <label className="flex min-h-9 cursor-pointer items-center gap-2">
-              <input type="checkbox" checked={includeDeferred} onChange={e => setIncludeDeferred(e.target.checked)} className="size-3.5 accent-[var(--color-brand)]" />
-              包含暂缓 <Count n={deferredCount} />
-              {overdueCount > 0 && <span className="text-warn">{overdueCount} 项提醒到期</span>}
-            </label> : <label className="flex items-center gap-2">结果<select aria-label="筛选历史结果" value={historyResult} onChange={e => setHistoryResult(e.target.value)} className="min-h-9 rounded-md border border-edge bg-card px-2 text-xs text-fg">
+            {disposition === 'history' ? <label className="flex items-center gap-2">结果<select aria-label="筛选历史结果" value={historyResult} onChange={e => setHistoryResult(e.target.value)} className="min-h-9 rounded-md border border-edge bg-card px-2 text-xs text-fg">
               <option value="all">全部结果</option><option value="COMPLETED">已完成</option><option value="CANCELED">已取消</option><option value="skipped">无需处理</option>
-            </select></label>}
+            </select></label> : disposition === 'parked' && overdueCount > 0 ? <span className="text-warn">{overdueCount} 项提醒到期</span> : null}
           </div>
           <div className="group relative w-10 shrink-0 transition-[width] focus-within:w-40 [&:has(input:not(:placeholder-shown))]:w-40 sm:w-52">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3 -translate-y-1/2 text-fg-dim" />
@@ -181,37 +192,16 @@ export default function Board(props: {
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-3 lg:flex-row lg:gap-3 lg:overflow-x-auto lg:overflow-y-hidden lg:p-4">
         {displayGroups.map((g) => {
           const items = byGroup.get(g.key)!;
-          const isDropTarget = g.key === 'blocked' && g.label !== '暂缓' && draggedTask !== null;
           return (
             <section
               key={g.key}
-              onDragOver={
-                isDropTarget
-                  ? (e) => {
-                      e.preventDefault();
-                      e.dataTransfer.dropEffect = 'move';
-                    }
-                  : undefined
-              }
-              onDrop={
-                isDropTarget
-                  ? (e) => {
-                      e.preventDefault();
-                      onStop(draggedTask);
-                      setDraggingId(null);
-                    }
-                  : undefined
-              }
-              className={`flex min-h-0 w-full shrink-0 flex-col rounded-lg border bg-panel lg:max-h-full ${displayGroups.length <= 2 ? 'lg:w-auto lg:flex-1 lg:max-w-2xl' : 'lg:w-0 lg:min-w-[240px] lg:flex-1'} ${g.key === selectedMobileGroup ? 'flex' : 'hidden'} lg:flex ${
-                isDropTarget ? 'border-danger/40 bg-danger/[0.04]' : 'border-edge'
-              }`}
+              className={`flex min-h-0 w-full shrink-0 flex-col rounded-lg border border-edge bg-panel lg:max-h-full ${displayGroups.length <= 2 ? 'lg:w-auto lg:flex-1 lg:max-w-2xl' : 'lg:w-0 lg:min-w-[240px] lg:flex-1'} ${g.key === selectedMobileGroup ? 'flex' : 'hidden'} lg:flex`}
             >
               <header className="flex shrink-0 items-center gap-2 px-3 py-2.5 text-[12px] font-medium text-fg-muted">
                 <span
                   className={`size-1.5 rounded-full ${g.dot} ${g.key === 'active' ? '[animation:pulse-dot_1.5s_infinite]' : ''}`}
                 />
                 {g.label}
-                {disposition === 'normal' && g.key === 'done' && <span className="text-[10px] font-normal text-fg-dim">最近 7 天</span>}
                 <span className="ml-auto rounded border border-edge px-1.5 py-px text-[10.5px] tabular-nums text-fg-dim">
                   {items.length}
                 </span>
@@ -226,10 +216,6 @@ export default function Board(props: {
                     tick={tick}
                     selected={selected === t.id}
                     onSelect={onSelect}
-                    draggable={isActivePhase(phaseOf(t)) && displayGroups.some(group => group.key === 'blocked')}
-                    dragging={draggingId === t.id}
-                    onDragStart={() => setDraggingId(t.id)}
-                    onDragEnd={() => setDraggingId(null)}
                     onIntakeChanged={onIntakeChanged}
                     onChanged={onChanged}
                     onToast={onToast}
@@ -237,7 +223,7 @@ export default function Board(props: {
                 ))}
                 {items.length === 0 && (
                   <div className="rounded-md border border-dashed border-edge px-3 py-6 text-center text-[11px] text-fg-dim">
-                    {g.label === '暂缓' ? '暂无暂缓任务' : EMPTY_HINT[g.key] ?? '暂无任务'}
+                    {g.label === '已暂停' ? '没有已暂停的任务' : EMPTY_HINT[g.key] ?? '暂无任务'}
                   </div>
                 )}
               </div>
@@ -277,15 +263,11 @@ function TaskCard(props: {
   tick: number;
   selected: boolean;
   onSelect: (id: number) => void;
-  draggable: boolean;
-  dragging: boolean;
-  onDragStart: () => void;
-  onDragEnd: () => void;
   onIntakeChanged: (id: number, state: IntakeState) => void;
   onChanged: () => void;
   onToast: (toast: Toast) => void;
 }) {
-  const { task, tick, selected, onSelect, draggable, dragging, onDragStart, onDragEnd, onIntakeChanged, onChanged, onToast } = props;
+  const { task, tick, selected, onSelect, onIntakeChanged, onChanged, onToast } = props;
   const active = task.active_run;
   const phase = active?.phase ?? task.status;
   const disposition = !active && !['COMPLETED', 'MERGING', 'AWAITING_REVIEW', 'AWAITING_HUMAN'].includes(task.status) ? task.intake : null;
@@ -293,21 +275,9 @@ function TaskCard(props: {
     <div
       data-tick={tick}
       onClick={() => onSelect(task.id)}
-      draggable={draggable}
-      onDragStart={
-        draggable
-          ? (e) => {
-              e.dataTransfer.setData('text/plain', String(task.id));
-              e.dataTransfer.effectAllowed = 'move';
-              onDragStart();
-            }
-          : undefined
-      }
-      onDragEnd={draggable ? onDragEnd : undefined}
-      title={draggable ? '拖到「需要处理」即可停止' : undefined}
       className={`relative w-full cursor-pointer overflow-hidden rounded-md border p-3 text-left transition-colors ${
         selected ? 'border-edge-strong bg-elevated' : 'border-edge bg-card hover:border-edge-strong hover:bg-elevated'
-      } ${dragging ? 'opacity-40' : ''}`}
+      }`}
     >
       {active && <span className="absolute inset-y-0 left-0 w-[2px] bg-ok" />}
       <button type="button" onClick={() => onSelect(task.id)} className="w-full touch-manipulation rounded text-left text-[13px] font-semibold leading-snug text-fg focus-visible:outline-2 focus-visible:outline-brand" style={{ paddingLeft: active ? 6 : 0 }}>
@@ -334,7 +304,7 @@ function TaskCard(props: {
         <div className="flex items-center gap-2">
           <span className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap ${phaseTextClass(phase)}`}>
             <StatusIcon phase={phase} />
-            {disposition?.kind === 'deferred' ? '暂缓' : disposition?.kind === 'skipped' ? '无需处理' : disposition?.kind === 'human' || disposition?.locked || disposition?.external_hold || disposition?.external_needs ? '待人工' : phaseLabel(phase)}
+            {disposition?.kind === 'deferred' ? '暂缓' : disposition?.kind === 'skipped' ? '无需处理' : disposition?.locked || disposition?.external_hold ? '已暂停' : disposition?.kind === 'human' || disposition?.external_needs ? '待人工' : phaseLabel(phase)}
           </span>
           <span className="ml-auto flex shrink-0 items-center gap-3">
             {active ? (

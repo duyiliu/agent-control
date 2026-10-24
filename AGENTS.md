@@ -95,7 +95,11 @@
   allowlist (no bash/edit/write) and stays ephemeral. `review_model` and
   `review_reasoning_effort` may select a different Pi model/settings for review.
   `agent.model` is required — no implicit model default; `reasoning_effort` is
-  optional (unset = runner default). All children get the scrubbed env.
+  optional (unset = runner default). `agent.complex_model` /
+  `agent.complex_reasoning_effort` apply only to tasks whose Issue carries the
+  explicit `agent-complex` label; complexity is never inferred from issue text
+  or diff size, and a missing complex setting falls back to the base coder
+  settings. All children get the scrubbed env.
 - 优雅停机挂起而非取消：`Engine.shutdown` 中止在途 run 并有界等待其
   `finally`/`session.close` 收尾；被切断的编码 run 保持原相位
   （记 `service_shutdown` 事件、`cancel_requested` 仍为 0、不摘

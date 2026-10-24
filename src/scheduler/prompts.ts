@@ -178,7 +178,7 @@ function buildReviewV2Prompt(ctx: PromptContext, testEvidence: string, diffEvide
     '在 summary 和 compatibility.evidence 交代正常路径、错误路径、输入边界、旧调用兼容覆盖，各项引用真实证据或说明不适用。并发异步检查非 Error 拒绝值、退出码和在途收尾，测试全绿不能代替新增分支审查。',
     'decision_requests 仅接受 product_choice、breaking_change、sensitive_authorization、configured_hold；每项给出具体 question、至少两个不同 options、impact、reason（为什么已批准需求不能决定）；指出 file/line 或明确需求冲突。仅契约变化/改动大/高风险不是决策理由。',
     '权限扩大、认证密钥或发布信任边界、不可逆生产删除迁移必须提出具体授权问题；reviewer 自述授权不是有效批准。破坏性变化先核查是否已获具体批准，不能擅自解释为已授权。',
-    'compatibility.kind 为 unchanged/additive/breaking/unknown，evidence 非空且引用核查依据。unknown 要提出具体补证，breaking 要明确未解决问题；二者均不能直接放行。',
+    'compatibility.kind 为 unchanged/additive/breaking/unknown，evidence 非空且引用核查依据。unknown 要提出具体补证，breaking 要明确未解决问题；二者均不能直接放行。breaking 的未解决问题若是旧行为回归，写入 findings 交编码 Agent 修复；只有已有需求无法决定的取舍才写 breaking_change decision_request。',
     '保留本轮及所有分段未解决的 findings、verification_requests、decision_requests；汇总不得删除或淡化它们。分段仅判断本段及可读上下文，不仅因未含其他文件就误报。',
     '# 输出格式',
     '只输出一个严格 JSON 对象，不能包含代码围栏、叙述、示例、额外字段。必填：{"protocol_version":2,"summary":"具体结论与覆盖说明","findings":[],"verification_requests":[],"decision_requests":[],"compatibility":{"kind":"unchanged","evidence":["具体依据"]}}。findings 项格式 {"file":"path","line":1,"trigger":"触发条件","impact":"实际影响","verification":"验证方法"}；verification_requests 项格式 {"claim":"命题","scenario":"场景","expected":"成功标准"}；decision_requests 项格式 {"type":"product_choice","question":"具体问题","options":["方案 A","方案 B"],"impact":"影响","reason":"现有授权不足的原因","file":"path","line":1}（file/line 可省略）。',

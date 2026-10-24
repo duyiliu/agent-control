@@ -46,6 +46,8 @@
 
 `agent-control.yaml` 里的 `agent.model` 以 `<provider名>/<模型id>` 引用（如 `new-api/deepseek-v4.1-flash`），**必填——缺失直接拒绝启动**。`agent.reasoning_effort` 是可选 Pi 思考级别（`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`）；不配置时使用 Pi 默认值。
 
+Issue 标注 `agent-complex` 后，该任务的所有编码回合（首次实现、修复、冲突修复）改用 `agent.complex_model` 和 `agent.complex_reasoning_effort`；未配置时回落到 `agent.model` / `agent.reasoning_effort`。复杂度由人工显式声明，不做自动推断。
+
 编码与评审都走 Pi。评审可用 `review_model` 和 `review_reasoning_effort` 单独选择模型与思考级别。旧配置里的 `provider: codex`、`review_provider`、`sandbox`、`review_sandbox` 会被明确拒绝，请改用 `provider: pi` 并按 Pi 格式配置模型。
 
 ## 快速开始
@@ -124,7 +126,11 @@ Issue 任务去重，输出首次自动闭合率、人工决策率、当前执�
 | `projects[].issue_triage.enabled` | `false` | 旧配置兼容：true 映射到 all；显式 issue_intake 优先，timeout_seconds 已弃用 |
 | `projects[].checks[].argv` | — | 无 shell 执行；`timeout_seconds` 默认 `600` |
 | `agent.model` | 必填 | `<provider>/<model id>`，来自 `~/.pi/agent/models.json` |
+| `agent.reasoning_effort` | 未设置 | 常规编码的 Pi 思考级别；未设置时使用 Pi 默认值 |
+| `agent.complex_model` | 同 `agent.model` | `agent-complex` 任务的编码模型 |
+| `agent.complex_reasoning_effort` | 同 `agent.reasoning_effort` | `agent-complex` 任务的思考级别 |
 | `agent.review_model` | 同 `agent.model` | 评审模型，可用来做异构评审 |
+| `agent.review_reasoning_effort` | 同 `agent.reasoning_effort` | 评审思考级别 |
 | `approvals.auto_merge.enabled` | `false` | 兼容旧配置；AI PASS 不会自动合并。人工 `agent-merge` 批准仍可触发宿主合并 |
 | `approvals.auto_merge.max_files` | `10` | 保留旧风险配置；文件数本身不替代人工审查 |
 | `approvals.auto_merge.max_lines` | `400` | 保留旧风险配置；改动大小本身不替代人工审查 |

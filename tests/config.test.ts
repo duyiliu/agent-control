@@ -22,12 +22,21 @@ function withConfig(agent: string, run: (path: string) => void) {
 }
 
 test('config: Pi is the only runner and review model override is supported', () => {
-  withConfig('  provider: pi\n  model: test/coder\n  review_model: test/reviewer\n  review_reasoning_effort: low', (path) => {
+  withConfig('  provider: pi\n  model: test/coder\n  reasoning_effort: high\n  complex_model: test/complex\n  complex_reasoning_effort: max\n  review_model: test/reviewer\n  review_reasoning_effort: low', (path) => {
     const config = loadConfig(path);
     assert.equal(config.agent.provider, 'pi');
     assert.equal(config.agent.model, 'test/coder');
+    assert.equal(config.agent.reasoning_effort, 'high');
+    assert.equal(config.agent.complex_model, 'test/complex');
+    assert.equal(config.agent.complex_reasoning_effort, 'max');
     assert.equal(config.agent.review_model, 'test/reviewer');
     assert.equal(config.agent.review_reasoning_effort, 'low');
+  });
+});
+
+test('config: unknown complex reasoning level is rejected', () => {
+  withConfig('  model: test/coder\n  complex_reasoning_effort: ultra', (path) => {
+    assert.throws(() => loadConfig(path), (err) => err instanceof ConfigError && /agent\.complex_reasoning_effort/.test(err.message));
   });
 });
 

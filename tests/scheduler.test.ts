@@ -320,6 +320,24 @@ test('FIXING continues the coder session opened by RUNNING', async () => {
   } finally { env.done(); }
 });
 
+test('agent-complex label selects the complex coder model and thinking level', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(31, { ...ISSUE, labels: ['agent-ready', 'agent-complex'] });
+    env.config.agent.complex_model = 'test/complex';
+    env.config.agent.complex_reasoning_effort = 'max';
+    let sessionOpts: CoderSessionOpts | undefined;
+    const { engine } = makeEngine(env, { openCoderSessionFn: (opts) => {
+      sessionOpts = opts;
+      return fakeCoderSession(async () => okCoder());
+    } });
+    await tickAndDrain(engine);
+    assert.equal(env.stores[0]!.getTask('me/sandbox', 31)!.status, 'AWAITING_REVIEW');
+    assert.equal(sessionOpts?.model, 'test/complex');
+    assert.equal(sessionOpts?.thinking, 'max');
+  } finally { env.done(); }
+});
+
 test('AC2: no approval label → task cancelled, zero agent calls', async () => {
   const env = setup();
   try {

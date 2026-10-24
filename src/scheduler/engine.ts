@@ -28,6 +28,10 @@ import { IssueTriage } from '../triage/service.js';
 import { MANAGED } from '../triage/state.js';
 import { acceptsAllIssues, parseOutcome } from '../triage/intake.js';
 
+// Older v2 rounds auto-generated this exact question for any breaking change.
+// It is a host template, not a reviewer judgement, so reruns drop it.
+const HOST_BREAKING_QUESTION = '是否接受本提交的破坏性兼容变化？';
+
 export interface EngineDeps {
   store: Store;
   config: AppConfig;
@@ -59,6 +63,10 @@ const PR_REVIEW_BATCH = 1;
 
 /** Label a human adds to summon a review for a PR opened before the anchor. */
 const PR_SUMMON_LABEL = 'agent-review';
+
+/** Human-declared complexity marker: selects agent.complex_* for every coder
+ *  turn of this task (initial implementation, fixes and conflict repair). */
+const COMPLEX_LABEL = 'agent-complex';
 
 /** Task states a human must look at — surfaced as a GitHub issue comment. */
 const ATTENTION_PHASES: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED'];
@@ -153,10 +161,6 @@ export class Engine {
       assessment.verification_requests = unique([...control.assessment.verification_requests, ...assessment.verification_requests]);
     }
     const requests: DecisionRequest[] = [...assessment.decision_requests];
-    if (assessment.compatibility.kind === 'breaking' && !requests.some(r => r.type === 'breaking_change')) requests.push({
-      type: 'breaking_change', question: '是否接受本提交的破坏性兼容变化？', options: ['接受当前提交的变化', '保留原兼容行为'],
-      impact: assessment.compatibility.evidence.join('\n'), reason: '当前评审判定为破坏性变更，需要明确选择兼容策略',
-    });
     const protectedFiles = splitDiff(diff).filter(f => classifyPath(f.path, { generated: project.human_review_paths ?? [], docs: [] }) === 'generated');
     for (const file of protectedFiles) requests.push({ type: 'configured_hold', file: file.path,
       question: `是否批准修改受保护路径 ${file.path}？`, options: ['批准当前提交', '拒绝当前提交'],
@@ -166,13 +170,15 @@ export class Engine {
       ...(request.type !== 'product_choice' ? { options: ['批准当前提交', '拒绝当前提交'] } : {}), request_id: createHash('sha256').update(JSON.stringify({
       requirement: control.requirement_hash, type: request.type, file: request.file ?? '', question: request.question, options: request.options,
     })).digest('hex').slice(0, 24), head_sha: sha, requirement_hash: control.requirement_hash }));
-    const decisions = [...new Map([...control.decisions.filter(d => d.head_sha === sha), ...requested].map(d => [d.request_id, d])).values()];
+    const decisions = [...new Map([...control.decisions.filter(d => d.head_sha === sha
+      && !(d.type === 'breaking_change' && d.question === HOST_BREAKING_QUESTION)), ...requested].map(d => [d.request_id, d])).values()];
     const next = { ...control, assessment, decisions, next_attempt_at: null };
     this.store.saveReviewControl(task.id, next);
     const pending = unresolvedDecisions(next, sha);
     const findings = assessment.findings.map(f => `${f.file}:${f.line}: ${f.trigger}; ${f.impact}; 验证: ${f.verification}`);
     findings.push(...assessment.verification_requests.map(v => `补充验证：${v.claim}; 场景：${v.scenario}; 通过标准：${v.expected}`));
     if (assessment.compatibility.kind === 'unknown') findings.push('核对受影响调用方及旧默认行为，补齐兼容性证据；不得仅凭未知状态放行');
+    if (assessment.compatibility.kind === 'breaking') findings.push(`破坏性兼容变化：${assessment.compatibility.evidence.join('；')}；先恢复既有行为，或由评审提出具体产品取舍`);
     const verdict = pending.length ? 'HUMAN_REVIEW_REQUIRED' : findings.length ? 'BLOCK' : 'PASS';
     this.store.addCheck({ run_id: run.run_id, kind: 'review', command: 'agent (review v2)', exit_code: null,
       artifact_path: logPath, verdict, head_sha: sha, detail_json: JSON.stringify(assessment) });
@@ -222,7 +228,8 @@ export class Engine {
       return false;
     }
     if (unresolvedDecisions(control, pr.headSha).length || this.reviewDenied(control, pr.headSha)) return false;
-    if (control.assessment && (control.assessment.findings.length || control.assessment.verification_requests.length || control.assessment.compatibility.kind === 'unknown')) return false;
+    if (control.assessment && (control.assessment.findings.length || control.assessment.verification_requests.length
+      || control.assessment.compatibility.kind === 'unknown' || control.assessment.compatibility.kind === 'breaking')) return false;
     if (project.review_mode === 'auto' && !control.assessment) return false;
     if (!pr.baseSha || !control.base_sha || pr.baseSha !== control.base_sha) {
       this.store.setTaskStatus(task.id, project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'BLOCKED', { approved_sha: null, approved_by: null });
@@ -1353,11 +1360,17 @@ export class Engine {
         const logPath = join(artifactsDir, `agent-${stamp}.jsonl`);
         const spawned: { pid: number | null; identity: string | null } = { pid: null, identity: null };
         const firstCodeRun = store.runsForTask(task.id).find(candidate => candidate.kind === 'code') ?? run;
+        const complex = ctx.issue.labels.includes(COMPLEX_LABEL);
+        const model = complex ? this.config.agent.complex_model ?? this.config.agent.model : this.config.agent.model;
+        const thinking = complex
+          ? this.config.agent.complex_reasoning_effort ?? this.config.agent.reasoning_effort
+          : this.config.agent.reasoning_effort;
+        if (complex) this.appLog.event('coder_complex_model', { run: run.run_id, model, thinking: thinking ?? null });
         const session = this.openCoderSessionFn({
           workdir: worktreePath,
           agentConfig: this.config.agent,
-          model: this.config.agent.model,
-          thinking: this.config.agent.reasoning_effort,
+          model,
+          thinking,
           tools: PI_ALL_TOOLS,
           logPath,
           lastMessagePath: join(artifactsDir, `coder-last-${stamp}.txt`),

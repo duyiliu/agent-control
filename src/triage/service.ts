@@ -56,7 +56,9 @@ export class IssueTriage {
       value.kind = old?.decision === 'HUMAN' ? 'human' : old?.decision === 'DEFER' ? 'deferred' : old?.decision === 'SKIP' ? 'skipped' : null;
       value.reason = old ? REASONS[old.reason_code] : '';
       value.defer_until = old?.defer_until ?? null;
-      value.locked = issue.labels.includes(HUMAN_HOLD);
+      // locked is the local human lock; the remote label is tracked by external_hold
+      // in the scan loop, so removing it in GitHub must not leave a stale local lock.
+      value.locked = false;
       if (issue.labels.includes(NEEDS_HUMAN)) value.kind = 'human';
     } catch (err) {
       value.kind = 'human'; value.error = String(err); value.imported = false;

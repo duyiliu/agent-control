@@ -105,6 +105,9 @@ export interface AppConfig {
     /** pi model identifier from models.json: "<provider>/<model id>". */
     model: string;
     reasoning_effort?: ReasoningEffort;
+    /** Optional coder model and thinking level for issues labelled agent-complex. */
+    complex_model?: string;
+    complex_reasoning_effort?: ReasoningEffort;
     /** Optional reviewer model and thinking level; the runner remains Pi. */
     review_model?: string;
     review_reasoning_effort?: ReasoningEffort;

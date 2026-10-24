@@ -127,6 +127,38 @@ test('v2 engine real product choice requests human decision with SHA and stable 
     assert.equal(e.store.getTaskById(e.task.id)?.pending_fix, null);
   } finally { e.done(); }
 });
+test('v2 breaking compatibility without a reviewer decision queues bounded AI repair instead of a human gate', async () => {
+  const a = assessment(); a.compatibility = { kind: 'breaking', evidence: ['旧调用方的默认行为发生变化'] };
+  const e = boot({ assessment: a }); try {
+    await tick(e); const t = e.store.getTaskById(e.task.id)!;
+    assert.equal(t.status, 'DISCOVERED'); assert.match(t.pending_fix ?? '', /破坏性兼容变化/);
+    assert.equal(e.store.getReviewControl(t.id)?.decisions.length, 0);
+    assert.equal(e.store.getReviewControl(t.id)?.fix_attempts, 1); assert.equal(t.fix_rounds, 1);
+  } finally { e.done(); }
+});
+test('v2 breaking compatibility with an explicit product choice still asks a human', async () => {
+  const a = assessment(); a.compatibility = { kind: 'breaking', evidence: ['默认行为变化'] };
+  a.decision_requests.push({ type: 'product_choice', question: '新旧默认值哪个生效？', options: ['保留旧默认', '采用新默认'], impact: '旧调用方行为', reason: '需求未约定' });
+  const e = boot({ assessment: a }); try {
+    await tick(e); const t = e.store.getTaskById(e.task.id)!;
+    assert.equal(t.status, 'AWAITING_HUMAN'); assert.equal(t.pending_fix, null);
+    const c = e.store.getReviewControl(t.id)!;
+    assert.equal(c.decisions.length, 1); assert.equal(c.decisions[0]!.type, 'product_choice'); assert.equal(c.fix_attempts, 0);
+  } finally { e.done(); }
+});
+test('v2 rerun drops the legacy host-generated breaking question for the same head', async () => {
+  const e = boot(); try {
+    const c = e.store.getReviewControl(e.task.id)!;
+    c.head_sha = SHA;
+    c.decisions.push({ request_id: 'legacy-host-breaking', requirement_hash: c.requirement_hash, head_sha: SHA,
+      type: 'breaking_change', question: '是否接受本提交的破坏性兼容变化？', options: ['批准当前提交', '拒绝当前提交'],
+      impact: '旧行为变化', reason: '当前评审判定为破坏性变更，需要明确选择兼容策略' });
+    e.store.saveReviewControl(e.task.id, c);
+    await tick(e); const t = e.store.getTaskById(e.task.id)!;
+    assert.equal(t.status, 'AWAITING_HUMAN');
+    assert.equal(e.store.getReviewControl(t.id)!.decisions.some(d => d.request_id === 'legacy-host-breaking'), false);
+  } finally { e.done(); }
+});
 test('v2 engine ERROR schedules retry and same-SHA ERROR does not strand a due retry', async () => {
   const e = boot({ failReview: true }); try {
     await tick(e); assert.equal(e.store.getTaskById(e.task.id)?.status, 'AWAITING_REVIEW');

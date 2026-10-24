@@ -12,7 +12,7 @@ export interface TaskActions {
 }
 
 export interface Attention {
-  kind: 'decision' | 'approval' | 'execution_error' | 'recovery' | 'advisory';
+  kind: 'decision' | 'approval' | 'execution_error' | 'recovery' | 'advisory' | 'hold';
   decisions?: DecisionRequest[];
   decision_version?: string;
   head_sha?: string;
@@ -46,7 +46,14 @@ export function taskAttention(task: TaskRow, last: RunRow | undefined, intake: I
   if (!['AWAITING_HUMAN', 'BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED'].includes(task.status)) return null;
   if (intake?.kind === 'deferred' || intake?.kind === 'skipped') return null;
   if (intake && (intake.kind === 'human' || intake.locked || intake.external_hold || intake.external_needs || intake.error || intake.pending)) {
-    return { kind: intake.pending || intake.error ? 'execution_error' : 'decision', summary: intake.pending ? '人工操作正在同步' : intake.error ? 'Issue 同步或恢复失败' : 'Issue 需要人工确认', detail: intake.error || intake.reason || 'Issue 存在人工门禁', next_step: intake.pending ? '等待同步完成；失败后可重试同步' : '核对原因后选择继续处理或解除锁定' };
+    if (intake.pending || intake.error) return { kind: 'execution_error', summary: intake.pending ? '人工操作正在同步' : 'Issue 同步或恢复失败', detail: intake.error || intake.reason || 'Issue 存在人工门禁', next_step: intake.pending ? '等待同步完成；失败后可重试同步' : '核对原因后选择继续处理或解除锁定' };
+    if (intake.locked || intake.external_hold) {
+      const hold = intake.external_hold
+        ? { summary: 'Issue 已被 agent-human-hold 锁定', detail: 'GitHub 标签 agent-human-hold（外部人工门禁）' }
+        : { summary: 'Issue 已本地人工锁定', detail: '本地人工锁定，未派发' };
+      return { kind: 'hold', ...hold, next_step: '在 GitHub 摘除标签，或在看板选择继续处理/解除锁定' };
+    }
+    return { kind: 'decision', summary: intake.external_needs ? 'Issue 被标记为需要人工' : 'Issue 已判定需要人工', detail: intake.external_needs ? 'GitHub 标签 agent-needs-human（外部人工门禁）' : intake.reason || '人工分流结论：需要人工处理', next_step: '核对原因后选择继续处理或解除锁定' };
   }
   const reason = last && (last.phase === task.status || task.source === 'pr' && task.status === 'AWAITING_HUMAN' && last.kind === 'review' && last.phase === 'COMPLETED') ? last.reason ?? '' : '';
   const detail = [reason, reviewSummary].filter(Boolean).join('\n');
@@ -56,6 +63,10 @@ export function taskAttention(task: TaskRow, last: RunRow | undefined, intake: I
   if (/checks infra:/.test(reason)) return { kind: 'execution_error', summary: '检查环境异常', detail, next_step: '修复依赖或执行环境后重试' };
   if (/checks failed|checks did not pass/.test(reason)) return { kind: 'execution_error', summary: '自动检查未通过', detail, next_step: '查看检查日志并继续修复' };
   if (/PR closed|PR already closed/.test(reason)) return { kind: 'execution_error', summary: '关联 PR 已关闭', detail, next_step: '确认仍需处理后，在 GitHub 重新打开 PR 再重试' };
+  if (/repair budget|fix budget|budget exhausted/.test(detail)) return { kind: 'execution_error', summary: '自动修复预算已耗尽', detail, next_step: '核对剩余缺陷后决定人工修复或重新评审' };
+  if (/publish|push failed|create pr/i.test(reason)) return { kind: 'execution_error', summary: '发布 PR 失败', detail, next_step: '检查远程仓库与凭据后重试' };
+  if (/fix run produced no new commits/.test(detail)) return { kind: 'execution_error', summary: '修复未产生新提交', detail, next_step: '查看修复日志，确认阻塞原因后重试或人工修复' };
+  if (/external PR review BLOCK/.test(detail)) return { kind: 'execution_error', summary: '独立 PR 评审未通过', detail, next_step: '在 GitHub 查看评审意见并修改 PR' };
   if (task.status === 'AWAITING_HUMAN') {
     if (task.source === 'pr') return { kind: 'advisory', summary: '独立 PR 已完成自动评审', detail, next_step: '在 GitHub 人工决定是否合并，或重新评审' };
     return { kind: 'approval', summary: /high risk|review requires human/.test(reason) ? '评审发现需要人工确认的风险' : '等待人工审阅或合并', detail, next_step: '核对评审意见后批准合并，或重新评审' };

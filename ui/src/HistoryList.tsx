@@ -29,7 +29,7 @@ export default function HistoryList({ tasks, selected, onSelect }: {
               <span className="mt-1 block break-all text-[11px] text-fg-muted md:hidden">{task.repo}</span>
             </button></td>
             <td className="hidden px-4 py-3 text-fg-muted md:table-cell">{task.repo}</td>
-            <td className={`whitespace-nowrap px-4 py-3 ${task.status === 'COMPLETED' ? 'text-ok' : 'text-fg-muted'}`}>{task.status === 'COMPLETED' ? '已完成' : task.status === 'CANCELED' ? '已取消' : '无需处理'}</td>
+            <td className={`whitespace-nowrap px-4 py-3 ${task.status === 'COMPLETED' ? 'text-ok' : 'text-fg-muted'}`}>{task.status === 'COMPLETED' ? '已完成' : task.status === 'CANCELED' ? '已取消' : task.attention?.kind === 'advisory' ? '评审完成' : '无需处理'}</td>
             <td className="hidden whitespace-nowrap px-4 py-3 text-fg-muted sm:table-cell">{fmtTime(task.updated_at)}</td>
           </tr>)}
           {rows.length === 0 && <tr><td colSpan={4} className="px-4 py-12 text-center text-fg-muted">暂无匹配的历史记录，试试调整项目、结果或搜索条件。</td></tr>}

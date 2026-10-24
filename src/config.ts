@@ -150,6 +150,10 @@ export function loadConfig(path: string): AppConfig {
   if (effort !== undefined && !efforts.includes(effort as string)) {
     fail(`agent.reasoning_effort: expected one of ${efforts.join('/')}`);
   }
+  const complexEffort = agent['complex_reasoning_effort'];
+  if (complexEffort !== undefined && !efforts.includes(complexEffort as string)) {
+    fail(`agent.complex_reasoning_effort: expected one of ${efforts.join('/')}`);
+  }
   const reviewEffort = agent['review_reasoning_effort'];
   if (reviewEffort !== undefined && !efforts.includes(reviewEffort as string)) {
     fail(`agent.review_reasoning_effort: expected one of ${efforts.join('/')}`);
@@ -216,6 +220,8 @@ export function loadConfig(path: string): AppConfig {
       provider: 'pi',
       model: asStr(agent['model'], 'agent.model'),
       reasoning_effort: effort as AppConfig['agent']['reasoning_effort'],
+      complex_model: agent['complex_model'] !== undefined ? asStr(agent['complex_model'], 'agent.complex_model') : undefined,
+      complex_reasoning_effort: complexEffort as AppConfig['agent']['complex_reasoning_effort'],
       review_model: agent['review_model'] !== undefined ? asStr(agent['review_model'], 'agent.review_model') : undefined,
       review_reasoning_effort: reviewEffort as AppConfig['agent']['review_reasoning_effort'],
       env_deny: envDeny as string[],
