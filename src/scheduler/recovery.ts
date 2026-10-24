@@ -5,6 +5,7 @@ import type { AppLog } from '../telemetry/logging.js';
 import type { Phase, RunRow, TaskRow } from '../types.js';
 import type { Engine } from './engine.js';
 import { approvalHash, type GitHubTracker } from '../tracker/github.js';
+import { retryReview } from '../verify/review-policy.js';
 import type { AppConfig } from '../types.js';
 
 export interface RecoveryDeps {
@@ -75,6 +76,24 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
     }
 
     if (run.kind === 'review') {
+      const control = store.getReviewControl(task.id);
+      if (control) {
+        store.tx(() => {
+          if (run.cancel_requested) {
+            store.endRun(run.run_id, 'CANCELED', 'explicit stop recovered');
+            store.setTaskStatus(task.id, 'CANCELED');
+          } else {
+            const next = retryReview(control);
+            store.saveReviewControl(task.id, next);
+            store.addCheck({ run_id: run.run_id, kind: 'review', command: 'agent (review v2)', exit_code: null,
+              verdict: 'ERROR', head_sha: run.head_sha, detail_json: JSON.stringify({ reason: 'service interrupted review', policy_version: 2 }) });
+            store.endRun(run.run_id, 'FAILED', 'review execution interrupted by service restart');
+            store.setTaskStatus(task.id, next.next_attempt_at ? 'AWAITING_REVIEW' : 'BLOCKED');
+          }
+        });
+        report.finalized.push(run.run_id);
+        continue;
+      }
       // A review run is resumable whenever it still pins a head sha: the
       // site is re-materialized, no workspace required. Anything else
       // (missing sha, unknown phase) cannot safely continue.
@@ -144,8 +163,23 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
             // auto-review project lands in AWAITING_REVIEW for dispatch; a
             // manual-review project parks straight on the human merge path.
             const afterPublish: Phase = project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN';
-            store.endRun(run.run_id, afterPublish, 'recovered: PR already exists');
-            store.setTaskStatus(task.id, afterPublish, { pr_url: existing.url, branch });
+            const control = store.getReviewControl(task.id);
+            let details: Awaited<ReturnType<GitHubTracker['getPrDetails']>> | undefined;
+            try { if (control) details = await deps.tracker.getPrDetails(project.repo, existing.number); }
+            catch (error) {
+              await markRecoveryRequired(deps, task, run, `cannot pin published review evidence: ${String(error)}`, true);
+              report.recoveryRequired.push({ run_id: run.run_id, why: 'publish evidence unavailable' });
+              break;
+            }
+            store.tx(() => {
+              if (control && details) {
+                const next = { ...control, head_sha: details.headSha, base_sha: details.baseSha ?? null, decisions: [], next_attempt_at: null };
+                delete next.assessment;
+                store.saveReviewControl(task.id, next);
+              }
+              store.endRun(run.run_id, afterPublish, 'recovered: PR already exists');
+              store.setTaskStatus(task.id, afterPublish, { pr_url: existing.url, branch, ...(control ? { approved_sha: null, approved_by: null } : {}) });
+            });
             report.finalized.push(run.run_id);
           } else {
             try { await deps.tracker.closePr(project.repo, existing.number); } catch { /* best effort */ }

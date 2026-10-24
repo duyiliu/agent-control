@@ -29,6 +29,7 @@ function fakeWorkspace(): GitWorkspace {
     ensureWorktree: async (i: { worktreePath: string }) => ({ path: i.worktreePath, created: true }),
     isDirty: async () => false,
     head: async () => 'head-sha',
+    refSha: async (_repo: string, ref: string) => ref,
     commitAll: async () => false,
     aheadCount: async () => 1,
     diffVsBase: async () => 'diff',

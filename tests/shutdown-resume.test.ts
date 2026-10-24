@@ -338,7 +338,7 @@ test('shutdown: a coder turn that THROWS under an explicit cancel still lands CA
 });
 
 for (const phase of ['VERIFYING', 'FIXING'] as const) {
-  test(`resume at ${phase}: consumed merge repair lands back in MERGING with human approval kept`, async () => {
+  test(`resume at ${phase}: consumed merge repair returns its new SHA for review`, async () => {
     const env = setup();
     try {
       env.tracker.issues.set(1, { ...ISSUE });
@@ -358,10 +358,10 @@ for (const phase of ['VERIFYING', 'FIXING'] as const) {
       const afterTask = env.store.getTaskById(task.id)!;
       assert.ok(!wsCalls.includes('resetHard'), 'resumed run must never resetHard');
       assert.ok(after.fix_count >= 1, 'fix_count preserved, never reset');
-      assert.equal(afterTask.status, 'MERGING', 'merge repair publish must land back in MERGING');
-      assert.equal(afterTask.approved_by, 'human', 'human approval source preserved');
-      assert.equal(afterTask.approved_sha, 'head-new');
-      assert.equal(after.phase, 'COMPLETED');
+      assert.equal(afterTask.status, 'AWAITING_REVIEW', 'a repaired new head must be reviewed');
+      assert.equal(afterTask.approved_by, null, 'old human approval is cleared');
+      assert.equal(afterTask.approved_sha, null);
+      assert.equal(after.phase, 'AWAITING_REVIEW');
     } finally { env.done(); }
   });
 }
@@ -497,7 +497,7 @@ test('cancel+throw releases the agent-running claim via the normal finish path',
   } finally { env.done(); }
 });
 
-test('shutdown pauses mid-driveMerge: no markPrReady/merge after getPrDetails gate', async () => {
+test('legacy AI merge approval is parked instead of marking Ready or merging', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(1, { ...ISSUE });
@@ -509,25 +509,13 @@ test('shutdown pauses mid-driveMerge: no markPrReady/merge after getPrDetails ga
     const origDetails = tracker.getPrDetails.bind(env.tracker as never);
     const ready: number[] = [];
     tracker.markPrReady = async (_r, n) => { ready.push(n); };
-    let rel!: () => void;
-    const gate = new Promise<void>((r) => (rel = r));
-    let entered!: () => void;
-    const enteredP = new Promise<void>((r) => (entered = r));
-    (tracker as unknown as { getPrDetails: unknown }).getPrDetails = async (repo: string, n: number) => {
-      entered();
-      await gate;
-      return (origDetails as (r: string, n: number) => Promise<unknown>)(repo, n);
-    };
     const engine = makeEngine(env);
     const tickP = engine.tick();
-    await enteredP;
-    const shutP = engine.shutdown(5_000);
-    rel();
     await tickP;
-    assert.equal(await shutP, true);
-    assert.equal(ready.length, 0, 'no markPrReady after shutdown');
-    assert.equal(env.tracker.merged.length, 0, 'no merge after shutdown');
-    assert.equal(env.store.getTaskById(task.id)!.status, 'MERGING');
+    assert.equal(ready.length, 0, 'an old AI approval cannot make a PR Ready');
+    assert.equal(env.tracker.merged.length, 0, 'an old AI approval cannot merge');
+    assert.equal(env.store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
+    assert.equal(env.store.getTaskById(task.id)!.approved_by, null);
   } finally { env.done(); }
 });
 
@@ -536,6 +524,7 @@ test('shutdown pauses mid-human-approval: agent-merge label not consumed', async
   try {
     env.tracker.issues.set(1, { ...ISSUE });
     const { task } = env.store.upsertDiscovered({ repo: 'me/sandbox', issue_number: 1, issue_title: 't', issue_url: 'u' });
+    env.config.projects[0]!.review_mode = 'manual';
     env.store.setTaskStatus(task.id, 'AWAITING_HUMAN', { pr_url: 'https://x/pull/9' });
     env.tracker.prs.set('agent/issue-1', { number: 9, url: 'https://x/pull/9', state: 'OPEN', isDraft: false });
     env.tracker.prLabels.set(9, ['agent-merge']);

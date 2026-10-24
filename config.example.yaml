@@ -14,6 +14,10 @@ server:
     port: 8787
     # token: <random-secret>        # required when exposed beyond loopback; gates all routes
 
+review_policy:
+  version: 1                       # 2 显式启用新策略；历史任务仅在人工重新评审后升级
+  # timeout_minutes: 10             # v2 整轮预算，包含分段与格式纠正，受 max_task_minutes 上限约束
+
 projects:
   - repo: your-org/your-sandbox-repo
     local_repo: C:/path/to/your-sandbox-repo
@@ -22,6 +26,7 @@ projects:
     branch_prefix: agent/issue-
     review_mode: auto                # auto（默认）：每个 PR head 自动派独立评审 run；manual：不派评审，PR 停在 AWAITING_HUMAN 等人审人合
     pr_review: auto                  # auto（默认）：没有 issue 的 PR 也自动评审；manual：只评审打了 agent-review 标签的 PR
+    # human_review_paths: [src/auth/**] # v2 显式保护路径；即使是生成物/文档也必须逐项授权
     # issue_intake: all                # 全部开放 Issue 默认排队；同一 Agent 判断并处理
     # 默认 labeled：仍需 ready_label；旧 issue_triage.enabled=true 兼容为 all
     checks:
@@ -50,13 +55,13 @@ agent:
 
 approvals:
   auto_merge:
-    enabled: false                   # 低危 PASS 自动合并（仅 review_mode: auto 的项目）；关闭则一律转人工处理
+    enabled: false                   # 兼容旧配置；AI PASS 始终交给人工审查，不触发自动合并
     max_files: 10                    # 只统计源码文件：生成物、文档、测试不计入
     max_lines: 400                   # 只统计源码增删行：生成物、文档、测试不计入
     # 生成物与文档不参与风险统计，也不进入评审 diff（避免大 diff 直接把评审短路成人工）
     generated_paths: [dist/**, "**/dist/**", "*.generated.*", "*.min.*", "*.map"]
     doc_paths: [docs/**, "**/*.md"]
-    # 合并前重建一次并比对：生成物与提交不一致则阻止自动合并（排除生成物评审后的对冲）
+    # 人工明确批准合并前重建并比对：生成物与提交不一致则阻止合并
     # 项目级 projects[].verify_build / verify_bootstrap 优先，这里配的是全局兜底
     # verify_build:
     #   argv: [npm, run, build]

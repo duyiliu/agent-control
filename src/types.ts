@@ -53,6 +53,7 @@ export interface CheckSpec {
 }
 
 export interface ProjectConfig {
+  human_review_paths?: string[];
   issue_intake?: 'all' | 'labeled';
   issue_triage?: { enabled: boolean; timeout_seconds: number };
   repo: string;
@@ -84,6 +85,7 @@ export interface ProjectConfig {
 }
 
 export interface AppConfig {
+  review_policy?: { version: 1 | 2; timeout_minutes?: number };
   server: {
     poll_interval_seconds: number;
     max_concurrent: number;
@@ -117,7 +119,7 @@ export interface AppConfig {
     pi_path?: string;
   };
   approvals: {
-    /** Host-side auto-merge for low-risk PRs that pass review. */
+    /** Legacy compatibility and guarded-build settings. AI review never authorizes a merge. */
     auto_merge: {
       enabled: boolean;
       /** Source files only — generated output, docs and tests are excluded. */
@@ -189,6 +191,7 @@ export interface PendingFix {
 }
 
 export interface TaskRow {
+  review_control_json: string | null;
   id: number;
   repo: string;
   /** GitHub numbers issues and PRs from one sequence, so a PR-only task
@@ -207,9 +210,9 @@ export interface TaskRow {
   fix_rounds: number;
   pending_fix: string | null;
   merge_attempts: number;
-  /** The exact sha cleared to land; set when the task enters MERGING. */
+  /** The exact SHA covered by explicit human merge approval. */
   approved_sha: string | null;
-  /** Who cleared it: 'review' (PASS+low) or 'human' (agent-merge label). */
+  /** 'review' remains for older tasks; new merges require 'human'. */
   approved_by: 'review' | 'human' | null;
   updated_at: string;
   created_at: string;
@@ -240,6 +243,7 @@ export interface RunRow {
 }
 
 export interface CheckResultRow {
+  review_detail_json: string | null;
   id: number;
   run_id: string;
   kind: string;
@@ -257,8 +261,56 @@ export type ReviewVerdict = 'PASS' | 'BLOCK' | 'HUMAN_REVIEW_REQUIRED';
 export type ReviewRisk = 'low' | 'high';
 
 export interface ReviewResult {
+  assessment?: ReviewAssessment;
   verdict: ReviewVerdict;
   risk: ReviewRisk;
   summary: string;
   findings: string[];
+}
+
+export interface DecisionRequest {
+  type: 'product_choice' | 'breaking_change' | 'sensitive_authorization' | 'configured_hold';
+  question: string;
+  options: string[];
+  impact: string;
+  reason: string;
+  file?: string;
+  line?: number;
+  request_id?: string;
+  head_sha?: string;
+  requirement_hash?: string;
+}
+
+export interface DecisionResolution {
+  request_id: string;
+  requirement_hash: string;
+  head_sha: string;
+  selected_option: string;
+  authorization: string;
+  actor: string;
+  created_at: string;
+  scope?: string[];
+}
+
+export interface ReviewAssessment {
+  protocol_version: 2;
+  summary: string;
+  findings: { file: string; line: number; trigger: string; impact: string; verification: string }[];
+  verification_requests: { claim: string; scenario: string; expected: string }[];
+  decision_requests: DecisionRequest[];
+  compatibility: { kind: 'unchanged' | 'additive' | 'breaking' | 'unknown'; evidence: string[] };
+}
+
+export interface ReviewControl {
+  policy_version: 2;
+  requirement_hash: string;
+  rounds: number;
+  infra_attempts: number;
+  fix_attempts: number;
+  next_attempt_at: string | null;
+  head_sha: string | null;
+  base_sha: string | null;
+  assessment?: ReviewAssessment;
+  decisions: DecisionRequest[];
+  resolutions: DecisionResolution[];
 }

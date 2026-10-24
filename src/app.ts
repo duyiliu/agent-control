@@ -129,6 +129,9 @@ export async function startService(app: App): Promise<void> {
   await lock.acquire();
   const appLog = new AppLog(config.server.logs_dir);
   appLog.event('service_start', { pid: process.pid });
+  appLog.event('review_policy', { version: config.review_policy?.version ?? 1,
+    size_thresholds: config.review_policy?.version === 2 ? 'planning_only' : 'human_gate',
+    legacy_tasks: 'preserved_until_explicit_rereview' });
 
   // UI failure (e.g. port taken) must never take the scheduler down.
   let ui: UiServer | null = null;

@@ -5,7 +5,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppLog } from '../telemetry/logging.js';
-import { approveMergeTask, OpsError, rereviewTask, retryTask, stopTask } from '../ops.js';
+import { approveMergeTask, resolveReviewDecision, OpsError, rereviewTask, retryTask, stopTask } from '../ops.js';
 import type { TriageAction } from '../triage/service.js';
 import {
   addProjectPayload,
@@ -273,6 +273,20 @@ async function handle(deps: UiDeps, req: IncomingMessage, res: ServerResponse): 
       url.searchParams.get('offset'),
     );
     json(res, out.status, out.body);
+    return;
+  }
+
+  const decision = /^\/api\/tasks\/(\d+)\/decisions\/([A-Za-z0-9_-]+)\/resolve$/.exec(path);
+  if (method === 'POST' && decision) {
+    const task = deps.store.getTaskById(Number(decision[1]));
+    if (!task) { json(res, 404, { error: 'no such task' }); return; }
+    try {
+      const body = await readBody(req) as Record<string, unknown> | null;
+      const keys = ['expected_updated_at', 'decision_version', 'head_sha', 'selected_option', 'authorization'] as const;
+      if (!body || keys.some(k => typeof body[k] !== 'string' || !(body[k] as string).trim())) throw new OpsError('决策回答缺少版本、提交、选项或授权范围');
+      const params = Object.fromEntries(keys.map(k => [k, body[k]])) as unknown as import('../ops.js').ResolveDecisionParams;
+      json(res, 200, { message: await resolveReviewDecision(deps.store, deps.config, deps.tracker, task, decision[2]!, params) });
+    } catch (err) { json(res, err instanceof OpsError ? 400 : 500, { error: err instanceof Error ? err.message : String(err) }); }
     return;
   }
 

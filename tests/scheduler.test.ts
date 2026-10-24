@@ -4,11 +4,12 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Engine } from '../src/scheduler/engine.js';
+import { Engine, type EngineDeps } from '../src/scheduler/engine.js';
 import { GitWorkspace } from '../src/workspace/git.js';
 import type { GitHubTracker } from '../src/tracker/github.js';
 import type { AgentCallResult } from '../src/runners/types.js';
 import type { CoderSession, CoderTurn } from '../src/runners/session.js';
+import type { CoderSessionOpts } from '../src/runners/session.js';
 import { runChecks, type ChecksSummary } from '../src/verify/checks.js';
 import { rereviewTask, stopTask } from '../src/ops.js';
 import type { AppConfig, CheckSpec, ReviewResult } from '../src/types.js';
@@ -26,6 +27,7 @@ function fakeWorkspace(calls?: string[]): GitWorkspace {
     isDirty: async () => false,
     dirtyUnder: async () => '',
     head: async (p?: string) => siteHeads.get(p ?? '') ?? 'head-sha',
+    refSha: async (_repo: string, ref: string) => ref,
     commitAll: async () => false,
     aheadCount: async () => 1,
     diffVsBase: async () => 'diff',
@@ -61,8 +63,8 @@ function fakeCoderSession(get: () => Promise<AgentCallResult>): CoderSession {
   };
 }
 
-function checksOk(): ChecksSummary {
-  return { ok: true, outcomes: [{ spec: { argv: ['x'] }, command: 'x', exitCode: 0, timedOut: false, tail: '', logPath: 'l' }], skipped: [], failureEvidence: '' };
+function checksOk(specs: CheckSpec[] = [{ argv: ['x'] }]): ChecksSummary {
+  return { ok: true, outcomes: specs.map(spec => ({ spec, command: spec.argv.join(' '), exitCode: 0, timedOut: false, tail: 'tests passed', logPath: 'l' })), skipped: [], failureEvidence: '' };
 }
 
 function checksFail(): ChecksSummary {
@@ -105,6 +107,7 @@ function makeEngine(env: Env, over: {
   runChecksFn?: typeof runChecks;
   review?: ReviewFn;
   workspace?: GitWorkspace;
+  openCoderSessionFn?: EngineDeps['openCoderSessionFn'];
 } = {}) {
   const store = makeStore(env.dir);
   env.stores.push(store);
@@ -115,8 +118,8 @@ function makeEngine(env: Env, over: {
     workspace: over.workspace ?? fakeWorkspace(),
     appLog: nullLog,
     installDir: env.dir,
-    openCoderSessionFn: () => fakeCoderSession(over.coder ?? (async () => okCoder())),
-    runChecksFn: over.runChecksFn ?? (over.checks ? async () => over.checks!() : async () => checksOk()),
+    openCoderSessionFn: over.openCoderSessionFn ?? (() => fakeCoderSession(over.coder ?? (async () => okCoder()))),
+    runChecksFn: over.runChecksFn ?? (over.checks ? async () => over.checks!() : async (specs) => checksOk(specs)),
     runReviewFn: (over.review ?? reviewPass) as never,
     claimArbitrationMs: 0,
   });
@@ -126,6 +129,16 @@ function makeEngine(env: Env, over: {
 async function tickAndDrain(engine: Engine) {
   await engine.tick();
   for (let i = 0; i < 300 && engine.activeCount() > 0; i++) await sleep(20);
+}
+
+function addHumanMergeApproval(env: Env, prUrl: string) {
+  const prNumber = Number(prUrl.match(/\/pull\/(\d+)/)?.[1]);
+  env.tracker.prLabels.set(prNumber, ['agent-merge']);
+}
+
+function prDraft(env: Env, prUrl: string): boolean | undefined {
+  const prNumber = Number(prUrl.match(/\/pull\/(\d+)/)?.[1]);
+  return [...env.tracker.prs.values()].find(pr => pr.number === prNumber)?.isDraft;
 }
 
 const ISSUE = { title: 'Fix parser', body: 'Fix the parsing bug.\n\nAC: test passes', labels: ['agent-ready'], state: 'OPEN', url: 'https://x/1' };
@@ -224,6 +237,8 @@ test('stranded AWAITING_REVIEW parks for a human instead of showing forever', as
       pr_url: 'https://github.com/me/sandbox/pull/50',
     });
     const run = store.claimRun(task.id, { kind: 'review', headSha: 'head-sha' });
+    store.transition(run.run_id, 'CLAIMED', 'REVIEWING');
+    store.transition(run.run_id, 'REVIEWING', 'REVIEWING', { kind: 'review_started', head_sha: 'head-sha', base_sha: 'base-sha' });
     store.endRun(run.run_id, 'BLOCKED', 'block');
     store.addCheck({
       run_id: run.run_id, kind: 'review', command: 'agent (review)',
@@ -716,6 +731,34 @@ test('runs.pid always names the long-lived coder session, not a finished check',
   } finally { env.done(); }
 });
 
+test('Review BLOCK repair run reopens the first code run session history', async () => {
+  const env = setup();
+  try {
+    const issueNumber = 92;
+    env.tracker.issues.set(issueNumber, { ...ISSUE });
+    const store = makeStore(env.dir); env.stores.push(store);
+    const { task } = store.upsertDiscovered({ repo: 'me/sandbox', issue_number: issueNumber, issue_title: ISSUE.title, issue_url: ISSUE.url });
+    const first = store.claimRun(task.id);
+    const worktree = join(env.config.server.worktree_root, 'me_sandbox', `issue-${issueNumber}`);
+    store.updateRunFields(first.run_id, { workspace: worktree, branch: `agent/issue-${issueNumber}`, head_sha: 'reviewed-sha' });
+    store.endRun(first.run_id, 'COMPLETED');
+    store.setTaskStatus(task.id, 'DISCOVERED', { branch: `agent/issue-${issueNumber}`, pr_url: `https://github.com/x/y/pull/${issueNumber}`,
+      pending_fix: JSON.stringify({ head_sha: 'reviewed-sha', title: 'Review BLOCK', summary: 'fix concrete regression', findings: ['src/x.js: rejects are swallowed'] }) });
+    env.tracker.prs.set(`agent/issue-${issueNumber}`, { number: issueNumber, url: `https://github.com/x/y/pull/${issueNumber}`, state: 'OPEN', isDraft: true });
+    let sessionOpts: CoderSessionOpts | undefined;
+    const { engine } = makeEngine(env, { openCoderSessionFn: (opts) => {
+      sessionOpts = opts;
+      return fakeCoderSession(async () => okCoder());
+    } });
+    await tickAndDrain(engine);
+    assert.equal(sessionOpts?.sessionId, first.run_id);
+    assert.equal(sessionOpts?.sessionDir, join(env.config.server.logs_dir, 'artifacts', first.run_id, 'pi-session'));
+    assert.equal(sessionOpts?.workdir, worktree);
+    assert.equal(store.runsForTask(task.id).filter((r) => r.kind === 'code').length, 2);
+    assert.equal(store.runsForTask(task.id).at(-1)?.phase, 'AWAITING_REVIEW');
+  } finally { env.done(); }
+});
+
 test('checks infrastructure failure never triggers a code repair', async () => {
   const env = setup();
   try {
@@ -1029,19 +1072,18 @@ test('AC14: fix run that produces no new commits is a dead end, not silent', asy
   } finally { env.done(); }
 });
 
-test('AC04: review PASS + low risk + auto_merge enabled merges and completes', async () => {
+test('AC04: review PASS marks the PR Ready and leaves the merge to a human', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(53, { ...ISSUE });
     env.config.approvals.auto_merge.enabled = true;
     const { store, engine } = makeEngine(env);
     await tickAndDrain(engine); // code run
-    await tickAndDrain(engine); // review run → PASS → task MERGING
-    assert.equal(store.getTask('me/sandbox', 53)!.status, 'MERGING');
-    await tickAndDrain(engine); // merge sweep lands the PR
+    await tickAndDrain(engine); // review run → PASS → Ready for human review
     const task = store.getTask('me/sandbox', 53)!;
-    assert.equal(task.status, 'COMPLETED');
-    assert.equal(env.tracker.merged.length, 1);
+    assert.equal(task.status, 'AWAITING_HUMAN');
+    assert.equal(prDraft(env, task.pr_url!), false);
+    assert.equal(env.tracker.merged.length, 0);
   } finally { env.done(); }
 });
 
@@ -1098,7 +1140,7 @@ const DIFF_NEW_TEST = [
   '+test',
 ].join('\n');
 
-test('risk: a newly added test file does not block auto-merge', async () => {
+test('a passing review hands the PR to a human even when auto_merge is configured', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(60, { ...ISSUE });
@@ -1108,13 +1150,13 @@ test('risk: a newly added test file does not block auto-merge', async () => {
     const { store, engine } = makeEngine(env, { workspace: ws });
     await tickAndDrain(engine); // code run → publish
     await tickAndDrain(engine); // review PASS low — new tests are not weakened coverage
-    await tickAndDrain(engine); // merge sweep
-    assert.equal(store.getTask('me/sandbox', 60)!.status, 'COMPLETED');
-    assert.equal(env.tracker.merged.length, 1);
+    assert.equal(store.getTask('me/sandbox', 60)!.status, 'AWAITING_HUMAN');
+    assert.equal(env.tracker.merged.length, 0);
+    assert.equal(prDraft(env, store.getTask('me/sandbox', 60)!.pr_url!), false);
   } finally { env.done(); }
 });
 
-test('risk: weakened test coverage keeps the human merge gate', async () => {
+test('a passing review does not treat test diff heuristics as merge approval', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(61, { ...ISSUE });
@@ -1140,11 +1182,11 @@ test('risk: weakened test coverage keeps the human merge gate', async () => {
     await tickAndDrain(engine);
     assert.equal(store.getTask('me/sandbox', 61)!.status, 'AWAITING_HUMAN');
     assert.equal(env.tracker.merged.length, 0);
-    assert.ok(env.tracker.labelsAdded.some(([n, l]) => n === 61 && l === 'agent-high-risk'));
+    assert.equal(env.tracker.labelsAdded.some(([n, l]) => n === 61 && l === 'agent-high-risk'), false);
   } finally { env.done(); }
 });
 
-test('risk: an edited test file is not weakened coverage and still auto-merges', async () => {
+test('a passing review with edited tests still waits for explicit human merge approval', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(66, { ...ISSUE });
@@ -1167,9 +1209,8 @@ test('risk: an edited test file is not weakened coverage and still auto-merges',
     const { store, engine } = makeEngine(env, { workspace: ws });
     await tickAndDrain(engine);
     await tickAndDrain(engine);
-    await tickAndDrain(engine);
-    assert.equal(store.getTask('me/sandbox', 66)!.status, 'COMPLETED');
-    assert.equal(env.tracker.merged.length, 1);
+    assert.equal(store.getTask('me/sandbox', 66)!.status, 'AWAITING_HUMAN');
+    assert.equal(env.tracker.merged.length, 0);
   } finally { env.done(); }
 });
 
@@ -1184,9 +1225,11 @@ test('verify_build: generated output drifting from source blocks the merge', asy
     await tickAndDrain(engine); // code run → publish
     await tickAndDrain(engine); // review PASS → MERGING
     const task = store.getTask('me/sandbox', 67)!;
+    addHumanMergeApproval(env, task.pr_url!);
     mkdirSync(store.lastCodeWorkspace(task.id)!, { recursive: true });
     env.config.approvals.auto_merge.verify_build = { argv: ['npm', 'run', 'build'] };
     ws.dirtyUnder = async () => ' M dist/bundle.js';
+    await tickAndDrain(engine); // explicit human approval → MERGING
     await tickAndDrain(engine); // sweep: drift → human
     assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
     assert.equal(env.tracker.merged.length, 0);
@@ -1214,6 +1257,8 @@ test('verify_build: missing code worktree falls back to a detached verify site',
     // rebuild the approved sha on a detached site, bootstrapping deps first.
     env.config.approvals.auto_merge.verify_bootstrap = { argv: ['npm', 'ci'] };
     env.config.approvals.auto_merge.verify_build = { argv: ['npm', 'run', 'build'] };
+    addHumanMergeApproval(env, task.pr_url!);
+    await tickAndDrain(engine);
     await tickAndDrain(engine);
     assert.equal(store.getTaskById(task.id)!.status, 'COMPLETED');
     assert.equal(env.tracker.merged.length, 1);
@@ -1234,7 +1279,9 @@ test('verify_build: detached materialization failure fails closed to a human', a
     await tickAndDrain(engine); // code run → publish
     await tickAndDrain(engine); // review PASS → MERGING
     const task = store.getTask('me/sandbox', 70)!;
+    addHumanMergeApproval(env, task.pr_url!);
     env.config.approvals.auto_merge.verify_build = { argv: ['npm', 'run', 'build'] };
+    await tickAndDrain(engine); // explicit human approval → MERGING
     await tickAndDrain(engine); // sweep: cannot materialize a site → human
     assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
     assert.equal(env.tracker.merged.length, 0);
@@ -1252,8 +1299,10 @@ test('verify_build: a reproducible build still merges', async () => {
     await tickAndDrain(engine);
     await tickAndDrain(engine);
     const task = store.getTask('me/sandbox', 68)!;
+    addHumanMergeApproval(env, task.pr_url!);
     mkdirSync(store.lastCodeWorkspace(task.id)!, { recursive: true });
     env.config.approvals.auto_merge.verify_build = { argv: ['npm', 'run', 'build'] };
+    await tickAndDrain(engine);
     await tickAndDrain(engine);
     assert.equal(store.getTaskById(task.id)!.status, 'COMPLETED');
     assert.equal(env.tracker.merged.length, 1);
@@ -1270,7 +1319,7 @@ test('dispatch clears a stale agent-blocked label on claim', async () => {
   } finally { env.done(); }
 });
 
-test('merge conflict after PASS spawns a fix run via pending_fix', async () => {
+test('merge conflict after explicit human merge approval spawns a fix run via pending_fix', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(63, { ...ISSUE });
@@ -1282,11 +1331,13 @@ test('merge conflict after PASS spawns a fix run via pending_fix', async () => {
     const prNum = Number(task.pr_url!.match(/pull\/(\d+)/)![1]);
     env.tracker.mergeErrors.set(prNum, new Error('gh pr merge failed: the merge commit cannot be cleanly created'));
     env.tracker.mergeable.set(prNum, 'CONFLICTING');
-    await tickAndDrain(engine); // review PASS → MERGING
+    addHumanMergeApproval(env, task.pr_url!);
+    await tickAndDrain(engine); // human approves merge → MERGING
+    await tickAndDrain(engine); // sweep sees CONFLICTING and queues the repair
     // Same tick: the sweep sees CONFLICTING → DISCOVERED + pending_fix, then
     // dispatch() claims the fix run — it ends BLOCKED because the fake
     // workspace head never moves off the reviewed sha.
-    await tickAndDrain(engine);
+    await tickAndDrain(engine); // dispatch the repair; fake worktree produces no new commit
     const t2 = store.getTaskById(task.id)!;
     assert.equal(t2.status, 'BLOCKED');
     assert.equal(t2.fix_rounds, 1);
@@ -1321,7 +1372,9 @@ test('merge refusal without conflicts retries, then parks for a human at the cap
     const prNum = Number(task.pr_url!.match(/pull\/(\d+)/)![1]);
     env.tracker.mergeErrors.set(prNum, new Error('gh pr merge failed: permission denied'));
     env.tracker.mergeable.set(prNum, 'MERGEABLE');
-    await tickAndDrain(engine); // review PASS → MERGING
+    addHumanMergeApproval(env, task.pr_url!);
+    await tickAndDrain(engine); // review PASS → AWAITING_HUMAN
+    await tickAndDrain(engine); // explicit human approval → MERGING
     await tickAndDrain(engine); // merge attempt 1 fails — still MERGING
     const mid = store.getTaskById(task.id)!;
     assert.equal(mid.status, 'MERGING');
@@ -1349,8 +1402,10 @@ test('merge conflict with fix budget exhausted lands on a human', async () => {
     const prNum = Number(task.pr_url!.match(/pull\/(\d+)/)![1]);
     env.tracker.mergeErrors.set(prNum, new Error('gh pr merge failed: not mergeable'));
     env.tracker.mergeable.set(prNum, 'CONFLICTING');
-    await tickAndDrain(engine); // review PASS → MERGING
-    await tickAndDrain(engine); // sweep: CONFLICTING but fix budget gone → human
+    addHumanMergeApproval(env, task.pr_url!);
+    await tickAndDrain(engine); // review PASS → AWAITING_HUMAN
+    await tickAndDrain(engine); // explicit human approval → MERGING
+    await tickAndDrain(engine); // conflict budget exhausted → human
     const t2 = store.getTaskById(task.id)!;
     assert.equal(t2.status, 'AWAITING_HUMAN');
     assert.equal(t2.pending_fix, null);
@@ -1439,7 +1494,7 @@ test('manual review mode parks the PR in Human Review and spends no review run',
   } finally { env.done(); }
 });
 
-test('switching a project to manual review stops an in-flight MERGING task', async () => {
+test('switching a project to manual review after AI PASS keeps the PR with a human', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(75, { ...ISSUE });
@@ -1447,8 +1502,8 @@ test('switching a project to manual review stops an in-flight MERGING task', asy
     const { store, engine } = makeEngine(env);
     await tickAndDrain(engine);
     const task = store.getTask('me/sandbox', 75)!;
-    await tickAndDrain(engine); // review PASS → MERGING
-    assert.equal(store.getTaskById(task.id)!.status, 'MERGING');
+    await tickAndDrain(engine); // review PASS → Ready for human review
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
     env.config.projects[0]!.review_mode = 'manual';
     await tickAndDrain(engine); // opt-out wins over the in-flight merge
     assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
@@ -1491,6 +1546,136 @@ test('a moved head is re-queued for review and the stale approval is dropped', a
     assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
     assert.equal(env.tracker.merged.length, 0);
     assert.ok(!(env.tracker.prLabels.get(prNum) ?? []).includes('agent-merge'));
+    assert.equal(prDraft(env, task.pr_url!), true);
+  } finally { env.done(); }
+});
+
+test('a moved base invalidates a same-head verdict and triggers a fresh review', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(83, { ...ISSUE });
+    let baseSha = 'base-one'; let reviews = 0;
+    const diffBases: string[] = [];
+    const workspace = fakeWorkspace();
+    workspace.diffVsBase = async (_site: string, base: string) => { diffBases.push(base); return 'diff'; };
+    const tracker = env.tracker as unknown as GitHubTracker;
+    const getDetails = tracker.getPrDetails.bind(tracker);
+    tracker.getPrDetails = async (repo: string, n: number) => ({ ...await getDetails(repo, n), baseSha });
+    const { store, engine } = makeEngine(env, { review: async () => {
+      reviews++;
+      return { result: { verdict: 'PASS', risk: 'low', summary: `review ${reviews}`, findings: [] }, logPath: 'r' };
+    }, workspace });
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 83)!;
+    await tickAndDrain(engine);
+    assert.equal(reviews, 1);
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
+    baseSha = 'base-two';
+    await tickAndDrain(engine);
+    assert.equal(reviews, 2);
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
+    assert.equal(prDraft(env, task.pr_url!), false);
+    assert.equal(env.tracker.merged.length, 0);
+    assert.deepEqual(diffBases, ['base-one', 'base-two']);
+    assert.ok(store.runsForTask(task.id).some(run => run.kind === 'review'
+      && store.eventsForRun(run.run_id).some(event => event.detail_json?.includes('"base_sha":"base-two"'))));
+  } finally { env.done(); }
+});
+
+test('review without a PR base SHA stops for a human without invoking the reviewer', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(87, { ...ISSUE });
+    const tracker = env.tracker as unknown as GitHubTracker;
+    const getDetails = tracker.getPrDetails.bind(tracker);
+    tracker.getPrDetails = async (repo: string, n: number) => {
+      const { baseSha: _baseSha, ...details } = await getDetails(repo, n);
+      return details;
+    };
+    let reviewCalls = 0;
+    const { store, engine } = makeEngine(env, { review: async () => {
+      reviewCalls++;
+      return { result: { verdict: 'PASS', risk: 'low', summary: 'unsafe', findings: [] }, logPath: 'r' };
+    } });
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 87)!;
+    await tickAndDrain(engine);
+
+    assert.equal(reviewCalls, 0);
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
+    assert.equal(prDraft(env, task.pr_url!), true);
+    assert.match(store.runsForTask(task.id).at(-1)!.reason ?? '', /base SHA is unavailable/);
+  } finally { env.done(); }
+});
+
+test('manual mode keeps a base-moved PR with a human and voids the old merge label', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(84, { ...ISSUE });
+    const { store, engine } = makeEngine(env);
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 84)!;
+    await tickAndDrain(engine);
+    const prNum = Number(task.pr_url!.match(/pull\/(\d+)/)![1]);
+    env.config.projects[0]!.review_mode = 'manual';
+    env.tracker.baseSha = 'base-moved';
+    env.tracker.prLabels.set(prNum, ['agent-merge']);
+
+    await tickAndDrain(engine);
+
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
+    assert.equal(prDraft(env, task.pr_url!), false);
+    assert.ok(!(env.tracker.prLabels.get(prNum) ?? []).includes('agent-merge'));
+    assert.equal(store.runsForTask(task.id).filter(run => run.kind === 'review').length, 1);
+    assert.equal(env.tracker.merged.length, 0);
+  } finally { env.done(); }
+});
+
+test('cancellation while publishing the handoff summary restores Draft and cancels review', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(85, { ...ISSUE });
+    let commentStarted = false;
+    let releaseComment!: () => void;
+    const tracker = env.tracker as unknown as GitHubTracker;
+    tracker.commentPr = async () => {
+      commentStarted = true;
+      await new Promise<void>(resolve => { releaseComment = resolve; });
+    };
+    const { store, engine } = makeEngine(env);
+    await tickAndDrain(engine);
+    await engine.tick();
+    for (let i = 0; i < 300 && !commentStarted; i++) await sleep(20);
+    assert.equal(commentStarted, true);
+    const task = store.getTask('me/sandbox', 85)!;
+    stopTask(store, task);
+    releaseComment();
+    for (let i = 0; i < 300 && engine.activeCount() > 0; i++) await sleep(20);
+
+    assert.equal(prDraft(env, task.pr_url!), true);
+    assert.equal(store.getTaskById(task.id)!.status, 'CANCELED');
+    assert.equal(store.runsForTask(task.id).at(-1)!.phase, 'CANCELED');
+  } finally { env.done(); }
+});
+
+test('handoff summary failure returns the PR to Draft and does not report success', async () => {
+  const env = setup();
+  try {
+    env.tracker.issues.set(86, { ...ISSUE });
+    const tracker = env.tracker as unknown as GitHubTracker;
+    tracker.commentPr = async () => {
+      tracker.getPrDetails = async () => { throw new Error('PR reread unavailable'); };
+      throw new Error('comment endpoint unavailable');
+    };
+    const { store, engine } = makeEngine(env);
+    await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 86)!;
+    await tickAndDrain(engine);
+
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
+    assert.equal(prDraft(env, task.pr_url!), true);
+    assert.match(store.runsForTask(task.id).at(-1)!.reason ?? '', /comment endpoint unavailable/);
+    assert.ok(!store.eventsForRun(store.runsForTask(task.id).at(-1)!.run_id).some(event => event.detail_json?.includes('human_handoff_ready')));
   } finally { env.done(); }
 });
 
@@ -1522,7 +1707,9 @@ test('MERGING retries a transient merge failure and lands on the next tick', asy
     await tickAndDrain(engine);
     const task = store.getTask('me/sandbox', 70)!;
     const prNum = Number(task.pr_url!.match(/pull\/(\d+)/)![1]);
-    await tickAndDrain(engine); // review PASS → MERGING
+    await tickAndDrain(engine); // review PASS → AWAITING_HUMAN
+    addHumanMergeApproval(env, task.pr_url!);
+    await tickAndDrain(engine); // explicit human approval → MERGING
     env.tracker.mergeErrors.set(prNum, new Error('gh pr merge failed: transient 502'));
     await tickAndDrain(engine); // attempt 1 fails — stay MERGING, do not park
     const mid = store.getTaskById(task.id)!;
@@ -1535,7 +1722,7 @@ test('MERGING retries a transient merge failure and lands on the next tick', asy
   } finally { env.done(); }
 });
 
-test('MERGING head move returns to AWAITING_REVIEW and re-reviews the new sha', async () => {
+test('a pushed head invalidates the human merge label and is fully re-reviewed', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(71, { ...ISSUE });
@@ -1546,22 +1733,21 @@ test('MERGING head move returns to AWAITING_REVIEW and re-reviews the new sha', 
     });
     await tickAndDrain(engine);
     const task = store.getTask('me/sandbox', 71)!;
-    await tickAndDrain(engine); // review PASS on head-sha → MERGING
-    assert.equal(store.getTaskById(task.id)!.status, 'MERGING');
+    await tickAndDrain(engine); // review PASS on head-sha → AWAITING_HUMAN
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
     env.tracker.headSha = 'sha-new';
-    // Same tick: the sweep unpins the stale verdict, dispatchReviews then
-    // claims a fresh review run for sha-new (drained by tickAndDrain).
+    addHumanMergeApproval(env, task.pr_url!);
+    // The stale approval is removed and the current SHA is reviewed.
     await tickAndDrain(engine);
-    assert.equal(env.tracker.merged.length, 0); // the old-sha verdict never lands a different head
+    assert.equal(env.tracker.merged.length, 0);
     assert.equal(reviews, 2);
     assert.ok(store.runsForTask(task.id).some((r) => r.kind === 'review' && r.head_sha === 'sha-new'));
-    await tickAndDrain(engine); // sweep merges pinned to sha-new
-    assert.equal(store.getTaskById(task.id)!.status, 'COMPLETED');
-    assert.equal(env.tracker.merged.length, 1);
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
+    assert.equal(prDraft(env, task.pr_url!), false);
   } finally { env.done(); }
 });
 
-test('a human merge while MERGING completes the task', async () => {
+test('an external human merge after AI handoff completes the task', async () => {
   const env = setup();
   try {
     env.tracker.issues.set(73, { ...ISSUE });
@@ -1570,7 +1756,7 @@ test('a human merge while MERGING completes the task', async () => {
     await tickAndDrain(engine);
     const task = store.getTask('me/sandbox', 73)!;
     const prNum = Number(task.pr_url!.match(/pull\/(\d+)/)![1]);
-    await tickAndDrain(engine); // → MERGING
+    await tickAndDrain(engine); // → AWAITING_HUMAN
     env.tracker.prStates.set(prNum, 'MERGED');
     await tickAndDrain(engine); // sweep reconciles the external merge
     assert.equal(store.getTaskById(task.id)!.status, 'COMPLETED');
@@ -1585,7 +1771,10 @@ test('stop on a MERGING task opts out to the human merge path', async () => {
     const { store, engine } = makeEngine(env);
     await tickAndDrain(engine);
     const task = store.getTask('me/sandbox', 72)!;
-    await tickAndDrain(engine); // → MERGING
+    await tickAndDrain(engine); // AI PASS → AWAITING_HUMAN
+    assert.equal(store.getTaskById(task.id)!.status, 'AWAITING_HUMAN');
+    addHumanMergeApproval(env, task.pr_url!);
+    await tickAndDrain(engine); // explicit approval → MERGING
     assert.equal(store.getTaskById(task.id)!.status, 'MERGING');
     const msg = stopTask(store, store.getTaskById(task.id)!);
     assert.match(msg, /人工处理/);

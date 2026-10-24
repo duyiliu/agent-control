@@ -86,6 +86,7 @@ export interface FakeTracker {
   merged: number[];
   prCreated: number;
   headSha: string;
+  baseSha: string;
   mergeable: Map<number, 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN'>;
   mergeErrors: Map<number, Error>;
   prLabels: Map<number, string[]>;
@@ -108,6 +109,7 @@ export function makeFakeTracker(): FakeTracker & {
   getPrState: (repo: string, n: number) => Promise<any>;
   getPrHeadSha: (repo: string, n: number) => Promise<string>;
   markPrReady: (repo: string, n: number) => Promise<void>;
+  markPrDraft: (repo: string, n: number) => Promise<void>;
   mergePr: (repo: string, n: number, sha: string) => Promise<void>;
   addPrLabel: (repo: string, n: number, l: string) => Promise<void>;
   removePrLabel: (repo: string, n: number, l: string) => Promise<void>;
@@ -130,6 +132,7 @@ export function makeFakeTracker(): FakeTracker & {
     merged: [],
     prCreated: 0,
     headSha: 'head-sha',
+    baseSha: 'base-sha',
     mergeable: new Map(),
     mergeErrors: new Map(),
     prLabels: new Map(),
@@ -172,6 +175,7 @@ export function makeFakeTracker(): FakeTracker & {
       return {
         state: (t.prStates.get(n) ?? pr?.state ?? 'OPEN') as 'OPEN' | 'CLOSED' | 'MERGED',
         headSha: sha,
+        baseSha: t.baseSha,
         labels: t.prLabels.get(n) ?? [],
         isDraft: pr?.isDraft ?? true,
         url: pr?.url ?? `https://github.com/x/y/pull/${n}`,
@@ -182,7 +186,14 @@ export function makeFakeTracker(): FakeTracker & {
     async listOpenPrs(_repo: string) {
       return t.openPrs.map((pr) => ({ ...pr, labels: [...pr.labels] }));
     },
-    async markPrReady(_repo: string, _n: number) {},
+    async markPrReady(_repo: string, n: number) {
+      const pr = [...t.prs.values()].find((p) => p.number === n);
+      if (pr) pr.isDraft = false;
+    },
+    async markPrDraft(_repo: string, n: number) {
+      const pr = [...t.prs.values()].find((p) => p.number === n);
+      if (pr) pr.isDraft = true;
+    },
     async mergePr(_repo: string, n: number, _sha: string) {
       const err = t.mergeErrors.get(n);
       if (err) throw err;

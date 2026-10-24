@@ -1,0 +1,18 @@
+{
+  "head": "e59a19d96dab0b1c636bab6fe98c39d1a16acef6",
+  "fixture": "C:\\Users\\ZHANGQ~1\\AppData\\Local\\Temp\\ac-rereview-probe-e8epRu",
+  "results": [
+    {
+      "concurrency": "1",
+      "exit": 1,
+      "stdout": "",
+      "stderr": "undefined\n"
+    },
+    {
+      "concurrency": "2",
+      "exit": 0,
+      "stdout": "\nOverall: 0/0 passed\n\n结论：执行完成。通过 0 步，实际失败 0 步，条件跳过 0 步，因 stop 策略未执行 0 步。\n",
+      "stderr": ""
+    }
+  ]
+}

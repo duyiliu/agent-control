@@ -4,7 +4,7 @@
 
 ```
 领取 → git worktree 隔离 → Pi agent 实现 → 受信 checks → push + Draft PR
-→ 独立只读评审 → 低风险自动合并（可选）/ 其余转人工
+→ 独立只读评审 → Checks + Review PASS 后 Ready for review → 人工审查/合并
 ```
 
 调度器的发布动作（push、建 PR、合并）都在宿主侧执行，agent 子进程不注入 GitHub 凭据（残余敞口见「安全边界」）。当前只支持 Pi runner。
@@ -83,6 +83,31 @@ npm run ac -- undrain         # 恢复派单
 
 配置骨架见 `config.example.yaml`，常用项说明：
 
+人工评审新策略通过 `review_policy.version: 2` 显式启用，默认仍为 1。
+v2 中兼容新增、版本号及改动大小本身不会转人工：具体缺陷交 AI 修复，
+证据缺口交 AI 补测试，临时执行故障按 30 秒、120 秒退避恢复；只有具体产品
+取舍、破坏性变化和敏感/保护路径授权才要求逐项回答。执行受阻单独显示，
+不计入“待你决策”。AI PASS 只把 PR 交给人工审查，不会自动合并；`agent-merge`
+仍表示人工明确批准合并。`approvals.auto_merge.enabled` 仅为旧配置兼容项，不再授权 AI 自动合并。
+
+v2 每个需求版本共用 6 轮评审、3 次执行失败及 `server.retry_limit` 修复预算，
+默认每轮评审 10 分钟（可设 `review_policy.timeout_minutes`，且不超过任务时限）。
+重启、分段、新提交均不重置预算；人工重试/重评会记录续期，保留历史证据。
+冲突修复的新提交必须重新评审，旧批准失效。普通批准或 `agent-merge` 标签不能
+回答授权问题、绕过检查或未闭合缺陷。`projects[].human_review_paths` 匹配完整
+diff，包含文档和生成物；manual 模式也执行宿主保护核验。
+
+启用只影响新任务；历史待人工记录需显式点击“重新评审”升级，暂缓/无需处理
+不会自动恢复。已关闭 Issue 且 PR 未合并的记录归为“外部关闭”，不冒充代码完成。
+v2 的 `max_files/max_lines` 仅作评审规划阈值；下表风险升级说明适用于旧策略。
+
+只读统计：`npx tsx scripts/review-policy-report.ts <数据库路径>`。按非 sandbox 的
+Issue 任务去重，输出首次自动闭合率、人工决策率、当前执行受阻率及尝试次数，
+同时说明分母、legacy 排除项与人工续期；不会把重复评审当成多个任务。
+
+升级前排空停机并备份数据库和配置。schema v12 不支持旧二进制原地降级，
+回滚必须停机还原升级前备份并配套旧代码；服务与 CLI 的 Store 均拒绝更高版本库。
+
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `server.poll_interval_seconds` | `30` | 调度 tick 间隔 |
@@ -100,9 +125,9 @@ npm run ac -- undrain         # 恢复派单
 | `projects[].checks[].argv` | — | 无 shell 执行；`timeout_seconds` 默认 `600` |
 | `agent.model` | 必填 | `<provider>/<model id>`，来自 `~/.pi/agent/models.json` |
 | `agent.review_model` | 同 `agent.model` | 评审模型，可用来做异构评审 |
-| `approvals.auto_merge.enabled` | `false` | 仅控制评审 PASS 后是否自动进入合并流程；人工 `agent-merge` 批准不受此开关影响 |
-| `approvals.auto_merge.max_files` | `10` | **源码**文件数超过此值 → 风险升级转人工；生成物、文档、测试不计入 |
-| `approvals.auto_merge.max_lines` | `400` | **源码**增删行数超过此值 → 风险升级转人工；生成物、文档、测试不计入 |
+| `approvals.auto_merge.enabled` | `false` | 兼容旧配置；AI PASS 不会自动合并。人工 `agent-merge` 批准仍可触发宿主合并 |
+| `approvals.auto_merge.max_files` | `10` | 保留旧风险配置；文件数本身不替代人工审查 |
+| `approvals.auto_merge.max_lines` | `400` | 保留旧风险配置；改动大小本身不替代人工审查 |
 | `approvals.auto_merge.generated_paths` | `dist/**`、`*.generated.*`、`*.min.*`、`*.map` | 构建产物：不参与风险统计，也不进入评审 diff |
 | `approvals.auto_merge.doc_paths` | `docs/**`、`**/*.md` | 文档：不参与大小闸门 |
 | `projects[].verify_build` | 未设置 | 合并前重建并比对生成物；与提交不一致 → 阻止合并转人工。`approvals.auto_merge.verify_build` 可作全局兜底，项目级优先 |
@@ -110,15 +135,15 @@ npm run ac -- undrain         # 恢复派单
 
 `checks.argv` 直接以进程参数数组启动，不经过 shell。Windows 上 `npm`/`npx` 会解析到 Node 入口；其他 `.cmd`/`.bat` 需显式配置可执行入口，否则记基础设施错误。
 
-未配置 `checks` 时，Issue 编码任务从工作树 `package.json` 自动识别 npm `check`；没有组合入口时识别 `test`、`typecheck`、`compile`（缺少 compile 则使用 build）。只执行这些固定脚本名；不存在适用入口时保留“未执行检查”，不因此强制转人工。新工作树有 package-lock.json、无 node_modules 时先执行 npm ci；安装失败属于环境错误。显式配置的非空 checks 优先。
+未配置 `checks` 时，Issue 编码任务从工作树 `package.json` 自动识别 npm `check`；没有组合入口时识别 `test`、`typecheck`、`compile`（缺少 compile 则使用 build）。只执行这些固定脚本名；若没有适用检查，AI Review 仍可提供意见，但 PR 保持 Draft 并说明需要人工补充验证。新工作树有 package-lock.json、无 node_modules 时先执行 npm ci；安装失败属于环境错误。显式配置的非空 checks 优先。
 
 Issue 关联 PR 重新评审时，会补跑该提交缺失的宿主检查，命令、真实日志和结果按 SHA 记录；同一 SHA 的对应检查已通过则复用证据。独立外部 PR 保持只读评审，不执行其代码。所有检查继续使用凭据隔离和 HEAD/工作树守卫。
 
-把项目切到 `review_mode: manual` 时，在途的 `MERGING` 任务会退出自动合并、退回 `AWAITING_HUMAN`（已由人工 `agent-merge` 批准的落地不受影响）。
+把项目切到 `review_mode: manual` 时，不再派发自动 Review；在途的人工合并仍受 SHA、需求哈希和检查门禁保护。
 
 ## 使用流程
 
-一条主线：**提 Issue → 排队 → 同一个 Agent 判断并实现 → Draft PR → 评审 → 合并（自动或人工）**。
+一条主线：**提 Issue → 排队 → 同一个 Coder 会话实现与修复 → Draft PR → 独立 Review → Ready for review → 人工审查与合并**。
 
 ### 1. 下任务
 
@@ -160,14 +185,16 @@ checks 失败会自动进入修复回路，同一个编码 run 内最多修复 `
 
 编码 run 结束后，根据 `projects[].review_mode` 分流：
 
+同一 Issue 的所有编码和修复 Run 共用首个 code Run 的 Pi 会话 ID / 历史目录；每个 Run 的进程、PID、日志和恢复计数仍独立。Review BLOCK 后的新 Reviewer 会收到宿主保存的上一轮 findings 和修复摘要。
+
 **`auto`（默认）**
 
 1. PR 进入 `AWAITING_REVIEW`，调度器按 PR head sha 派发一个独立评审 run（`kind='review'`）。同一 sha 已有任何评审结论（PASS/BLOCK/HUMAN_REVIEW_REQUIRED/ERROR）就不再重复派发；head 移动或本轮被取消时写不出结论，新 sha 会被重新评审。
 2. 评审现场是该 sha 的本地物化：优先复用编码 worktree（仅当 HEAD 正好是该 sha 且工作区干净），否则新建 detached worktree。评审结束后宿主校验 HEAD 未移动、工作区干净；被改动或 HEAD 被移动 → `ERROR` 结论并转人工，不会采纳评审意见。
 3. 结论处理：
-   - **PASS + 低风险**：`approvals.auto_merge.enabled: true` 时任务进 `MERGING`；关闭时进 `AWAITING_HUMAN` 等人工处理。
-   - **PASS 但宿主判定高风险**：进 `AWAITING_HUMAN` 并加 `agent-high-risk`。触发条件包括 reviewer 标记 `risk=high`、**源码**文件数/行数超限、命中权限/认证/密钥/构建/迁移路径、依赖声明变化（`package.json` 的 `dependencies`/`engines` 等，改 `scripts` 不算）、或测试覆盖被削弱（删除测试文件，或净删除 10 行以上）。生成物（`dist/**` 等）与文档既不计数也不进入评审 diff，只在 diff 开头标注被省略的文件。
-   - **BLOCK 且有具体 findings 且任务级修复预算未耗尽**：写 `pending_fix`，任务回 `DISCOVERED` 派生一轮冷启动修复 run；修复后重新 checks + 评审。修复 run 没有产生新提交（HEAD 仍是评审 sha）→ `BLOCKED`。
+   - **PASS 且当前 SHA 的宿主 Checks 实际通过**：宿主复核 Issue 授权、锁、取消、HEAD 和 base，将 Draft 转 Ready，发布交接摘要，任务进入 `AWAITING_HUMAN`。AI PASS 不会进入 `MERGING`。
+   - **PASS 但检查缺失、PR 状态变化或 Ready 操作失败**：保留 Draft（恢复失败时给出人工核验原因），不显示正常交付完成。
+   - **BLOCK 且有具体 findings 且任务级修复预算未耗尽**：写 `pending_fix`，任务回 `DISCOVERED` 派生修复 Run；Coder 恢复该 Issue 首个编码 Run 的 Pi 会话历史。修复后重新 checks + 独立评审；新 SHA 不继承旧结论。修复 Run 没有产生新提交（HEAD 仍是评审 sha）→ `BLOCKED`。
    - **BLOCK 但无 findings 或预算耗尽** → `BLOCKED`。
    - **评审基础设施不可用**（现场物化失败、diff 不可得、reviewer 进程失败等）→ 记 `ERROR` 或 `HUMAN_REVIEW_REQUIRED`，转 `AWAITING_HUMAN` + `agent-high-risk`，不消耗修复预算。
 
@@ -180,11 +207,11 @@ checks 失败会自动进入修复回路，同一个编码 run 内最多修复 `
 任务停在 `AWAITING_HUMAN` 时，在 PR 上打 `agent-merge` 标签即表示“批准合并”，Web 面板的「批准合并」按钮等价。
 
 - 标签是**一次性**的：调度器消费前先删除标签，再转 `MERGING`。
-- `auto` 模式下批准绑定最近一次评审结论的 sha。PR head 已越过被审 sha 时，批准作废（删除标签 + PR 评论说明），绝不合未经评审的版本；新的未评审 head 会回到 `AWAITING_REVIEW` 重新评审。
+- `auto` 模式下批准绑定最近一次评审结论的 sha。PR head 或 base 已变化时，批准作废，PR 回到 Draft 并重新评审；绝不合未经评审的版本。
 - `manual` 模式没有评审结论，批准的是打标签时的当前 head。
 - `MERGING` 由宿主每个 tick 推进：重新校验 PR head == `approved_sha`，执行 `gh pr merge --squash --match-head-commit`。合并成功后 `COMPLETED`，并触发 worktree/分支清理（best-effort）。
 
-合并冲突走修复回路：`CONFLICTING` 会派生一个合并修复 run（与评审 BLOCK 共用任务级修复预算），任务保持 `MERGING`，修复 push 新 head 后直接回到 `MERGING` 继续落地，**不再走一轮评审**。非冲突的合并失败按次数重试，`merge_attempts` 达到 20 次仍未成功 → `AWAITING_HUMAN` + `agent-high-risk`。
+人工批准后若合并冲突，宿主可派生修复 Run；修复 push 的新 HEAD 会清除旧批准并回到 Checks/Review 队列。冲突修复完成后必须再次人工批准新 SHA。非冲突的合并失败按次数重试，`merge_attempts` 达到 20 次仍未成功 → `AWAITING_HUMAN` + `agent-high-risk`。
 
 ### 5. 停止与异常
 
@@ -228,13 +255,13 @@ npm run ac -- undrain
 ## 质量闸门
 
 - **checks 是受信的**：命令只来自仓库配置，不来自 Issue。checks 执行前后都会校验 HEAD 和工作区；测试过程中代码被改动 → `BLOCKED`。命令启动失败、超时或异常终止记基础设施错误，不自动修改业务代码。
-- **评审是独立的**：评审 run 与编码 run 分离，绑定一个 PR head sha；评审子进程只拿到只读工具白名单（`read`/`grep`/`find`/`ls`），没有 shell、edit、write。编码 run 自身是长驻 `pi --mode rpc` 会话，`RUNNING` 与 `FIXING` 共享上下文；评审是一次性 `pi -p` 调用。
+- **评审是独立的**：评审 run 与编码 run 分离，绑定一个 PR head/base SHA；宿主刷新并用该 PR 当前 base SHA 生成完整 diff。评审子进程只拿到只读工具白名单（`read`/`grep`/`find`/`ls`），没有 shell、edit、write。评审是一次性 `pi -p --no-session` 调用；后续轮次只接收宿主记录的 findings 和修复摘要，不复用 Reviewer 会话。
 - **证据绑定 SHA**：checks 与 review 结论都写入 `check_results.head_sha`。评审证据只取被审 sha 对应的检查结果；历史数据没有 `head_sha` 时会明确告知评审“证据未绑定当前 SHA”。
 - **评审只拦有证据的问题**：仅对可复现的正确性、验收或越界问题返回 `BLOCK`，findings 必填。风格偏好、可选重构和超出任务范围的改进不作为阻塞项。
 - **大改动分段评审**：宿主保存完整差异，超过单轮 12 万字符时按文件/完整 hunk 切分，最多 8 段；各段均低风险通过后，再做跨文件汇总审查。分段和汇总共享整轮时间预算，任何分段的阻塞或高风险不能被汇总覆盖。单个 hunk 超限、超过段数预算或差异已截断时仍转人工。格式纠正最多重试两次，持续不合规的输出不能授权自动合并。
 - **失效即转人工**：评审现场物化失败、diff 超过分段容量/不可得、HEAD/工作区被改动、评审输出无法恢复，统一转人工，不惩罚编码成果。即使从叙述中恢复出结论，也会强制按高风险处理，不自动合并。
 - **恢复不重复执行**：重启时若无法证明旧子进程已死，进入 `RECOVERY_REQUIRED` 而不是再起一个；每个 run 最多自动恢复 `server.max_resumes` 次（默认 2），预算耗尽同样转人工。
-- **Pi 会话按 run 持久化**：编码会话绑定 `--session-id <run_id>` / `--session-dir <run artifacts>/pi-session`，RUNNING/FIXING 与重启恢复共享同一份已落盘历史；恢复的第一次 agent 调用会带上「服务重启后的接续」说明。session 文件随 run 的 artifacts 目录保留（本版不新增清理策略、不自动删文件）；会话目录只认绑定 `run_id` + 工作目录的头记录，损坏/错配/多文件时拒绝复用而不是静默换会话。
+- **Coder 会话跨 Run 持久化**：同一 Issue 的编码会话 ID 和历史目录锚定首个 code Run（`--session-id <首个 run_id>` / `--session-dir <首个 run artifacts>/pi-session`），后续 Review 修复 Run 恢复同一份历史；每个 Run 仍独立记录进程、PID、日志和恢复次数。会话目录只认绑定 ID 与工作目录的头记录，损坏、错配或含糊时保留现场并安全停车，不悄悄冷启动。
 - **恢复语义有边界**：被切断前未落盘的流式 token、正在执行的外部命令无法保证恰好一次；恢复后由提示词引导先 `git status`/`git diff`/`git log` 核实现状再续做。升级前用 `--no-session` 跑的旧 run 没有历史可找回，只能无上下文续做（行为同前版）。服务停机不等同于取消：挂起的 run 记 `service_shutdown` 事件、`cancel_requested` 仍为 0；`stop <issue>` 的显式取消优先于停机，仍然落 `CANCELED`。
 
 ## Web 管理界面
@@ -341,7 +368,7 @@ journalctl -u agent-control -n 50 --no-pager
 - **只接入你本人撰写或已确认可信的 Issue。** Issue 正文只作为数据注入提示词，但这只是约定，不是强制边界。编码 agent 以当前 Windows 用户权限运行，拥有完整的文件系统读写能力；worktree 是工作目录约定，不是文件隔离。恶意 Issue 最坏可诱导 agent 在当前用户权限范围内写任意文件（包括 worktree 之外），代码变更再由 checks、独立评审和合并前的风险闸门拦截，但无法撤销已经发生的越界写入。不要对非本人撰写、来源不明的 Issue 启用本工具。
 - **子进程环境是白名单**：只继承 PATH、用户目录、代理等最小集合；`GH_TOKEN`、`GITHUB_TOKEN` 及任何 `*_KEY`/`SECRET` 都不会传入。磁盘凭据也被切断：`GH_CONFIG_DIR` 指向空 jail → 子进程 `gh` 报未登录；`credential.helper` 清空 + 禁止终端提示 → `git` 取凭据失败；`GIT_SSH_COMMAND` 死结。**残余敞口**：`gh` 凭据实际存在 Windows 凭据管理器（keyring）中，同用户进程可以通过 `CredRead` API 读取。绕开正常 gh/git 路径需要诱导 agent 主动编写 keyring 读取代码，属于平台限制。
 - **评审是只读的**：评审子进程只有 `read`/`grep`/`find`/`ls` 工具，没有 shell、edit、write；评审后宿主还会校验现场 HEAD 未移动、工作区干净。Pi 不提供操作系统级沙箱，编码依赖提示约束和宿主检查。
-- **发布与合并是宿主行为**：push、建 PR 只由宿主执行，编码子进程没有发布权限。PR 一律以 **Draft** 创建；合并只发生在两条路径——评审 PASS + 低风险 + `auto_merge.enabled`（宿主执行），或人工批准（`agent-merge` 标签 / 直接在 GitHub 合并）。自动合并时宿主会先转 Ready，再以 `--match-head-commit` 钉住被审 sha。
+- **发布与合并是宿主行为**：push、建 PR 只由宿主执行，编码子进程没有发布权限。PR 一律以 **Draft** 创建；最新 SHA 的宿主 Checks 和独立 Review 都通过后才转 Ready。合并需要人工明确决定（`agent-merge` 标签 / 直接在 GitHub 合并），再由宿主以 `--match-head-commit` 钉住批准的 SHA。
 - **审批内容哈希**：SHA-256 覆盖 Issue 标题和规范化正文。`DISCOVERED` 对账以及每个 code/review run 的 phase gate 都会校验；内容变化 → `BLOCKED_APPROVAL_CHANGED`，必须人工 `retry` 重新批准。人工批准合并时以 PR 当时 head 为准；auto 模式下该 head 必须等于被审 sha。
 - **重启先对账**：无法证明旧子进程已死 → `RECOVERY_REQUIRED`，绝不重复执行；确认已死 → 按已存相位幂等续行。恢复时 GitHub 查询失败不等于授权撤销，不会关闭 PR。
 

@@ -85,7 +85,12 @@ function parseProject(v: unknown, idx: number | string): ProjectConfig {
   const triage = asObj(o['issue_triage'] ?? {}, `${name}.issue_triage`);
   const intake = o['issue_intake'];
   if (intake !== undefined && intake !== 'all' && intake !== 'labeled') fail(`${name}.issue_intake: expected all or labeled`);
+  const humanPaths = o['human_review_paths'];
+  if (humanPaths !== undefined && (!Array.isArray(humanPaths) || humanPaths.some(path => typeof path !== 'string' || !path.trim()))) {
+    fail(`${name}.human_review_paths must be a string array`);
+  }
   return {
+    human_review_paths: humanPaths as string[] | undefined,
     issue_intake: intake as ProjectConfig['issue_intake'],
     repo: asStr(o['repo'], `${name}.repo`),
     local_repo: resolve(asStr(o['local_repo'], `${name}.local_repo`)),
@@ -175,6 +180,11 @@ export function loadConfig(path: string): AppConfig {
   }
 
   const projects = projectsRaw.map(parseProject);
+  const reviewPolicy = asObj(root['review_policy'] ?? {}, 'review_policy');
+  const policyVersion = reviewPolicy['version'] ?? 1;
+  if (policyVersion !== 1 && policyVersion !== 2) fail('review_policy.version must be 1 or 2');
+  const maxTaskMinutes = asNum(server['max_task_minutes'] ?? 45, 'server.max_task_minutes', 1);
+  const timeoutMinutes = Math.min(asNum(reviewPolicy['timeout_minutes'] ?? 10, 'review_policy.timeout_minutes', 1), maxTaskMinutes);
   const normalizedUiHost = uiHost.toLowerCase().replace(/^\[|\]$/g, '');
   const loopbackUi = normalizedUiHost === 'localhost' || normalizedUiHost === '::1'
     || normalizedUiHost === '::ffff:127.0.0.1' || isIP(normalizedUiHost) === 4 && normalizedUiHost.split('.')[0] === '127';
@@ -183,6 +193,7 @@ export function loadConfig(path: string): AppConfig {
   }
 
   return {
+    review_policy: { version: policyVersion, timeout_minutes: timeoutMinutes },
     server: {
       poll_interval_seconds: asNum(server['poll_interval_seconds'] ?? 30, 'server.poll_interval_seconds', 1),
       max_concurrent: asNum(server['max_concurrent'] ?? 1, 'server.max_concurrent', 1),

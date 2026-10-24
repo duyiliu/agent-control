@@ -1,3 +1,4 @@
+import { newReviewControl, unresolvedDecisions } from './verify/review-policy.js';
 import { acceptsAllIssues, type IntakeState } from './triage/intake.js';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -10,6 +11,7 @@ import { RUN_ACTIVE_PHASES } from './types.js';
 /** Minimal tracker surface the shared stop/retry actions need. */
 export interface OpsTracker {
   getIssue(repo: string, issueNumber: number): Promise<IssueData | null>;
+  getPrHeadSha?(repo: string, prNumber: number): Promise<string>;
   getPrState(repo: string, prNumber: number): Promise<'MERGED' | 'CLOSED' | 'OPEN'>;
   removeLabel(repo: string, issueNumber: number, label: string): Promise<void>;
   addPrLabel(repo: string, prNumber: number, label: string): Promise<void>;
@@ -64,8 +66,16 @@ async function doRereviewTask(store: Store, config: AppConfig, tracker: OpsTrack
   store.tx(() => {
     assertCurrent();
     const last = store.runsForTask(task.id).at(-1);
-    if (last) store.transition(last.run_id, last.phase, last.phase, { kind: 'review_requeued', reason: 'operator_request' });
-    store.deleteReviewVerdicts(task.id);
+    const priorControl = store.getReviewControl(task.id);
+    if (last) store.transition(last.run_id, last.phase, last.phase, { kind: 'review_requeued', reason: 'operator_request', policy_version: config.review_policy?.version ?? priorControl?.policy_version ?? 'legacy', budget_renewed: config.review_policy?.version === 2 || !!priorControl,
+      previous_rounds: priorControl?.rounds ?? 0, previous_infra_attempts: priorControl?.infra_attempts ?? 0, previous_fix_attempts: priorControl?.fix_attempts ?? 0 });
+    if (config.review_policy?.version === 2 || store.getReviewControl(task.id)) {
+      const previous = store.getReviewControl(task.id);
+      const renewed = newReviewControl(task.approved_hash ?? previous?.requirement_hash ?? `pr:${task.repo}:${task.issue_number}`);
+      store.saveReviewControl(task.id, previous && previous.requirement_hash === renewed.requirement_hash
+        ? { ...previous, rounds: 0, infra_attempts: 0, fix_attempts: 0, next_attempt_at: null }
+        : renewed);
+    } else store.deleteReviewVerdicts(task.id);
     store.setTaskStatus(task.id, 'AWAITING_REVIEW', { pending_fix: null, approved_sha: null, approved_by: null, merge_attempts: 0 });
   });
   return `PR #${prNumber} 已重新排队评审，将复核当前提交`;
@@ -176,8 +186,22 @@ async function doApproveMergeTask(store: Store, tracker: OpsTracker, task: TaskR
   if (current.source === 'pr') {
     throw new OpsError('该任务只评审外部 PR，不会被自动合并；请在 GitHub 上人工合并');
   }
+  if (store.activeRunForTask(task.id)) throw new OpsError('仍有活动的运行');
+  const control = store.getReviewControl(task.id);
+  if (control && control.decisions.some(request => request.type !== 'product_choice' && control.resolutions.some(answer => answer.request_id === request.request_id && answer.requirement_hash === control.requirement_hash && answer.head_sha === control.head_sha && answer.selected_option === '拒绝当前提交'))) throw new OpsError('当前提交的授权已被拒绝，必须修改实现并重新评审');
+  if (control && (!control.head_sha || unresolvedDecisions(control, control.head_sha).length || control.assessment && (control.assessment.findings.length || control.assessment.verification_requests.length || control.assessment.compatibility.kind === 'unknown'))) throw new OpsError('仍有未解决决策或技术门禁，请先完成具体问题与重新评审');
   const prNum = current.pr_url?.match(/\/pull\/(\d+)/)?.[1];
   if (!prNum) throw new OpsError('任务没有关联 PR，无法批准合并');
+  if (control) {
+    const intake = store.getIntake<IntakeState>(current.repo, current.issue_number);
+    if (intake && (!intake.imported || intake.kind || intake.locked || intake.pending || intake.error || intake.external_hold || intake.external_needs)) throw new OpsError('Issue 仍有人工门禁或同步未完成');
+    const issue = await tracker.getIssue(current.repo, current.issue_number);
+    if (!issue || issue.state !== 'OPEN' || approvalHash(issue) !== control.requirement_hash || current.approved_hash !== control.requirement_hash) throw new OpsError('Issue 已关闭或需求已变化');
+    if (issue.labels.some(l => ['agent-human-hold', 'agent-needs-human', 'agent-running'].includes(l))) throw new OpsError('Issue 仍被人工锁定或其他运行持有');
+    if (await tracker.getPrState(current.repo, Number(prNum)) !== 'OPEN' || !tracker.getPrHeadSha || await tracker.getPrHeadSha(current.repo, Number(prNum)) !== control.head_sha) throw new OpsError('PR 已关闭或提交已变化');
+    const fresh = store.getTaskById(task.id);
+    if (!fresh || fresh.updated_at !== expectedUpdatedAt || fresh.status !== 'AWAITING_HUMAN' || store.activeRunForTask(task.id)) throw new OpsError('批准期间任务状态已变化，请刷新');
+  }
   const reviewRun = store.runsForTask(task.id).at(-1)?.run_id;
   await tracker.addPrLabel(current.repo, Number(prNum), 'agent-merge');
   const after = store.getTaskById(task.id);
@@ -205,7 +229,9 @@ export async function retryTask(
     const prNum = task.pr_url?.match(/\/pull\/(\d+)/)?.[1];
     if (!prNum) throw new OpsError('任务没有关联 PR，无法重试');
     store.tx(() => {
-      store.deleteReviewVerdicts(task.id);
+      const control = store.getReviewControl(task.id);
+      if (control) store.saveReviewControl(task.id, { ...control, rounds: 0, infra_attempts: 0, fix_attempts: 0, next_attempt_at: null });
+      else store.deleteReviewVerdicts(task.id);
       store.setTaskStatus(task.id, 'AWAITING_REVIEW', { pending_fix: null });
     });
     await tracker.removePrLabel(task.repo, Number(prNum), 'agent-blocked').catch(() => {});
@@ -258,11 +284,64 @@ export async function retryTask(
     // OPEN PR goes DISCOVERED → existing-PR → AWAITING_REVIEW, and the sha
     // idempotency would otherwise skip the unchanged head forever, leaving a
     // task that shows as "reviewing" but can never move.
-    store.deleteReviewVerdicts(task.id);
+    const control = store.getReviewControl(task.id);
+    if (control) {
+      const hash = approvalHash(issue);
+      store.saveReviewControl(task.id, control.requirement_hash === hash
+        ? { ...control, rounds: 0, infra_attempts: 0, fix_attempts: 0, next_attempt_at: null }
+        : newReviewControl(hash));
+      const last = store.runsForTask(task.id).at(-1);
+      if (last) store.transition(last.run_id, last.phase, last.phase, { kind: 'review_budget_renewed', actor: 'human', previous_rounds: control.rounds, previous_infra_attempts: control.infra_attempts, previous_fix_attempts: control.fix_attempts });
+    } else store.deleteReviewVerdicts(task.id);
     // A human retry re-approves the whole pipeline: discard any stale
     // review-fix intent so the new run starts clean.
-    store.setTaskStatus(task.id, 'DISCOVERED', { approved_hash: approvalHash(issue), pending_fix: null });
+    store.setTaskStatus(task.id, control && prNum ? (project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN') : 'DISCOVERED', { approved_hash: approvalHash(issue), pending_fix: null, ...(control ? { approved_sha: null, approved_by: null } : {}) });
   });
   await tracker.removeLabel(task.repo, task.issue_number, 'agent-blocked').catch(() => {});
   return `任务 ${task.repo}#${task.issue_number} 已重新排队（哈希 ${approvalHash(issue).slice(0, 12)}）`;
+}
+
+export interface ResolveDecisionParams {
+  expected_updated_at: string;
+  decision_version: string;
+  head_sha: string;
+  selected_option: string;
+  authorization: string;
+}
+
+export function resolveReviewDecision(store: Store, config: AppConfig, tracker: OpsTracker, task: TaskRow, requestId: string, params: ResolveDecisionParams): Promise<string> {
+  return withTaskOperation(store, task.id, async () => {
+    const assertCurrent = () => {
+      const current = store.getTaskById(task.id);
+      if (!current || current.source !== 'issue' || current.status !== 'AWAITING_HUMAN' || current.updated_at !== params.expected_updated_at || store.activeRunForTask(task.id)) throw new OpsError('任务状态已变化，请刷新后回答');
+      const intake = store.getIntake<IntakeState>(current.repo, current.issue_number);
+      if (intake && (!intake.imported || intake.kind || intake.locked || intake.pending || intake.error || intake.external_hold || intake.external_needs)) throw new OpsError('Issue 仍有人工门禁或同步未完成');
+      const control = store.getReviewControl(task.id);
+      if (!control || control.requirement_hash !== params.decision_version || control.head_sha !== params.head_sha) throw new OpsError('决策版本或提交已变化，请重新评审');
+      const request = unresolvedDecisions(control, params.head_sha).find(r => r.request_id === requestId && r.head_sha === params.head_sha);
+      if (!request || !request.options.includes(params.selected_option)) throw new OpsError('决策问题已失效或选项不合法');
+      if (!params.authorization.trim() || params.authorization.length > 4000 || /(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|-----BEGIN .*PRIVATE KEY-----|(?:password|token|secret)\s*[:=]\s*\S+)/i.test(params.authorization)) throw new OpsError('请填写具体授权范围，不要提交密码、令牌或私钥');
+      return { current, control, request };
+    };
+    const { current, control, request: answeredRequest } = assertCurrent();
+    if (!config.projects.some(p => p.repo === current.repo)) throw new OpsError('项目不在配置中');
+    const prNumber = Number(current.pr_url?.match(/\/pull\/(\d+)/)?.[1]);
+    if (!prNumber || await tracker.getPrState(current.repo, prNumber) !== 'OPEN') throw new OpsError('关联 PR 已关闭、已合并或不存在');
+    const issue = await tracker.getIssue(current.repo, current.issue_number);
+    if (!issue || issue.state !== 'OPEN') throw new OpsError('Issue 已关闭或不存在');
+    if (approvalHash(issue) !== control.requirement_hash || current.approved_hash !== control.requirement_hash) throw new OpsError('Issue 内容已变化，请重新确认需求');
+    if (issue.labels.some(l => ['agent-human-hold', 'agent-needs-human', 'agent-running'].includes(l))) throw new OpsError('Issue 仍被人工锁定或其他运行持有');
+    if (!tracker.getPrHeadSha || await tracker.getPrHeadSha(current.repo, prNumber) !== params.head_sha) throw new OpsError('PR 提交已变化或无法核验，请重新评审');
+    store.tx(() => {
+      const { control: latest, request } = assertCurrent();
+      latest.resolutions.push({ request_id: requestId, requirement_hash: latest.requirement_hash, head_sha: params.head_sha, selected_option: params.selected_option, authorization: params.authorization.trim(), actor: 'authenticated-ui', created_at: new Date().toISOString(), scope: request.file ? [request.file] : [] });
+      store.saveReviewControl(task.id, latest);
+      const run = store.runsForTask(task.id).at(-1);
+      if (run) store.transition(run.run_id, run.phase, run.phase, { kind: 'review_decision_resolved', request_id: requestId, head_sha: params.head_sha });
+      const rejected = latest.decisions.some(request => request.type !== 'product_choice' && latest.resolutions.some(answer => answer.request_id === request.request_id && answer.requirement_hash === latest.requirement_hash && answer.head_sha === params.head_sha && answer.selected_option === '拒绝当前提交'));
+      if (rejected) store.setTaskStatus(task.id, 'BLOCKED', { approved_sha: null, approved_by: null });
+      else if (!unresolvedDecisions(latest, params.head_sha).length) store.setTaskStatus(task.id, config.projects.find(p => p.repo === current.repo)?.review_mode === 'manual' ? 'AWAITING_HUMAN' : 'AWAITING_REVIEW', { approved_sha: null, approved_by: null });
+    });
+    return answeredRequest.type !== 'product_choice' && params.selected_option === '拒绝当前提交' ? '已记录拒绝，当前提交已阻塞；修改实现并重新评审后再处理' : '决策已记录并绑定当前提交；全部问题回答后将重新核验，不会立即合并';
+  });
 }

@@ -12,12 +12,15 @@ import { openPiCoderSession, SessionRestoreError, type CoderSession, type CoderS
 import { PI_ALL_TOOLS } from '../runners/pi.js';
 import { checksForPlatform, runChecks, skippedChecks, type ChecksSummary } from '../verify/checks.js';
 import { resolveCheckPlan, type CheckPlan } from '../verify/discovery.js';
+import { assessmentResult } from '../verify/review-v2.js';
 import { runReview, ReviewInfraError } from '../verify/review.js';
+import { createHash } from 'node:crypto';
+import { newReviewControl, reserveReview, reserveFix, retryReview, unresolvedDecisions, validateReviewAssessment } from '../verify/review-policy.js';
+import type { ReviewControl, ReviewAssessment, DecisionRequest } from '../types.js';
 import { publishDraftPr, PublishError } from '../publish/pr.js';
 import { buildCoderPrompt, buildFixPrompt, CODER_RESUME_NOTE, type PromptContext } from './prompts.js';
 import {
-  BUILD_PATH, classifyPath, codeStats, DEFAULT_POLICY, DEPENDENCY_PATH, filterGenerated,
-  SENSITIVE_PATH, splitDiff, touchesDependencies, type PathPolicy,
+  classifyPath, DEFAULT_POLICY, filterGenerated, SENSITIVE_PATH, splitDiff, type PathPolicy,
 } from './diff-paths.js';
 import type { AppConfig, CheckSpec, IssueData, PendingFix, Phase, ProjectConfig, ReviewResult, RunRow, TaskRow } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
@@ -86,6 +89,284 @@ export class Engine {
   private stopping = false;
   /** Runs already annotated as suspended for this shutdown (write once). */
   private suspended = new Set<string>();
+  private closedCursor = 0;
+
+  private async reconcileClosedIssues() {
+    const candidates = this.store.listTasks().filter(t => t.source === 'issue'
+      && !['COMPLETED', 'CANCELED'].includes(t.status) && !this.store.activeRunForTask(t.id)
+      && !this.store.getIntake<{ kind?: string; locked?: boolean }>(t.repo, t.issue_number)?.kind
+      && !this.store.getIntake<{ locked?: boolean }>(t.repo, t.issue_number)?.locked);
+    const ordered = [...candidates.filter(t => t.id > this.closedCursor), ...candidates.filter(t => t.id <= this.closedCursor)].slice(0, 10);
+    for (const task of ordered) {
+      if (this.stopping) return;
+      this.closedCursor = task.id;
+      try {
+        const issue = await this.tracker.getIssue(task.repo, task.issue_number);
+        if (!issue || issue.state !== 'CLOSED') continue;
+        const version = task.updated_at;
+        const prNumber = prNumberFromUrl(task.pr_url);
+        if (prNumber && await this.tracker.getPrState(task.repo, prNumber) === 'MERGED') {
+          const project = this.projectFor(task.repo);
+          if (project) await this.completeMergedTask(task, project);
+          continue;
+        }
+        this.store.tx(() => {
+          const current = this.store.getTaskById(task.id);
+          const intake = this.triage.state(task.repo, task.issue_number);
+          if (!current || current.updated_at !== version || this.store.activeRunForTask(task.id) || intake?.kind || intake?.locked) return;
+          if (intake) this.store.saveIntake(task.repo, task.issue_number, { ...intake, pending: null, error: null, reason: 'Issue 已在外部关闭', version: intake.version + 1, updated_at: new Date().toISOString() });
+          const control = this.store.getReviewControl(task.id);
+          if (control) this.store.saveReviewControl(task.id, { ...control, next_attempt_at: null });
+          const last = this.store.runsForTask(task.id).at(-1);
+          if (last) this.store.transition(last.run_id, last.phase, last.phase, { kind: 'external_issue_closed', task_status: 'CANCELED' });
+          this.store.setTaskStatus(task.id, 'CANCELED', { pending_fix: null, approved_sha: null, approved_by: null });
+          this.appLog.event('external_issue_closed', { task: task.id });
+        });
+      } catch (error) { this.appLog.event('closed_reconcile_error', { task: task.id, error: String(error) }); }
+    }
+  }
+
+  private reviewExecutionFailure(run: RunRow, task: TaskRow, reason: string, artifactPath?: string): boolean {
+    const control = this.store.getReviewControl(task.id);
+    if (!control) return false;
+    this.store.tx(() => {
+      const next = retryReview(control);
+      this.store.saveReviewControl(task.id, next);
+      this.writeReviewVerdict(run.run_id, run.head_sha!, 'ERROR', artifactPath);
+      this.store.transition(run.run_id, run.phase === 'CLAIMED' ? 'REVIEWING' : run.phase, 'REVIEWING', {
+        kind: 'review_execution_error', reason, next_attempt_at: next.next_attempt_at, policy_version: 2,
+      });
+      this.finishReview(run, task, 'FAILED', reason, next.next_attempt_at ? 'AWAITING_REVIEW' : 'BLOCKED');
+    });
+    return true;
+  }
+
+  private async applyReviewV2(run: RunRow, task: TaskRow, project: ProjectConfig, result: ReviewResult, logPath: string, diff: string) {
+    let assessment: ReviewAssessment;
+    try { assessment = validateReviewAssessment(result.assessment); }
+    catch (error) { this.reviewExecutionFailure(run, task, `review infra: invalid v2 assessment: ${String(error)}`, logPath); return; }
+    const control = this.store.getReviewControl(task.id)!;
+    const sha = run.head_sha!;
+    if (control.assessment && control.head_sha === sha) {
+      const unique = <T>(values: T[]) => [...new Map(values.map(v => [JSON.stringify(v), v])).values()];
+      assessment.findings = unique([...control.assessment.findings, ...assessment.findings]);
+      assessment.verification_requests = unique([...control.assessment.verification_requests, ...assessment.verification_requests]);
+    }
+    const requests: DecisionRequest[] = [...assessment.decision_requests];
+    if (assessment.compatibility.kind === 'breaking' && !requests.some(r => r.type === 'breaking_change')) requests.push({
+      type: 'breaking_change', question: '是否接受本提交的破坏性兼容变化？', options: ['接受当前提交的变化', '保留原兼容行为'],
+      impact: assessment.compatibility.evidence.join('\n'), reason: '当前评审判定为破坏性变更，需要明确选择兼容策略',
+    });
+    const protectedFiles = splitDiff(diff).filter(f => classifyPath(f.path, { generated: project.human_review_paths ?? [], docs: [] }) === 'generated');
+    for (const file of protectedFiles) requests.push({ type: 'configured_hold', file: file.path,
+      question: `是否批准修改受保护路径 ${file.path}？`, options: ['批准当前提交', '拒绝当前提交'],
+      impact: `项目 human_review_paths 覆盖 ${file.path}`, reason: '项目显式设置的人工门禁',
+    });
+    const requested = requests.map(request => ({ ...request,
+      ...(request.type !== 'product_choice' ? { options: ['批准当前提交', '拒绝当前提交'] } : {}), request_id: createHash('sha256').update(JSON.stringify({
+      requirement: control.requirement_hash, type: request.type, file: request.file ?? '', question: request.question, options: request.options,
+    })).digest('hex').slice(0, 24), head_sha: sha, requirement_hash: control.requirement_hash }));
+    const decisions = [...new Map([...control.decisions.filter(d => d.head_sha === sha), ...requested].map(d => [d.request_id, d])).values()];
+    const next = { ...control, assessment, decisions, next_attempt_at: null };
+    this.store.saveReviewControl(task.id, next);
+    const pending = unresolvedDecisions(next, sha);
+    const findings = assessment.findings.map(f => `${f.file}:${f.line}: ${f.trigger}; ${f.impact}; 验证: ${f.verification}`);
+    findings.push(...assessment.verification_requests.map(v => `补充验证：${v.claim}; 场景：${v.scenario}; 通过标准：${v.expected}`));
+    if (assessment.compatibility.kind === 'unknown') findings.push('核对受影响调用方及旧默认行为，补齐兼容性证据；不得仅凭未知状态放行');
+    const verdict = pending.length ? 'HUMAN_REVIEW_REQUIRED' : findings.length ? 'BLOCK' : 'PASS';
+    this.store.addCheck({ run_id: run.run_id, kind: 'review', command: 'agent (review v2)', exit_code: null,
+      artifact_path: logPath, verdict, head_sha: sha, detail_json: JSON.stringify(assessment) });
+    this.store.transition(run.run_id, 'REVIEWING', 'REVIEWING', { kind: 'review_completed', head_sha: sha, verdict, policy_version: 2, summary: assessment.summary, decisions: pending.length });
+    if (this.reviewDenied(next, sha)) { this.finishReview(run, task, 'BLOCKED', 'current head authorization was rejected'); return; }
+    if (pending.length) { this.finishReview(run, task, 'AWAITING_HUMAN', `decision required: ${pending.map(d => d.question).join('; ')}`); return; }
+    if (findings.length) {
+      try {
+        this.store.tx(() => {
+          const current = this.store.getTaskById(task.id);
+          if (current?.status !== 'REVIEWING' || this.store.getRun(run.run_id)?.cancel_requested) throw new Error('task changed during review');
+          this.store.saveReviewControl(task.id, reserveFix(next, this.config.server.retry_limit));
+          this.store.bumpFixRounds(task.id);
+          this.finishReview(run, task, 'BLOCKED', 'review v2 requires repair or verification', 'DISCOVERED');
+          this.store.setTaskStatus(task.id, 'DISCOVERED', { pending_fix: JSON.stringify({ head_sha: sha, summary: assessment.summary, findings } satisfies PendingFix) });
+        });
+      } catch (error) { this.finishReview(run, task, 'BLOCKED', `review repair budget or state exhausted: ${String(error)}`); }
+      return;
+    }
+    const prNumber = prNumberFromUrl(task.pr_url);
+    if (!prNumber) { this.finishReview(run, task, 'AWAITING_HUMAN', 'Review PASS but no PR is available for human handoff'); return; }
+    await this.handoffPassedReview(run, task, project, sha, control.base_sha, this.store.lastCodeWorkspace(task.id) ?? this.worktreePathFor(project, task), assessment.summary, diff);
+  }
+
+  private reviewDenied(control: ReviewControl, sha: string): boolean {
+    return control.decisions.some(d => d.type !== 'product_choice' && control.resolutions.some(r =>
+      r.request_id === d.request_id && r.requirement_hash === control.requirement_hash && r.head_sha === sha && r.selected_option === '拒绝当前提交'));
+  }
+
+  private async v2MergeGate(task: TaskRow, project: ProjectConfig, pr: { headSha: string; baseSha?: string }): Promise<boolean> {
+    const control = this.store.getReviewControl(task.id);
+    if (!control) return true;
+    if (task.source === 'pr') return false;
+    const current = this.store.getTaskById(task.id);
+    if (!current || current.updated_at !== task.updated_at || this.store.activeRunForTask(task.id)) return false;
+    const issue = await this.tracker.getIssue(task.repo, task.issue_number);
+    if (!issue) return false;
+    if (issue.state !== 'OPEN') { this.setTaskStatus(task.id, 'CANCELED', { pending_fix: null }); return false; }
+    if (approvalHash(issue) !== control.requirement_hash || current.approved_hash !== control.requirement_hash) {
+      this.setTaskStatus(task.id, 'BLOCKED_APPROVAL_CHANGED'); return false;
+    }
+    const intake = this.triage.state(task.repo, task.issue_number);
+    if (issue.labels.some(l => ['agent-human-hold', 'agent-needs-human', 'agent-running'].includes(l))
+      || intake && (!intake.imported || intake.kind || intake.locked || intake.pending || intake.error || intake.external_hold || intake.external_needs)) return false;
+    if (control.head_sha !== pr.headSha) {
+      this.store.setTaskStatus(task.id, project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN', { approved_sha: null, approved_by: null });
+      return false;
+    }
+    if (unresolvedDecisions(control, pr.headSha).length || this.reviewDenied(control, pr.headSha)) return false;
+    if (control.assessment && (control.assessment.findings.length || control.assessment.verification_requests.length || control.assessment.compatibility.kind === 'unknown')) return false;
+    if (project.review_mode === 'auto' && !control.assessment) return false;
+    if (!pr.baseSha || !control.base_sha || pr.baseSha !== control.base_sha) {
+      this.store.setTaskStatus(task.id, project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'BLOCKED', { approved_sha: null, approved_by: null });
+      return false;
+    }
+    const site = this.store.lastCodeWorkspace(task.id);
+    if ((project.human_review_paths?.length || project.review_mode === 'manual') && site) {
+      if (await this.workspace.head(site) !== pr.headSha || await this.workspace.isDirty(site)) return false;
+      const fullDiff = await this.workspace.diffVsBase(site, control.base_sha, Number.POSITIVE_INFINITY);
+      const guarded = splitDiff(fullDiff).filter(file =>
+        classifyPath(file.path, { generated: project.human_review_paths ?? [], docs: [] }) === 'generated'
+        || project.review_mode === 'manual' && SENSITIVE_PATH.test(file.path));
+      const missing = guarded.filter(file => !control.decisions.some(d => d.file === file.path && d.head_sha === pr.headSha
+        && d.type !== 'product_choice' && control.resolutions.some(r => r.request_id === d.request_id && r.head_sha === pr.headSha
+          && r.requirement_hash === control.requirement_hash && r.selected_option === '批准当前提交')));
+      if (missing.length) {
+        const decisions = missing.map(file => ({ type: 'configured_hold' as const, file: file.path,
+          question: `是否批准修改受保护路径 ${file.path}？`, options: ['批准当前提交', '拒绝当前提交'],
+          impact: `当前提交触及 ${file.path}`, reason: '宿主合并前的人工保护核验', head_sha: pr.headSha, requirement_hash: control.requirement_hash,
+          request_id: createHash('sha256').update(`${control.requirement_hash}:${pr.headSha}:protected:${file.path}`).digest('hex').slice(0, 24),
+        }));
+        this.store.saveReviewControl(task.id, { ...control, decisions: [...control.decisions, ...decisions] });
+        this.store.setTaskStatus(task.id, 'AWAITING_HUMAN', { approved_sha: null, approved_by: null });
+        return false;
+      }
+    } else if ((project.human_review_paths?.length || project.review_mode === 'manual') && !site) {
+      this.setTaskStatus(task.id, 'BLOCKED'); return false;
+    }
+    const plan = site ? resolveCheckPlan(project.checks, site) : { checks: project.checks, source: 'configured' as const };
+    const evidence = this.guardedCheckEvidence(task.id, pr.headSha);
+    if (plan.error || checksForPlatform(plan.checks).some(check => !evidence.some(row => row.command === check.argv.join(' ') && row.verdict === 'PASS'))) {
+      this.setTaskStatus(task.id, project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'BLOCKED'); return false;
+    }
+    return this.store.getTaskById(task.id)?.updated_at === task.updated_at;
+  }
+
+  private async handoffPassedReview(run: RunRow, task: TaskRow, project: ProjectConfig, sha: string, baseSha: string | null | undefined, sitePath: string, summary: string, diff: string) {
+    const prNumber = prNumberFromUrl(run.pr_url ?? task.pr_url);
+    if (!prNumber) { this.finishReview(run, task, 'BLOCKED', 'review PASS but no PR is available for human handoff', 'AWAITING_HUMAN'); return; }
+    if (this.store.getRun(run.run_id)?.cancel_requested || this.stopping) {
+      this.finishReview(run, task, 'CANCELED', 'cancelled at human handoff', this.cancelTaskPhase(run.run_id)); return;
+    }
+    const gate = await this.gateApproval(project, task);
+    if (gate !== 'ok') { this.finishReview(run, task, gate, 'approval gate changed before human handoff'); return; }
+    let before;
+    try { before = await this.tracker.getPrDetails(project.repo, prNumber); }
+    catch (error) { this.finishReview(run, task, 'AWAITING_HUMAN', `Review PASS but cannot verify PR before handoff: ${String(error).slice(0, 250)}`); return; }
+    if (before.state !== 'OPEN') { this.finishReview(run, task, 'AWAITING_HUMAN', `Review PASS but PR is ${before.state}`); return; }
+    if (before.headSha !== sha || baseSha && before.baseSha !== baseSha) {
+      this.finishReview(run, task, 'CANCELED', 'PR HEAD or base changed after review; re-review required', 'AWAITING_REVIEW'); return;
+    }
+    const plan = resolveCheckPlan(project.checks, sitePath);
+    const applicable = checksForPlatform(plan.checks);
+    const evidence = this.guardedCheckEvidence(task.id, sha);
+    const missing = applicable.filter(check => !evidence.some(row => row.command === check.argv.join(' ') && row.verdict === 'PASS'));
+    if (plan.error || applicable.length === 0 || missing.length) {
+      const reason = plan.error ?? (applicable.length === 0
+        ? '没有适用的宿主检查；零项检查不能证明验证通过'
+        : `当前 SHA 缺少通过的宿主检查：${missing.map(check => check.argv.join(' ')).join('; ')}`);
+      this.finishReview(run, task, 'AWAITING_HUMAN', `Review PASS，但不能安全交接：${reason}`);
+      return;
+    }
+    const finalGate = await this.gateApproval(project, task);
+    if (finalGate !== 'ok') { this.finishReview(run, task, finalGate, 'approval gate changed before PR ready'); return; }
+    if (this.store.getTaskById(task.id)?.status !== 'REVIEWING') {
+      this.finishReview(run, task, 'CANCELED', 'task left review before PR ready', this.store.getTaskById(task.id)?.status ?? 'CANCELED'); return;
+    }
+    if (this.store.getRun(run.run_id)?.cancel_requested || this.stopping) {
+      this.finishReview(run, task, 'CANCELED', 'cancelled before PR ready', this.cancelTaskPhase(run.run_id)); return;
+    }
+    let readyRequested = !before.isDraft;
+    try {
+      if (before.isDraft) { readyRequested = true; await this.tracker.markPrReady(project.repo, prNumber); }
+      const after = await this.tracker.getPrDetails(project.repo, prNumber);
+      const currentGate = await this.gateApproval(project, task);
+      const canceled = this.store.getRun(run.run_id)?.cancel_requested === 1 || this.stopping;
+      const taskStillReviewing = this.store.getTaskById(task.id)?.status === 'REVIEWING';
+      if (after.state !== 'OPEN' || after.headSha !== sha || baseSha && after.baseSha !== baseSha
+        || after.isDraft || currentGate !== 'ok' || canceled || !taskStillReviewing) {
+        let draftRestored = after.isDraft;
+        if (!after.isDraft && after.state === 'OPEN') {
+          await this.tracker.markPrDraft(project.repo, prNumber).then(() => { draftRestored = true; }).catch((error) => {
+            this.appLog.event('pr_draft_restore_error', { task: task.id, pr: prNumber, error: String(error) });
+          });
+        }
+        const moved = after.headSha !== sha || Boolean(baseSha && after.baseSha !== baseSha);
+        const finalPhase = canceled || moved ? 'CANCELED' : currentGate !== 'ok' ? currentGate : 'BLOCKED';
+        const taskPhase = moved ? (this.reviewsPr(project, task) ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN') : canceled ? this.cancelTaskPhase(run.run_id)
+          : currentGate !== 'ok' ? currentGate : !taskStillReviewing ? this.store.getTaskById(task.id)?.status ?? 'CANCELED' : 'AWAITING_HUMAN';
+        this.finishReview(run, task, finalPhase,
+          `${moved ? 'PR HEAD/base changed' : canceled ? 'handoff cancelled' : currentGate !== 'ok' ? 'approval changed' : 'handoff interrupted'} after Ready request${draftRestored ? '; PR returned to Draft' : '; PR draft state needs manual verification'}`,
+          taskPhase);
+        return;
+      }
+      const checkList = applicable.map(check => `- \`${check.argv.join(' ')}\`: PASS`).join('\n');
+      const files = [...new Set(splitDiff(diff).map(file => file.path))];
+      const fileList = [...files.slice(0, 50).map(file => `- \`${file}\``), ...(files.length > 50 ? [`- 另有 ${files.length - 50} 个文件`] : [])].join('\n') || '- (未解析到文件路径)';
+      await this.tracker.commentPr(project.repo, prNumber,
+        `<!-- agent-control-human-handoff:${sha} -->\n## AI 已完成，待人工审查\n\n- HEAD：\`${sha}\`\n- Review：PASS\n- Review 摘要 / 已知风险：${summary.slice(0, 500)}\n\n### 实现范围\n${fileList}\n\n### 宿主 Checks\n${checkList}\n\n请在 GitHub 审查并决定是否合并。AI PASS 不会自动合并。`)
+        .catch(error => { this.appLog.event('pr_handoff_comment_error', { task: task.id, pr: prNumber, error: String(error) }); throw error; });
+      const afterComment = await this.tracker.getPrDetails(project.repo, prNumber);
+      const commentGate = await this.gateApproval(project, task);
+      const commentCanceled = this.store.getRun(run.run_id)?.cancel_requested === 1 || this.stopping;
+      const taskStillReviewingAfterComment = this.store.getTaskById(task.id)?.status === 'REVIEWING';
+      const commentMoved = afterComment.headSha !== sha || Boolean(baseSha && afterComment.baseSha !== baseSha);
+      if (afterComment.state !== 'OPEN' || afterComment.isDraft || commentMoved || commentGate !== 'ok'
+        || commentCanceled || !taskStillReviewingAfterComment) {
+        let draftRestored = afterComment.isDraft;
+        if (afterComment.state === 'OPEN' && !afterComment.isDraft) {
+          await this.tracker.markPrDraft(project.repo, prNumber).then(() => { draftRestored = true; }).catch(error => {
+            this.appLog.event('pr_draft_restore_error', { task: task.id, pr: prNumber, error: String(error) });
+          });
+        }
+        const finalPhase = commentCanceled || commentMoved ? 'CANCELED' : commentGate !== 'ok' ? commentGate
+          : !taskStillReviewingAfterComment ? 'CANCELED' : 'AWAITING_HUMAN';
+        const taskPhase = commentMoved ? (this.reviewsPr(project, task) ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN')
+          : commentCanceled ? this.cancelTaskPhase(run.run_id)
+          : commentGate !== 'ok' ? commentGate
+          : !taskStillReviewingAfterComment ? this.store.getTaskById(task.id)?.status ?? 'CANCELED' : 'AWAITING_HUMAN';
+        this.finishReview(run, task, finalPhase,
+          `${commentMoved ? 'PR HEAD/base changed' : commentCanceled ? 'handoff cancelled while publishing summary' : commentGate !== 'ok' ? 'approval changed while publishing summary' : 'handoff interrupted while publishing summary'}${draftRestored ? '; PR returned to Draft' : ''}`,
+          taskPhase);
+        return;
+      }
+      this.store.transition(run.run_id, 'REVIEWING', 'REVIEWING', { kind: 'human_handoff_ready', head_sha: sha, base_sha: baseSha ?? afterComment.baseSha, checks: applicable.map(check => check.argv.join(' ')) });
+      this.finishReview(run, task, 'COMPLETED', 'AI 已完成，PR Ready for review，等待人工审查', 'AWAITING_HUMAN');
+    } catch (error) {
+      if (readyRequested) {
+        try {
+          const current = await this.tracker.getPrDetails(project.repo, prNumber);
+          if (current.state === 'OPEN' && !current.isDraft) await this.tracker.markPrDraft(project.repo, prNumber);
+        } catch (restoreError) {
+          this.appLog.event('pr_draft_restore_error', { task: task.id, pr: prNumber, error: String(restoreError) });
+          await this.tracker.markPrDraft(project.repo, prNumber).catch(fallbackError => {
+            this.appLog.event('pr_draft_restore_error', { task: task.id, pr: prNumber, error: String(fallbackError), fallback: true });
+          });
+        }
+      }
+      const canceled = this.store.getRun(run.run_id)?.cancel_requested === 1 || this.stopping;
+      this.finishReview(run, task, canceled ? 'CANCELED' : 'AWAITING_HUMAN',
+        `${canceled ? 'human handoff cancelled' : 'Review PASS，但 PR 无法安全转 Ready'}：${String(error).slice(0, 250)}`,
+        canceled ? this.cancelTaskPhase(run.run_id) : 'AWAITING_HUMAN');
+    }
+  }
 
   constructor(private deps: EngineDeps) {
     this.triage = new IssueTriage({ ...deps, canStart: () => !this.stopping && this.activeCount() < this.config.server.max_concurrent });
@@ -163,6 +444,7 @@ export class Engine {
       // also stops every further step — async claims already made stay
       // active rows for the next boot's reconcile.
       if (!this.stopping && !(this.store.getMeta('drain_requested') ?? '')) {
+        if (this.config.review_policy?.version === 2) await this.reconcileClosedIssues();
         await this.reconcileMergeStates();
         if (this.stopping) return;
         await this.triage.scan();
@@ -259,14 +541,45 @@ export class Engine {
       return;
     }
     if (pr.state !== 'OPEN') return;
+    const reviewedBase = this.lastReviewedBaseSha(task.id, pr.headSha) ?? this.store.getReviewControl(task.id)?.base_sha ?? undefined;
+    if (task.source === 'issue' && reviewedBase !== undefined && pr.baseSha && reviewedBase !== pr.baseSha) {
+      await this.prLabelQuietly(project.repo, prNumber, 'agent-merge', false);
+      const automaticReview = this.reviewsPr(project, task);
+      if (automaticReview && !pr.isDraft) await this.tracker.markPrDraft(project.repo, prNumber)
+        .catch(error => this.appLog.event('pr_draft_restore_error', { task: task.id, pr: prNumber, error: String(error) }));
+      let humanReviewHandoff = '项目使用人工评审，PR 保持 Ready for review，旧批准已失效，请人工复核当前差异。';
+      if (!automaticReview && pr.isDraft) await this.tracker.markPrReady(project.repo, prNumber)
+        .catch(error => {
+          humanReviewHandoff = `项目使用人工评审，但 PR 无法转为 Ready（${String(error).slice(0, 180)}）；旧批准已失效，请人工处理。`;
+          this.appLog.event('pr_ready_error', { task: task.id, pr: prNumber, error: String(error) });
+        });
+      const control = this.store.getReviewControl(task.id);
+      if (control && !automaticReview) {
+        const { assessment: _assessment, ...withoutAssessment } = control;
+        this.store.saveReviewControl(task.id, { ...withoutAssessment, head_sha: pr.headSha, base_sha: pr.baseSha, decisions: [], resolutions: [], next_attempt_at: null });
+      }
+      const nextStatus = automaticReview ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN';
+      this.store.setTaskStatus(task.id, nextStatus, { approved_sha: null, approved_by: null });
+      const lastReview = this.store.runsForTask(task.id).filter(item => item.kind === 'review').at(-1);
+      if (lastReview) this.store.transition(lastReview.run_id, lastReview.phase, lastReview.phase, { kind: 'review_scope_moved', head_sha: pr.headSha, previous_base_sha: reviewedBase, base_sha: pr.baseSha, automatic_review: automaticReview });
+      this.appLog.event('review_base_moved', { task: task.id, head_sha: pr.headSha, previous_base_sha: reviewedBase, base_sha: pr.baseSha, automatic_review: automaticReview });
+      const handoff = automaticReview
+        ? 'PR 已退回 Draft，正在重新运行适用检查并审查完整差异。'
+        : humanReviewHandoff;
+      await this.tracker.commentPr(project.repo, prNumber, `## 目标分支已变化\n\n目标分支 SHA 已从 ${reviewedBase.slice(0, 12)} 变为 ${pr.baseSha.slice(0, 12)}，旧评审和合并批准已失效。${handoff}`)
+        .catch(error => this.appLog.event('pr_comment_error', { task: task.id, error: String(error) }));
+      return;
+    }
     // Self-heal: an AWAITING_HUMAN task whose current head was never reviewed
     // (e.g. a repair pushed a new head while the task was parked) must go back
     if (this.stopping) return; // shutdown mid-approval: consume nothing
     // to the review queue — otherwise the new head can never be approved.
-    if (this.reviewsPr(project, task) && !this.store.hasReviewVerdictForSha(task.id, pr.headSha)) {
+    if (this.reviewsPr(project, task) && !this.store.hasReviewVerdictForScope(task.id, pr.headSha, pr.baseSha ?? null)) {
       // Any pending approval covers the old head only — drop it, re-review.
       await this.prLabelQuietly(project.repo, prNumber, 'agent-merge', false);
-      this.setTaskStatus(task.id, 'AWAITING_REVIEW');
+      if (!pr.isDraft) await this.tracker.markPrDraft(project.repo, prNumber)
+        .catch(error => this.appLog.event('pr_draft_restore_error', { task: task.id, pr: prNumber, error: String(error) }));
+      this.store.setTaskStatus(task.id, 'AWAITING_REVIEW', { approved_sha: null, approved_by: null });
       this.appLog.event('human_head_unreviewed', { task: task.id, head_sha: pr.headSha });
       return;
     }
@@ -277,18 +590,21 @@ export class Engine {
     const reviewedSha = this.store.latestReviewVerdictSha(task.id);
     if (reviewedSha && pr.headSha !== reviewedSha) {
       await this.prLabelQuietly(project.repo, prNumber, 'agent-merge', false);
+      if (this.reviewsPr(project, task) && !pr.isDraft) await this.tracker.markPrDraft(project.repo, prNumber)
+        .catch(error => this.appLog.event('pr_draft_restore_error', { task: task.id, pr: prNumber, error: String(error) }));
       await this.tracker.commentPr(project.repo, prNumber,
         `## 人工批准已作废\n\nPR head 已从被审版本 \`${reviewedSha.slice(0, 12)}\` 变为 \`${pr.headSha.slice(0, 12)}\`——批准只对被审版本有效，已移除 \`agent-merge\` 标签。请等新一轮评审完成后重新打标签。`)
         .catch((err) => this.appLog.event('pr_comment_error', { task: task.id, error: String(err) }));
       this.appLog.event('human_merge_stale', { task: task.id, reviewed_sha: reviewedSha, head_sha: pr.headSha });
       return;
     }
+    if (!await this.v2MergeGate(task, project, pr)) return;
     // Consume the label first: a crash between the CAS and the removal would
     // otherwise leave a one-shot approval armed for a future, unreviewed head.
     await this.prLabelQuietly(project.repo, prNumber, 'agent-merge', false);
     const moved = this.store.tx(() => {
       const now = this.store.getTaskById(task.id);
-      if (!now || now.status !== 'AWAITING_HUMAN') return false;
+      if (!now || now.status !== 'AWAITING_HUMAN' || this.store.getReviewControl(task.id) && (now.updated_at !== task.updated_at || this.store.activeRunForTask(task.id))) return false;
       this.store.setTaskStatus(task.id, 'MERGING', { merge_attempts: 0, approved_sha: pr.headSha, approved_by: 'human' });
       return true;
     });
@@ -297,6 +613,19 @@ export class Engine {
       `## 人工批准，排队自动合并\n\n合并将钉在 \`${pr.headSha.slice(0, 12)}\`；失败/冲突会走修复回路，需重新批准。`)
       .catch((err) => this.appLog.event('pr_comment_error', { task: task.id, error: String(err) }));
     this.appLog.event('human_merge_approved', { task: task.id, head_sha: pr.headSha });
+  }
+
+  private lastReviewedBaseSha(taskId: number, headSha: string): string | undefined {
+    for (const run of this.store.runsForTask(taskId).filter(item => item.kind === 'review').reverse()) {
+      for (const event of this.store.eventsForRun(run.run_id).reverse()) {
+        try {
+          const detail = JSON.parse(event.detail_json ?? 'null') as { kind?: unknown; head_sha?: unknown; base_sha?: unknown } | null;
+          if (!['review_started', 'review_scope_moved'].includes(String(detail?.kind)) || detail?.head_sha !== headSha) continue;
+          return typeof detail.base_sha === 'string' ? detail.base_sha : undefined;
+        } catch { /* malformed historical event is not a base-SHA attestation */ }
+      }
+    }
+    return undefined;
   }
 
   /** Whether an autonomous review run may judge this task's PR. */
@@ -311,8 +640,12 @@ export class Engine {
    */
   private async driveMerge(task: TaskRow, project: ProjectConfig, prNumber: number | undefined) {
     const store = this.store;
-    // A manual-review project only disables REVIEW-driven auto-merge: a task
-    // cleared by a human (agent-merge label) still lands.
+    if (task.approved_by !== 'human') {
+      this.setTaskStatus(task.id, 'AWAITING_HUMAN', { approved_sha: null, approved_by: null });
+      this.appLog.event('merge_approval_required', { task: task.id, approved_by: task.approved_by, approved_sha: task.approved_sha });
+      return;
+    }
+    // A manual-review project still permits an explicit human approval.
     if (project.review_mode !== 'auto' && store.getTaskById(task.id)?.approved_by !== 'human') {
       this.setTaskStatus(task.id, 'AWAITING_HUMAN');
       this.appLog.event('merge_mode_manual', { task: task.id });
@@ -351,10 +684,11 @@ export class Engine {
       // Someone pushed past the reviewed head: the verdict covers the old
       // sha only. Back to AWAITING_REVIEW — a fresh review (or, if a verdict
       // already exists for the new head, the human path) decides next.
-      this.setTaskStatus(task.id, 'AWAITING_REVIEW');
+      this.store.setTaskStatus(task.id, 'AWAITING_REVIEW', this.store.getReviewControl(task.id) ? { approved_sha: null, approved_by: null } : {});
       this.appLog.event('merge_head_moved', { task: task.id, approved_sha: approvedSha, head_sha: pr.headSha });
       return;
     }
+    if (!await this.v2MergeGate(task, project, pr)) return;
     if (pr.mergeable === 'CONFLICTING') {
       if (await this.spawnMergeFix(task, project, prNumber, approvedSha, `PR conflicts with ${project.base_branch}`)) return;
       if (store.getTaskById(task.id)?.status !== 'MERGING') return;
@@ -375,8 +709,10 @@ export class Engine {
       return;
     }
     try {
+      if (this.store.getReviewControl(task.id) && !await this.v2MergeGate(task, project, await this.tracker.getPrDetails(project.repo, prNumber))) return;
       await this.tracker.markPrReady(project.repo, prNumber);
       if (this.stopping) return;
+      if (this.store.getReviewControl(task.id) && (store.getTaskById(task.id)?.updated_at !== task.updated_at || store.getTaskById(task.id)?.status !== 'MERGING' || store.activeRunForTask(task.id))) return;
       await this.tracker.mergePr(project.repo, prNumber, approvedSha);
     } catch (err) {
       // A conflict can appear between the pre-check and the merge call —
@@ -522,12 +858,11 @@ export class Engine {
           continue;
         }
         if (created >= PR_REVIEW_BATCH) break;
-        this.store.upsertPrTask({
-          repo: project.repo,
-          number: pr.number,
-          title: pr.title,
-          url: pr.url,
-          branch: pr.headRefName,
+        this.store.tx(() => {
+          const registered = this.store.upsertPrTask({
+            repo: project.repo, number: pr.number, title: pr.title, url: pr.url, branch: pr.headRefName,
+          });
+          if (this.config.review_policy?.version === 2 && registered.created) this.store.saveReviewControl(registered.task.id, newReviewControl(`pr:${project.repo}:${pr.number}`));
         });
         created++;
         if (summoned) await this.prLabelQuietly(project.repo, pr.number, PR_SUMMON_LABEL, false);
@@ -639,7 +974,10 @@ export class Engine {
     const finalApproval = await this.triage.authorize(project, issue);
     if (!finalApproval || this.stopping) return;
     if (approvalHash(finalApproval.issue) !== hash) return;
-    const run = this.store.claimRun(task.id, { outcomeProtocol: acceptsAllIssues(project) && !task.pending_fix ? 1 : 0 });
+    const run = this.store.tx(() => {
+      if (this.config.review_policy?.version === 2 && !this.store.runsForTask(task.id).length && !this.store.getReviewControl(task.id)) this.store.saveReviewControl(task.id, newReviewControl(hash));
+      return this.store.claimRun(task.id, { outcomeProtocol: acceptsAllIssues(project) && !task.pending_fix ? 1 : 0 });
+    });
     if (finalApproval.hash) {
       try {
         const artifacts = this.artifactsDirFor(run);
@@ -691,6 +1029,9 @@ export class Engine {
     const run = this.store.getRun(runId);
     // Gone or already terminal — nothing left to resume.
     if (!run || !RUN_ACTIVE_PHASES.includes(run.phase)) return true;
+    if (run.kind === 'review' && this.store.getReviewControl(run.task_id)) {
+      throw new Error('v2 review must be reconciled and re-queued through its persistent budget');
+    }
     const to = phase ?? run.phase;
     if (this.activeCount() >= this.config.server.max_concurrent) {
       this.deferredResumes.set(runId, to);
@@ -821,6 +1162,24 @@ export class Engine {
     return null;
   }
 
+  private previousReviewContext(task: TaskRow): string {
+    const runs = this.store.runsForTask(task.id);
+    for (const candidate of runs.reverse()) {
+      if (candidate.kind !== 'code') continue;
+      for (const event of this.store.eventsForRun(candidate.run_id).reverse()) {
+        if (!event.detail_json?.includes('pending_fix_consumed')) continue;
+        try {
+          const detail = JSON.parse(event.detail_json) as Partial<PendingFix> & { kind?: string };
+          if (detail.kind !== 'pending_fix_consumed' || typeof detail.summary !== 'string'
+            || !Array.isArray(detail.findings) || detail.findings.some(f => typeof f !== 'string')) continue;
+          return [`上轮修复主题：${detail.title ?? 'Review BLOCK'}`, `上轮摘要：${detail.summary}`,
+            '上轮 findings：', ...detail.findings.map(f => `- ${f}`)].join('\n').slice(0, 12_000);
+        } catch { /* malformed host evidence is not passed to the reviewer */ }
+      }
+    }
+    return '';
+  }
+
   private async parkRecovery(task: TaskRow, run: RunRow, why: string, safeToReleaseClaim = false) {
     await markRecoveryRequired(
       { store: this.store, tracker: this.tracker, appLog: this.appLog, engine: this },
@@ -891,6 +1250,7 @@ export class Engine {
         return;
       }
       if (run.kind === 'review') {
+        if (task && this.store.getReviewControl(task.id) && this.reviewExecutionFailure(run, task, `review infra: engine crash: ${String(err).slice(0, 400)}`)) return;
         // A crashed review leaves no verdict row; without one the same
         // sha would be re-dispatched forever. ERROR counts as a verdict.
         if (run.head_sha && !this.store.hasReviewVerdictForSha(run.task_id, run.head_sha)) {
@@ -952,11 +1312,9 @@ export class Engine {
       let worktreePath = run.workspace ?? '';
       let lastFailureEvidence = '';
       let verifiedHead: string | null = null;
-      // A merge-conflict repair is part of landing: its published head goes
-      // straight back to MERGING (no re-review), carrying the original
-      // approval source so a manual-mode human approval is not lost.
+      // A conflict repair keeps its intent across recovery; the new head must
+      // pass checks and review before the human can approve it again.
       let mergeRepair = false;
-      let mergeRepairApprovedBy: 'review' | 'human' = 'review';
       // This process resumed the run from a previous boot: the FIRST real
       // coder turn (RUNNING or FIXING) is prefixed with the resume note —
       // later turns in this same process are not.
@@ -983,7 +1341,6 @@ export class Engine {
         }
         if (fixIntent) {
           mergeRepair = fixIntent.title ? fixIntent.title === '自动合并受阻' : task.status === 'MERGING';
-          mergeRepairApprovedBy = task.approved_by ?? 'review';
         }
       }
 
@@ -995,6 +1352,7 @@ export class Engine {
         const stamp = Date.now();
         const logPath = join(artifactsDir, `agent-${stamp}.jsonl`);
         const spawned: { pid: number | null; identity: string | null } = { pid: null, identity: null };
+        const firstCodeRun = store.runsForTask(task.id).find(candidate => candidate.kind === 'code') ?? run;
         const session = this.openCoderSessionFn({
           workdir: worktreePath,
           agentConfig: this.config.agent,
@@ -1008,11 +1366,10 @@ export class Engine {
             spawned.identity = identity;
             this.store.updateRunFields(run.run_id, { pid, process_identity: identity });
           },
-          // One persisted Pi session per run — a restart reopens the same
-          // history. The dir lives under the run's own artifacts, never the
-          // worktree, so a new run (new run_id) is always isolated.
-          sessionId: run.run_id,
-          sessionDir: join(artifactsDir, 'pi-session'),
+          // The first code run owns the task's conversation history; later
+          // repair runs close their own process but reopen this same session.
+          sessionId: firstCodeRun.run_id,
+          sessionDir: join(this.artifactsDirFor(firstCodeRun), 'pi-session'),
         });
         coderRef.current = { session, logPath, pid: spawned.pid, identity: spawned.identity };
         return coderRef.current;
@@ -1063,10 +1420,9 @@ export class Engine {
                   summary: pendingFix.summary, findings: pendingFix.findings,
                 });
                 if (!resumed) {
-                  // A merge-conflict repair keeps the task in MERGING;
-                  // review-driven fixes read as RUNNING.
+                  // A merge-conflict repair keeps the task in MERGING until
+                  // the new head is published back to review.
                   mergeRepair = pendingFix.title === '自动合并受阻';
-                  mergeRepairApprovedBy = store.getTaskById(task.id)?.approved_by ?? 'review';
                 }
                 store.setTaskStatus(task.id, mergeRepair ? 'MERGING' : 'RUNNING', { pending_fix: null });
                 task = { ...task, pending_fix: null };
@@ -1193,7 +1549,11 @@ export class Engine {
             }
             const gate = await this.gateApproval(project, task);
             if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed before repair'); return; }
-            this.store.bumpRunFixCount(runId);
+            this.store.tx(() => {
+              const control = this.store.getReviewControl(task.id);
+              if (control) this.store.saveReviewControl(task.id, reserveFix(control, this.config.server.retry_limit));
+              this.store.bumpRunFixCount(runId);
+            });
             const evidence = lastFailureEvidence;
             const turn = ensureCoder();
             const res = await this.coderTurn(run, log, turn, withResumeNote(buildFixPrompt(ctx, evidence)), 'FIXING', signal);
@@ -1244,15 +1604,15 @@ export class Engine {
               }
               store.transition(runId, phase, phase, { kind: 'pr_published', head_sha: verifiedHead, pr_url: pr.url });
               await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-pr');
-              // Coding ends here. A merge-conflict repair lands directly
-              // (Symphony-style: landing owns the repair); otherwise an
-              // auto-review project enters its review wait state and a manual
-              // one parks on the human path.
-              if (mergeRepair) {
-                this.finish(run, task, 'COMPLETED', `merge repair published: ${pr.url}`, {
-                  pr_url: pr.url, merge_attempts: 0, approved_sha: verifiedHead, approved_by: mergeRepairApprovedBy,
-                }, 'MERGING');
-                return;
+              // A conflict repair creates a new head and cannot carry its old approval.
+              if (mergeRepair) store.setTaskStatus(task.id, store.getTaskById(task.id)!.status, { approved_sha: null, approved_by: null });
+              const policy = store.getReviewControl(task.id);
+              if (policy) {
+                const remote = await this.tracker.getPrDetails(project.repo, pr.number);
+                const updated = { ...policy, head_sha: verifiedHead, base_sha: remote.baseSha ?? null, next_attempt_at: null, decisions: [] };
+                delete updated.assessment;
+                store.saveReviewControl(task.id, updated);
+                store.setTaskStatus(task.id, store.getTaskById(task.id)!.status, { approved_sha: null, approved_by: null });
               }
               this.finish(run, task,
                 project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN',
@@ -1317,7 +1677,10 @@ export class Engine {
           await this.setPrLabel(project.repo, prNum, false);
           this.appLog.event('stale_review_label_cleared', { task: task.id, pr: prNum });
         }
-        if (this.store.hasReviewVerdictForSha(task.id, pr.headSha)) {
+        const control = this.store.getReviewControl(task.id);
+        if (control?.next_attempt_at && Date.parse(control.next_attempt_at) > Date.now()) continue;
+        if (control && (control.rounds >= 6 || control.infra_attempts >= 3)) { this.setTaskStatus(task.id, 'BLOCKED'); continue; }
+        if (!control && this.store.hasReviewVerdictForScope(task.id, pr.headSha, pr.baseSha ?? null)) {
           // AWAITING_REVIEW + a verdict for exactly this head is a stranded
           // state: the sha idempotency below will never dispatch it again, so
           // the UI would show "reviewing" for a task that cannot move. BLOCKED
@@ -1333,6 +1696,8 @@ export class Engine {
         // cannot leave a zombie task with no active run or vice versa.
         const worktree = this.store.lastCodeWorkspace(task.id) ?? this.worktreePathFor(project, task);
         const run = this.store.tx(() => {
+          const currentControl = this.store.getReviewControl(task.id);
+          if (currentControl) this.store.saveReviewControl(task.id, reserveReview(currentControl, pr.headSha, pr.baseSha));
           const r = this.store.claimRun(task.id, { kind: 'review', headSha: pr.headSha });
           this.store.updateRunFields(r.run_id, {
             workspace: worktree,
@@ -1362,6 +1727,7 @@ export class Engine {
     const store = this.store;
     const runId = run.run_id;
     const reviewedSha = run.head_sha!;
+    let reviewedBaseSha: string | null = null;
     const prNum = prNumberFromUrl(run.pr_url ?? task.pr_url);
     let tempWorktree: string | null = null;
     let labelApplied = false;
@@ -1374,6 +1740,11 @@ export class Engine {
       if (prNum) {
         const pr = await this.tracker.getPrDetails(project.repo, prNum)
           .catch((err) => { this.appLog.event('review_preflight_error', { run: runId, error: String(err) }); return null; });
+        if (!pr && this.reviewExecutionFailure(run, task, 'review infra: PR preflight unavailable')) return;
+        const preflightControl = this.store.getReviewControl(task.id);
+        if (pr && preflightControl?.base_sha && pr.baseSha !== preflightControl.base_sha) {
+          this.finishReview(run, task, 'CANCELED', 'PR base moved during review preflight', this.cancelTaskPhase(runId)); return;
+        }
         if (pr?.state === 'MERGED') {
           store.transition(runId, 'REVIEWING', 'REVIEWING', { kind: 'review_skipped', reason: 'PR already merged' });
           this.finishReview(run, task, 'COMPLETED', 'PR merged before review');
@@ -1386,7 +1757,7 @@ export class Engine {
           this.finishReview(run, task, 'BLOCKED', 'PR closed before review');
           return;
         }
-        if (pr) currentHead = pr.headSha;
+        if (pr) { currentHead = pr.headSha; reviewedBaseSha = pr.baseSha ?? null; }
       }
       const gate = await this.gateApproval(project, task);
       if (gate !== 'ok') { this.finishReview(run, task, gate, 'approval gate failed before review'); return; }
@@ -1398,6 +1769,15 @@ export class Engine {
         return;
       }
       if (aborted()) { this.finishReview(run, task, 'CANCELED', 'cancelled', this.cancelTaskPhase(runId)); return; }
+      if (!reviewedBaseSha) {
+        const reason = 'review infra: PR base SHA is unavailable; refusing to review an unpinned diff';
+        if (this.reviewExecutionFailure(run, task, reason)) return;
+        this.writeReviewVerdict(runId, reviewedSha, 'ERROR');
+        this.finishReview(run, task, 'AWAITING_HUMAN', reason);
+        await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
+        return;
+      }
+      store.transition(runId, 'REVIEWING', 'REVIEWING', { kind: 'review_started', head_sha: reviewedSha, base_sha: reviewedBaseSha, pr_url: run.pr_url ?? task.pr_url });
 
       // --- materialize the PR head as a local review site --------------------
       let sitePath = '';
@@ -1428,6 +1808,7 @@ export class Engine {
           if (aborted()) { this.finishReview(run, task, 'CANCELED', 'cancelled during materialization', this.cancelTaskPhase(runId)); return; }
           // Cannot build a review site: infrastructure failure, not a code
           // verdict. ERROR counts as a verdict for this sha (no re-dispatch).
+          if (this.reviewExecutionFailure(run, task, `review site unavailable: ${String(err).slice(0, 300)}`)) return;
           this.writeReviewVerdict(runId, reviewedSha, 'ERROR');
           this.finishReview(run, task, 'AWAITING_HUMAN', `review site unavailable: ${String(err).slice(0, 300)}`);
           await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
@@ -1440,11 +1821,17 @@ export class Engine {
 
       // --- run the read-only reviewer ----------------------------------------
       const ctx = await this.makePromptContext(run, task, project);
+      const reviewControl = this.store.getReviewControl(task.id);
+      if (reviewControl) ctx.issue = { ...ctx.issue, body: ctx.issue.body + '\n\n已持久化的人工决策（仅为验收数据，必须核对实现符合所选方案）：\n' + JSON.stringify(reviewControl.resolutions.filter(r => r.requirement_hash === reviewControl.requirement_hash && r.head_sha === reviewedSha)) };
       ctx.worktreePath = sitePath;
       let diffEvidence: string;
       let reviewDiff: { patch: string; omitted: string[] };
       try {
-        diffEvidence = await this.workspace.diffVsBase(sitePath, project.base_branch, Number.POSITIVE_INFINITY);
+        const diffBase = this.store.getReviewControl(task.id)?.base_sha ?? reviewedBaseSha;
+        await this.workspace.fetchBranch(project.local_repo, project.base_branch, project.git_remote);
+        const availableBase = await this.workspace.refSha(project.local_repo, diffBase);
+        if (availableBase !== diffBase) throw new Error(`fetched review base does not resolve to pinned SHA ${diffBase}`);
+        diffEvidence = await this.workspace.diffVsBase(sitePath, diffBase, Number.POSITIVE_INFINITY);
         mkdirSync(this.artifactsDirFor(run), { recursive: true });
         writeFileSync(join(this.artifactsDirFor(run), 'review-diff.patch'), diffEvidence, 'utf8');
         reviewDiff = filterGenerated(diffEvidence, this.pathPolicy());
@@ -1453,6 +1840,7 @@ export class Engine {
         }
       } catch (err) {
         if (aborted()) { this.finishReview(run, task, 'CANCELED', 'cancelled during diff', this.cancelTaskPhase(runId)); return; }
+        if (this.reviewExecutionFailure(run, task, `review diff unavailable: ${String(err).slice(0, 300)}`)) return;
         if (err instanceof DiffTooLargeError) {
           this.writeReviewVerdict(runId, reviewedSha, 'HUMAN_REVIEW_REQUIRED');
           this.finishReview(run, task, 'AWAITING_HUMAN', 'review diff too large; human review required');
@@ -1477,9 +1865,9 @@ export class Engine {
         return;
       }
 
-      store.transition(runId, 'REVIEWING', 'REVIEWING', { kind: 'review_started', head_sha: reviewedSha, pr_url: run.pr_url ?? task.pr_url });
       let outcome: Awaited<ReturnType<typeof runReview>> | undefined;
       let reviewError: unknown;
+      let hostCheckFailed = false;
       try {
         const plan: CheckPlan = task.source === 'issue' ? resolveCheckPlan(project.checks, sitePath) : { checks: [], source: 'none' };
         const evidence = this.guardedCheckEvidence(task.id, reviewedSha);
@@ -1493,14 +1881,16 @@ export class Engine {
           if (summary.aborted || aborted()) { this.finishReview(run, task, 'CANCELED', 'cancelled during review checks', this.cancelTaskPhase(runId)); return; }
           if (checkedHead !== reviewedSha || !checksClean) throw new Error('review checks changed HEAD or tracked files; verification does not match the approved head');
           if (summary.infraError) throw new Error(`checks infra: ${summary.infraError}`);
-          if (!summary.ok) outcome = {
+          if (!summary.ok) { hostCheckFailed = true; outcome = {
             result: { verdict: 'BLOCK', risk: 'low', summary: '宿主自动检查未通过，需要修复', findings: [summary.failureEvidence] },
             logPath: summary.outcomes.at(-1)!.logPath,
-          };
+          }; }
         }
         if (!outcome) outcome = await this.runReviewFn(ctx, this.testEvidenceFor(task, reviewedSha), reviewDiff.patch, {
           agentConfig: this.config.agent,
-          timeoutMs: this.config.server.max_task_minutes * 60_000,
+          timeoutMs: Math.min(this.config.server.max_task_minutes, this.store.getReviewControl(task.id) ? this.config.review_policy?.timeout_minutes ?? 10 : this.config.server.max_task_minutes) * 60_000,
+          policyVersion: this.store.getReviewControl(task.id) ? 2 : 1,
+          previousReviewContext: this.previousReviewContext(task),
           artifactsDir: this.artifactsDirFor(run), signal, headSha: reviewedSha,
           onSpawn: (pid, identity) => store.updateRunFields(runId, { pid, process_identity: identity }),
         });
@@ -1513,6 +1903,11 @@ export class Engine {
       const headAfter = await this.workspace.head(sitePath).catch(() => null);
       const siteDirty = await this.workspace.isDirty(sitePath).catch(() => true);
       if (headAfter !== reviewedSha || siteDirty) {
+        if (this.store.getReviewControl(task.id)) {
+          this.writeReviewVerdict(runId, reviewedSha, 'ERROR');
+          this.finishReview(run, task, 'RECOVERY_REQUIRED', 'review site integrity failure; HEAD or tracked files changed');
+          return;
+        }
         this.writeReviewVerdict(runId, reviewedSha, 'ERROR');
         this.finishReview(run, task, 'AWAITING_HUMAN', headAfter !== reviewedSha
           ? 'review site HEAD moved during review; refusing verdict'
@@ -1522,6 +1917,7 @@ export class Engine {
       }
 
       if (!outcome) {
+        if (this.reviewExecutionFailure(run, task, `review infra: ${String(reviewError).slice(0, 400)}`, reviewError instanceof ReviewInfraError ? reviewError.logPath : undefined)) return;
         this.writeReviewVerdict(runId, reviewedSha, 'ERROR',
           reviewError instanceof ReviewInfraError ? reviewError.logPath : undefined);
         store.transition(runId, 'REVIEWING', 'REVIEWING', { kind: 'review_completed', head_sha: reviewedSha, verdict: 'ERROR', error: String(reviewError) });
@@ -1532,9 +1928,18 @@ export class Engine {
       }
 
       // --- verdict ------------------------------------------------------------
-      const { result, logPath } = outcome;
+      const { logPath } = outcome;
+      let result = outcome.result;
+      if (this.store.getReviewControl(task.id) && task.source === 'pr') {
+        try { result = assessmentResult(validateReviewAssessment(result.assessment)); }
+        catch (error) { this.reviewExecutionFailure(run, task, `review infra: invalid advisory assessment: ${String(error)}`, logPath); return; }
+      }
+      if (this.store.getReviewControl(task.id) && task.source === 'issue' && !hostCheckFailed) {
+        await this.applyReviewV2(run, task, project, result, logPath, diffEvidence);
+        return;
+      }
       store.addCheck({ run_id: runId, kind: 'review', command: 'agent (review)', exit_code: null,
-        artifact_path: logPath, verdict: result.verdict, head_sha: reviewedSha });
+        artifact_path: logPath, verdict: result.verdict, head_sha: reviewedSha, detail_json: result.assessment ? JSON.stringify(result.assessment) : undefined });
       store.transition(runId, 'REVIEWING', 'REVIEWING', { kind: 'review_completed', head_sha: reviewedSha,
         verdict: result.verdict, risk: result.risk, summary: result.summary, artifact_path: logPath });
 
@@ -1556,29 +1961,7 @@ export class Engine {
       }
 
       if (result.verdict === 'PASS') {
-        const riskReasons = this.assessRisk(reviewDiff.patch, result.risk);
-        if (riskReasons.length > 0) {
-          if (prNum) {
-            await this.tracker.commentPr(project.repo, prNum, this.riskComment(result, riskReasons))
-              .catch((err) => this.appLog.event('pr_comment_error', { run: runId, error: String(err) }));
-          }
-          await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
-          this.finishReview(run, task, 'AWAITING_HUMAN', `review PASS but high risk: ${riskReasons.join('; ')}`);
-          return;
-        }
-        if (prNum && this.config.approvals.auto_merge.enabled) {
-          // A cancel that landed while the reviewer worked wins over the
-          // merge handoff — never push a cancelled task into MERGING.
-          if (aborted() || store.getRun(runId)?.cancel_requested === 1) {
-            this.finishReview(run, task, 'CANCELED', 'cancelled at merge handoff', this.cancelTaskPhase(runId));
-            return;
-          }
-          // The review run's job is the verdict; landing is the host-side
-          // MERGING sweep's job — retried and crash-resumable there.
-          this.finishReview(run, task, 'COMPLETED', 'review PASS; auto-merge queued', 'MERGING', { merge_attempts: 0, approved_sha: reviewedSha, approved_by: 'review' });
-          return;
-        }
-        this.finishReview(run, task, 'AWAITING_HUMAN', 'review PASS');
+        await this.handoffPassedReview(run, task, project, reviewedSha, reviewedBaseSha, sitePath, result.summary, reviewDiff.patch);
         return;
       }
 
@@ -1606,6 +1989,8 @@ export class Engine {
           // A stop in the verdict window: honor the cancel intent — never
           // leave a REVIEWING task with no live run and nothing to sweep it.
           if (cancelled) { store.setTaskStatus(task.id, 'CANCELED'); return false; }
+          const control = store.getReviewControl(task.id);
+          if (control) store.saveReviewControl(task.id, reserveFix(control, this.config.server.retry_limit));
           store.bumpFixRounds(task.id);
           store.setTaskStatus(task.id, 'DISCOVERED', { pending_fix: JSON.stringify(payload) });
           return true;
@@ -1676,7 +2061,8 @@ export class Engine {
       this.appLog.event('mergeable_check_error', { task: task.id, error: String(err) });
     }
     if (mergeable !== 'CONFLICTING') return false;
-    if (store.getTaskById(task.id)!.fix_rounds >= this.config.server.retry_limit) {
+    const reviewControl = store.getReviewControl(task.id);
+    if ((reviewControl?.fix_attempts ?? store.getTaskById(task.id)!.fix_rounds) >= this.config.server.retry_limit) {
       await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-high-risk');
       return false;
     }
@@ -1687,19 +2073,21 @@ export class Engine {
       summary: `auto-merge failed: PR conflicts with ${project.base_branch}`,
       findings: [
         `GitHub 拒绝合并（${mergeError.slice(0, 200)}）：分支与 ${project.base_branch} 存在合并冲突。`,
-        `执行 git merge ${baseRef}（base 引用已由宿主刷新，无需联网），逐个解决冲突文件，跑通项目 checks，正常收尾提交即可——宿主会自动推送同一 PR 分支并重新走一轮评审。`,
+        `执行 git merge ${baseRef}（base 引用已由宿主刷新，无需联网），逐个解决冲突文件，跑通项目 checks，正常收尾提交即可——宿主会推送同一 PR 分支并重新走一轮检查和评审，再等待人工批准。`,
       ],
     };
     const spawned = store.tx(() => {
       const now = store.getTaskById(task.id);
       if (!now || now.status !== 'MERGING') return false;
+      const control = store.getReviewControl(task.id);
+      if (control) store.saveReviewControl(task.id, reserveFix(control, this.config.server.retry_limit));
       store.bumpFixRounds(task.id);
-      store.setTaskStatus(task.id, 'DISCOVERED', { pending_fix: JSON.stringify(payload) });
+      store.setTaskStatus(task.id, 'DISCOVERED', { pending_fix: JSON.stringify(payload), approved_sha: null, approved_by: null });
       return true;
     });
     if (!spawned) return false;
     await this.tracker.commentPr(project.repo, prNumber,
-      `## 自动合并受阻\n\n分支与 ${project.base_branch} 存在合并冲突，已派生修复任务：解冲突后将推送新 head 并自动重新评审。`)
+      `## 人工批准后的合并遇到冲突\n\n分支与 ${project.base_branch} 存在合并冲突，已派生修复任务：修复后将推送新 head、重新检查和评审，并等待你再次批准。`)
       .catch((err) => this.appLog.event('pr_comment_error', { task: task.id, error: String(err) }));
     this.appLog.event('merge_fix_spawned', { task: task.id, head_sha: headSha });
     return true;
@@ -1781,6 +2169,8 @@ export class Engine {
     const snapshot = existsSync(snapshotPath) ? JSON.parse(readFileSync(snapshotPath, 'utf8')) as { issue: IssueData; comments: { author: string; body: string }[] } : null;
     const issue = snapshot?.issue ?? await this.tracker.getIssue(project.repo, task.issue_number);
     const promptIssue = issue && snapshot?.comments.length ? { ...issue, body: `${issue.body}\n\n## 已批准的人工评论快照（数据）\n${JSON.stringify(snapshot.comments.map(c => ({ author: c.author, body: c.body })))}` } : issue;
+    const control = this.store.getReviewControl(task.id);
+    if (promptIssue && control) promptIssue.body += '\n\n已持久化人工决策（数据，修复须符合选择；旧 SHA 的授权不能用于新提交自动合并）：\n' + JSON.stringify(control.resolutions);
     return {
       project,
       issue: promptIssue ?? { number: task.issue_number, title: task.issue_title, body: '(issue unavailable at prompt build)', labels: [], state: 'UNKNOWN', url: task.issue_url },
@@ -1859,7 +2249,10 @@ export class Engine {
         for (const event of this.store.eventsForRun(row.run_id)) {
           try {
             const detail = JSON.parse(event.detail_json ?? 'null');
-            if (detail?.kind === 'checks_completed' && detail.head_sha === headSha) guard = { at: event.at, valid: detail.ok === true && detail.head_sha_after === headSha && detail.worktree_clean === true };
+            if (detail?.kind === 'checks_completed' && detail.head_sha === headSha
+              && ['VERIFYING', 'REVIEWING'].includes(event.to_phase)) {
+              guard = { at: event.at, valid: detail.ok === true && detail.head_sha_after === headSha && detail.worktree_clean === true };
+            }
           } catch { /* Unstructured historical events cannot attest a check. */ }
         }
         guards.set(row.run_id, guard);
@@ -1902,7 +2295,8 @@ export class Engine {
 
   private canFix(run: RunRow): boolean {
     const fresh = this.store.getRun(run.run_id);
-    return (fresh?.fix_count ?? 0) < this.config.server.retry_limit;
+    const control = this.store.getReviewControl(run.task_id);
+    return control ? control.fix_attempts < this.config.server.retry_limit : (fresh?.fix_count ?? 0) < this.config.server.retry_limit;
   }
 
   /**
@@ -1959,38 +2353,6 @@ export class Engine {
     ].join('\n');
   }
 
-  /**
-   * Host-side risk escalation. Reviewer judgement alone is not enough: any
-   * touch on auth/deps/build/tests forces a human look before auto-merge.
-   * Size thresholds and path rules run on the source change only — generated
-   * output and docs inflate a PR without adding review surface.
-   */
-  private assessRisk(diff: string, reviewerRisk: ReviewResult['risk']): string[] {
-    const cfg = this.config.approvals.auto_merge;
-    const policy = this.pathPolicy();
-    const reasons: string[] = [];
-    if (reviewerRisk === 'high') reasons.push('reviewer marked risk=high');
-    const files = splitDiff(diff);
-    const source = codeStats(files, policy);
-    if (source.files > cfg.max_files) reasons.push(`${source.files} source files changed > ${cfg.max_files}`);
-    if (source.lines > cfg.max_lines) reasons.push(`${source.lines} source lines changed > ${cfg.max_lines}`);
-    for (const file of files) {
-      const kind = classifyPath(file.path, policy);
-      if (kind === 'generated' || kind === 'docs') continue;
-      if (SENSITIVE_PATH.test(file.path)) reasons.push(`sensitive path: ${file.path}`);
-      else if (DEPENDENCY_PATH.test(file.path)) {
-        if (touchesDependencies(file)) reasons.push(`dependency change: ${file.path}`);
-      } else if (BUILD_PATH.test(file.path)) reasons.push(`build or migration change: ${file.path}`);
-      // Weakened coverage is the risk, not tests moving with the code they
-      // cover: only deleting a suite or shrinking assertions counts.
-      else if (kind === 'tests') {
-        if (file.status === 'deleted') reasons.push(`test file deleted: ${file.path}`);
-        else if (file.deleted > file.added + 10) reasons.push(`test coverage weakened: ${file.path} (-${file.deleted}/+${file.added})`);
-      }
-    }
-    return reasons;
-  }
-
   private pathPolicy(): PathPolicy {
     const cfg = this.config.approvals.auto_merge;
     return {
@@ -2001,7 +2363,7 @@ export class Engine {
 
   /**
    * Generated files are excluded from review, so the host must prove they are
-   * still reproducible from the reviewed source before landing: rebuild the
+   * still reproducible from the reviewed source before an approved merge: rebuild the
    * approved head and refuse if `dist` (or any other generated path) drifts
    * from the commit. A hand-edited build output is the one thing the reviewer
    * can no longer see.
@@ -2099,7 +2461,7 @@ export class Engine {
       '### 触发原因',
       ...reasons.map((reason) => `- ${reason}`),
       '',
-      '本 PR 不会自动合并，请人工审查后再合并。',
+      'AI Review PASS 不会自动合并；请人工审查后决定是否合并。',
     ].join('\n');
   }
 
@@ -2145,7 +2507,7 @@ export class Engine {
   private setTaskStatus(
     taskId: number,
     status: Phase,
-    fields?: { approved_hash?: string | null; branch?: string | null; pr_url?: string | null; pending_fix?: string | null },
+    fields?: { approved_hash?: string | null; branch?: string | null; pr_url?: string | null; pending_fix?: string | null; merge_attempts?: number; approved_sha?: string | null; approved_by?: 'review' | 'human' | null },
   ) {
     this.store.setTaskStatus(taskId, status, fields);
     if (ATTENTION_PHASES.includes(status)) {

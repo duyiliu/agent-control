@@ -9,6 +9,41 @@ import type { GitHubTracker } from '../src/tracker/github.js';
 import type { Phase } from '../src/types.js';
 import type { Store } from '../src/store/sqlite.js';
 import { makeConfig, makeFakeTracker, makeStore, nullLog, teardown } from './helpers.js';
+import { newReviewControl } from '../src/verify/review-policy.js';
+
+for (const failures of [0, 1, 2]) test(`v2 interrupted review with ${failures} prior infra failures consumes persistent budget instead of resuming`, async () => {
+  const env = setup();
+  try {
+    const task = env.store.upsertDiscovered({ repo: 'me/sandbox', issue_number: 40, issue_title: 't', issue_url: 'u' }).task;
+    env.store.saveReviewControl(task.id, { ...newReviewControl('requirement'), rounds: failures + 1, infra_attempts: failures, fix_attempts: 2 });
+    const run = env.store.claimRun(task.id, { kind: 'review', headSha: 'head' });
+    env.store.transition(run.run_id, 'CLAIMED', 'REVIEWING');
+    const deps = { store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker, appLog: nullLog,
+      engine: env.fakeEngine, findProcs: async () => [], isPidAlive: () => false };
+    const report = await reconcile(deps);
+    assert.deepEqual(report.finalized, [run.run_id]); assert.deepEqual(env.resumed, []);
+    const control = env.store.getReviewControl(task.id)!;
+    assert.equal(control.infra_attempts, failures + 1); assert.equal(control.rounds, failures + 1); assert.equal(control.fix_attempts, 2);
+    assert.equal(env.store.getTaskById(task.id)?.status, failures === 2 ? 'BLOCKED' : 'AWAITING_REVIEW');
+    assert.equal(env.store.checksForRun(run.run_id)[0]?.verdict, 'ERROR');
+    await reconcile(deps);
+    assert.deepEqual(env.store.getReviewControl(task.id), control);
+  } finally { env.done(); }
+});
+
+test('v2 possibly live reviewer remains recovery required without spawning or spending another attempt', async () => {
+  const env = setup(); try {
+    const task = env.store.upsertDiscovered({ repo: 'me/sandbox', issue_number: 40, issue_title: 't', issue_url: 'u' }).task;
+    const control = { ...newReviewControl('r'), rounds: 1 };
+    env.store.saveReviewControl(task.id, control);
+    const run = env.store.claimRun(task.id, { kind: 'review', headSha: 'head' });
+    env.store.updateRunFields(run.run_id, { pid: 1234, process_identity: '1234:100000' });
+    const report = await reconcile({ store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [], isPidAlive: () => true, processStartedAt: async () => 100000 });
+    assert.equal(report.recoveryRequired.length, 1); assert.deepEqual(env.resumed, []);
+    assert.deepEqual(env.store.getReviewControl(task.id), control);
+  } finally { env.done(); }
+});
 
 function setup() {
   const dir = mkdtempSync(join(tmpdir(), 'ac-rec-'));

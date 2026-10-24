@@ -4,6 +4,7 @@ import {
   fetchArtifact,
   fetchTask,
   postAction,
+  resolveDecision,
   type Artifact,
   type RunDetail,
   type TaskDetail,
@@ -25,11 +26,14 @@ export default function DetailDrawer(props: {
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [decisionAnswers, setDecisionAnswers] = useState<Record<string, { option: string; authorization: string }>>({});
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const actionInFlight = useRef(false);
   const currentTaskId = useRef(taskId);
   currentTaskId.current = taskId;
   const [artifact, setArtifact] = useState<{ path: string; data: Artifact | null; error: string | null } | null>(null);
+
+  useEffect(() => { setDecisionAnswers({}); }, [detail?.task.attention?.head_sha, detail?.task.attention?.decision_version]);
 
   const refreshSequence = useRef(0);
   const refresh = useCallback(async () => {
@@ -47,6 +51,7 @@ export default function DetailDrawer(props: {
 
   useEffect(() => {
     setDetail(null);
+    setDecisionAnswers({});
     setActionMessage(null);
     setArtifact(null);
     refresh();
@@ -92,6 +97,22 @@ export default function DetailDrawer(props: {
       actionInFlight.current = false;
       setBusyAction(null);
     }
+  };
+
+  const answerDecision = async (requestId: string) => {
+    const task = detail?.task;
+    const attention = task?.attention;
+    const answer = decisionAnswers[requestId];
+    if (!task || !attention?.decision_version || !attention.head_sha || !answer || actionInFlight.current) return;
+    actionInFlight.current = true;
+    setBusyAction(`decision:${requestId}`);
+    try {
+      const message = await resolveDecision(task.id, requestId, { expected_updated_at: task.updated_at, decision_version: attention.decision_version, head_sha: attention.head_sha, selected_option: answer.option, authorization: answer.authorization });
+      onToast({ msg: message });
+      setDecisionAnswers({});
+      await Promise.all([refresh(), onChanged()]);
+    } catch (e) { onToast({ msg: (e as Error).message, err: true }); await refresh(); }
+    finally { actionInFlight.current = false; setBusyAction(null); }
   };
 
   const openArtifact = async (path: string) => {
@@ -203,6 +224,21 @@ export default function DetailDrawer(props: {
           {actionMessage && <p role="status" className="mb-3 rounded-md border border-info/25 bg-info/5 px-3 py-2 text-xs text-info">{actionMessage}</p>}
           {t?.source === 'pr' && t.status === 'AWAITING_HUMAN' && <a href={t.pr_url ?? t.issue_url} target="_blank" rel="noopener noreferrer" className="mb-3 inline-block text-xs text-info hover:underline">在 GitHub 查看评审并决定是否合并 ↗</a>}
           {t && <TaskAttention attention={t.attention} />}
+          {t?.attention?.decisions?.map(request => {
+            if (!request.request_id) return null;
+            const id = request.request_id;
+            const answer = decisionAnswers[id] ?? { option: '', authorization: '' };
+            return <section key={`${t.attention?.head_sha}:${id}`} className="mt-3 rounded-md border border-warn/30 p-3 text-xs">
+              <p className="font-medium">{request.question}</p>
+              <p className="mt-2 text-fg-muted">影响：{request.impact}</p>
+              <p className="mt-1 text-fg-muted">需要你决定的原因：{request.reason}</p>
+              {request.file && <p className="mt-1 break-all text-fg-dim">{request.file}{request.line ? `:${request.line}` : ''}</p>}
+              <label className="mt-3 block">选择方案<select aria-label={request.question} className="mt-1 w-full rounded border border-edge bg-panel p-2" value={answer.option} onChange={e => setDecisionAnswers(prev => ({ ...prev, [id]: { ...answer, option: e.target.value } }))}><option value="">请选择</option>{request.options.map(option => <option key={option} value={option}>{option}</option>)}</select></label>
+              <label className="mt-3 block">具体决定与授权范围<textarea maxLength={4000} value={answer.authorization} onChange={e => setDecisionAnswers(prev => ({ ...prev, [id]: { ...answer, authorization: e.target.value } }))} className="mt-1 min-h-20 w-full rounded border border-edge bg-panel p-2" placeholder="说明允许的方案、影响范围和限制，请勿填写密码或令牌" /></label>
+              <p className="mt-1 text-fg-dim">回答仅适用于当前需求和提交；不会立即合并。</p>
+              <button disabled={!!busyAction || !answer.option || !answer.authorization.trim()} onClick={() => answerDecision(id)} className="mt-3 rounded border border-info/30 px-3 py-2 text-info disabled:opacity-40">{busyAction === `decision:${id}` ? '正在记录…' : '提交此项决定'}</button>
+            </section>;
+          })}
           {t && <><MetaGrid detail={detail!} /><IntakeActions task={t} active={detail!.has_active_run} onState={state => { ++refreshSequence.current; setDetail(current => current && state.version >= (current.task.intake?.version ?? 0) ? { ...current, task: { ...current.task, intake: state } } : current); }} onChanged={() => { refresh(); onChanged(); }} onToast={onToast} /></>}
           {detail && (
             <div className="mt-4 space-y-3">

@@ -7,10 +7,12 @@ import type {
   Phase,
   RunRow,
   TaskRow,
+  ReviewControl,
 } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
+import { parseReviewControl } from '../verify/review-policy.js';
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -237,7 +239,30 @@ export class Store {
         this.db.prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)').run(11, now());
       });
     }
+    if (current < 12) {
+      this.tx(() => {
+        this.db.exec('ALTER TABLE tasks ADD COLUMN review_control_json TEXT; ALTER TABLE check_results ADD COLUMN review_detail_json TEXT;');
+        this.db.prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)').run(12, now());
+      });
+    }
 
+  }
+
+  getReviewControl(taskId: number): ReviewControl | null {
+    const task = this.getTaskById(taskId);
+    if (!task) throw new Error(`task ${taskId} not found`);
+    return parseReviewControl(task.review_control_json);
+  }
+
+  saveReviewControl(taskId: number, control: ReviewControl | null) {
+    const value = parseReviewControl(control);
+    this.tx(() => {
+      const task = this.getTaskById(taskId);
+      if (!task) throw new Error(`task ${taskId} not found`);
+      const timestamp = new Date(Math.max(Date.now(), Date.parse(task.updated_at) + 1)).toISOString();
+      this.db.prepare('UPDATE tasks SET review_control_json=?, updated_at=? WHERE id=?')
+        .run(value === null ? null : JSON.stringify(value), timestamp, taskId);
+    });
   }
 
   getIntake<T>(repo: string, number: number): T | null {
@@ -603,13 +628,15 @@ export class Store {
     artifact_path?: string;
     verdict: string;
     head_sha?: string | null;
+    detail_json?: string | null;
   }): number {
+    if (input.detail_json != null) JSON.parse(input.detail_json);
     const res = this.db
       .prepare(
-        `INSERT INTO check_results (run_id, kind, command, exit_code, artifact_path, verdict, head_sha, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO check_results (run_id, kind, command, exit_code, artifact_path, verdict, head_sha, review_detail_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(input.run_id, input.kind, input.command, input.exit_code, input.artifact_path ?? null, input.verdict, input.head_sha ?? null, now());
+      .run(input.run_id, input.kind, input.command, input.exit_code, input.artifact_path ?? null, input.verdict, input.head_sha ?? null, input.detail_json ?? null, now());
     return Number(res.lastInsertRowid);
   }
 
@@ -627,6 +654,25 @@ export class Store {
          WHERE r.task_id = ? AND c.kind = 'review' AND c.head_sha = ? LIMIT 1`,
       )
       .get(taskId, headSha) !== undefined;
+  }
+
+  hasReviewVerdictForScope(taskId: number, headSha: string, baseSha: string | null): boolean {
+    const reviews = this.runsForTask(taskId).filter(run => run.kind === 'review');
+    return reviews.some(run => {
+      if (!this.checksForRun(run.run_id).some(check => check.kind === 'review' && check.head_sha === headSha)) return false;
+      const events = this.eventsForRun(run.run_id);
+      let hasScopedStart = false;
+      for (const event of events.reverse()) {
+        try {
+          const detail = JSON.parse(event.detail_json ?? 'null') as { kind?: unknown; head_sha?: unknown; base_sha?: unknown } | null;
+          if (detail?.kind !== 'review_started') continue;
+          hasScopedStart = true;
+          if (detail.head_sha !== headSha) continue;
+          return (typeof detail.base_sha === 'string' ? detail.base_sha : null) === baseSha;
+        } catch { /* unstructured historical events cannot attest the diff base */ }
+      }
+      return !hasScopedStart && baseSha === null;
+    });
   }
 
   /** The sha of the task's latest review verdict row (any verdict). */

@@ -32,6 +32,7 @@ function fakeWorkspace(over: Partial<GitWorkspace> = {}): GitWorkspace {
   return {
     isDirty: async () => false,
     head: async () => 'head-sha',
+    refSha: async (_repo: string, ref: string) => ref,
     diffVsBase: async () => 'diff',
     fetchBranch: async () => {},
     addDetachedWorktree: async (_r: string, _s: string, p: string) => p,

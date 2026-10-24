@@ -27,7 +27,7 @@ export interface IntakeState {
 
 export interface TaskSummary {
   actions?: { stop: boolean; retry: boolean; rereview: boolean; approve_merge: boolean };
-  attention?: { summary: string; detail: string; next_step: string } | null;
+  attention?: { kind?: 'decision' | 'approval' | 'execution_error' | 'recovery' | 'advisory'; summary: string; detail: string; next_step: string; next_attempt_at?: string | null; decision_version?: string; head_sha?: string; decisions?: { request_id?: string; question: string; options: string[]; impact: string; reason: string; file?: string; line?: number }[] } | null;
   intake?: IntakeState | null;
   id: number;
   repo: string;
@@ -195,4 +195,11 @@ export async function postAction(id: number, action: 'stop' | 'retry' | 'rerevie
   const d = (await r.json().catch(() => ({}))) as { message?: string; error?: string };
   if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
   return d.message ?? 'done';
+}
+
+export async function resolveDecision(id: number, requestId: string, params: { expected_updated_at: string; decision_version: string; head_sha: string; selected_option: string; authorization: string }): Promise<string> {
+  const r = await fetch(`/api/tasks/${id}/decisions/${encodeURIComponent(requestId)}/resolve`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(params) });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error ?? `HTTP ${r.status}`);
+  return data.message;
 }

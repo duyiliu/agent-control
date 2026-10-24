@@ -33,7 +33,7 @@ export default function Board(props: {
   onToast: (toast: Toast) => void;
 }) {
   const { tasks, projectRepos, tick, selected, onSelect, onStop, onIntakeChanged, onChanged, onToast } = props;
-  const [disposition, setDisposition] = useState<'normal' | 'attention' | 'history'>('normal');
+  const [disposition, setDisposition] = useState<'normal' | 'attention' | 'errors' | 'history'>('normal');
   const [historyResult, setHistoryResult] = useState('all');
   const [includeDeferred, setIncludeDeferred] = useState(false);
   const [mobileGroup, setMobileGroup] = useState<GroupKey | null>(null);
@@ -71,33 +71,34 @@ export default function Board(props: {
   const hasDisposition = (t: TaskSummary) => !t.active_run && !['COMPLETED', 'MERGING', 'AWAITING_REVIEW', 'AWAITING_HUMAN'].includes(t.status);
   const phaseOf = (t: TaskSummary) => (t.status === 'MERGING' ? 'MERGING' : (t.active_run?.phase ?? t.status));
   const deferred = (t: TaskSummary) => !['COMPLETED', 'CANCELED'].includes(t.status) && hasDisposition(t) && t.intake?.kind === 'deferred';
-  const history = (t: TaskSummary) => groupOf(phaseOf(t)) === 'done' || hasDisposition(t) && t.intake?.kind === 'skipped';
+  const history = (t: TaskSummary) => t.attention?.kind === 'advisory' || groupOf(phaseOf(t)) === 'done' || hasDisposition(t) && t.intake?.kind === 'skipped';
   const taskGroup = (t: TaskSummary): GroupKey => hasDisposition(t) && t.intake && (t.intake.kind === 'human' || t.intake.locked || t.intake.external_hold || t.intake.external_needs || t.intake.error || t.intake.pending) ? 'human' : groupOf(phaseOf(t));
-  const attention = (t: TaskSummary) => !deferred(t) && !history(t) && ['human', 'blocked'].includes(taskGroup(t));
+  const executionError = (t: TaskSummary) => !deferred(t) && !history(t) && (['execution_error', 'recovery'].includes(t.attention?.kind ?? '') || !t.attention?.kind && taskGroup(t) === 'blocked');
+  const attention = (t: TaskSummary) => !deferred(t) && !history(t) && (['decision', 'approval'].includes(t.attention?.kind ?? '') || !t.attention?.kind && taskGroup(t) === 'human');
   const recentlyCompleted = (t: TaskSummary) => t.status === 'COMPLETED' && Date.parse(t.updated_at) >= Date.now() - 7 * 24 * 60 * 60 * 1000;
   const scoped = matching.filter(t => !activeFilter || t.repo === activeFilter);
   const deferredCount = scoped.filter(deferred).length;
   const overdueCount = scoped.filter(t => deferred(t) && isDeferredDue(t.intake)).length;
   const attentionCount = scoped.filter(attention).length;
-  const executionCount = scoped.filter(t => !deferred(t) && !history(t) && !attention(t)).length;
+  const executionCount = scoped.filter(t => !deferred(t) && !history(t) && !attention(t) && !executionError(t)).length;
   const historyCount = scoped.filter(history).length;
   const recentCompletedCount = scoped.filter(recentlyCompleted).length;
   const inView = matching.filter(t => disposition === 'history'
     ? history(t) && (historyResult === 'all' || (historyResult === 'skipped' ? t.intake?.kind === 'skipped' && !['COMPLETED', 'CANCELED'].includes(t.status) : t.status === historyResult))
-    : deferred(t) ? includeDeferred : disposition === 'attention' ? attention(t) : recentlyCompleted(t) || !history(t) && !attention(t));
+    : deferred(t) ? includeDeferred : disposition === 'attention' ? attention(t) : disposition === 'errors' ? executionError(t) : recentlyCompleted(t) || !history(t) && !attention(t) && !executionError(t));
   const repos = buildRepoCounts(inView, []);
   const repoNames = [...repos.keys()].sort();
   if (activeFilter && !repos.has(activeFilter)) repoNames.push(activeFilter);
   const visible = inView.filter(t => !activeFilter || t.repo === activeFilter);
   const displayGroups = disposition === 'history'
     ? [{ key: 'done' as const, label: '历史记录', dot: 'bg-fg-dim' }]
-    : GROUPS.filter(g => disposition === 'attention' ? ['human', 'blocked'].includes(g.key) : ['queued', 'active', 'reviewing', 'merging', 'done'].includes(g.key));
+    : GROUPS.filter(g => disposition === 'attention' ? g.key === 'human' : disposition === 'errors' ? g.key === 'blocked' : ['queued', 'active', 'reviewing', 'merging', 'done'].includes(g.key));
   const deferredGroup: GroupKey = disposition === 'normal' ? 'blocked' : 'done';
   if (disposition !== 'history' && includeDeferred) displayGroups.push({ key: deferredGroup, label: '暂缓', dot: 'bg-fg-dim' });
   const byGroup = new Map<GroupKey, TaskSummary[]>();
   for (const g of GROUPS) byGroup.set(g.key, []);
   for (const t of visible) {
-    byGroup.get(disposition === 'history' ? 'done' : deferred(t) ? deferredGroup : taskGroup(t))!.push(t);
+    byGroup.get(disposition === 'history' ? 'done' : deferred(t) ? deferredGroup : disposition === 'errors' ? 'blocked' : disposition === 'attention' ? 'human' : taskGroup(t))!.push(t);
   }
   for (const list of byGroup.values()) {
     list.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
@@ -116,12 +117,13 @@ export default function Board(props: {
           <h1 className="text-base font-semibold text-fg">执行工作台</h1>
           <p className="text-xs text-fg-muted">{attentionCount > 0 ? `${attentionCount} 项待你处理${executionCount > 0 ? `，${executionCount} 项正在推进` : '，当前没有执行任务'}` : executionCount > 0 ? `${executionCount} 项任务由 Agent 推进` : '当前没有需要你介入的任务'}</p>
         </div>
-        <nav aria-label="工作台视图" className="flex gap-4 sm:gap-6">
+        <nav aria-label="工作台视图" className="flex gap-3 overflow-x-auto sm:gap-6">
           {([
             { id: 'normal', label: '执行看板', count: executionCount + recentCompletedCount },
             { id: 'attention', label: '待我处理', count: attentionCount },
+            { id: 'errors', label: '执行受阻', count: scoped.filter(executionError).length },
             { id: 'history', label: '历史记录', count: historyCount },
-          ] as const).map(view => <button key={view.id} type="button" aria-pressed={disposition === view.id} onClick={() => { setDisposition(view.id); setMobileGroup(null); }} className={`flex min-h-11 items-center gap-2 border-b-2 text-xs font-medium focus-visible:outline-2 focus-visible:outline-brand ${disposition === view.id ? 'border-brand text-fg' : 'border-transparent text-fg-muted hover:text-fg'}`}>
+          ] as const).map(view => <button key={view.id} type="button" aria-pressed={disposition === view.id} onClick={() => { setDisposition(view.id); setMobileGroup(null); }} className={`flex min-h-11 shrink-0 items-center gap-2 border-b-2 text-xs font-medium focus-visible:outline-2 focus-visible:outline-brand ${disposition === view.id ? 'border-brand text-fg' : 'border-transparent text-fg-muted hover:text-fg'}`}>
             {view.label}<span className={`rounded px-1.5 py-0.5 text-[10px] tabular-nums ${view.id === 'attention' && view.count > 0 ? 'bg-warn/15 text-warn' : 'bg-elevated text-fg-muted'}`}>{view.count}</span>
           </button>)}
         </nav>

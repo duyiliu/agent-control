@@ -221,18 +221,20 @@ export class GitHubTracker {
   async getPrDetails(repo: string, prNumber: number): Promise<{
     state: 'MERGED' | 'CLOSED' | 'OPEN';
     headSha: string;
+    baseSha?: string;
     labels: string[];
     isDraft: boolean;
     url: string;
     body: string;
     mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   }> {
-    const r = await this.ghJson<{ state: string; headRefOid: string; labels: { name: string }[]; isDraft: boolean; url: string; body: string; mergeable: string }>([
-      'pr', 'view', String(prNumber), '-R', repo, '--json', 'state,headRefOid,labels,isDraft,url,body,mergeable',
+    const r = await this.ghJson<{ state: string; headRefOid: string; baseRefOid?: string; labels: { name: string }[]; isDraft: boolean; url: string; body: string; mergeable: string }>([
+      'pr', 'view', String(prNumber), '-R', repo, '--json', 'state,headRefOid,baseRefOid,labels,isDraft,url,body,mergeable',
     ]);
     return {
       state: r.state === 'MERGED' ? 'MERGED' : r.state === 'CLOSED' ? 'CLOSED' : 'OPEN',
       headSha: r.headRefOid,
+      baseSha: r.baseRefOid,
       labels: (r.labels ?? []).map((l) => l.name),
       isDraft: r.isDraft,
       url: r.url,
@@ -271,6 +273,10 @@ export class GitHubTracker {
   /** Draft → ready for review, required before `gh pr merge` accepts it. */
   async markPrReady(repo: string, prNumber: number): Promise<void> {
     await this.gh(['pr', 'ready', String(prNumber), '-R', repo]);
+  }
+
+  async markPrDraft(repo: string, prNumber: number): Promise<void> {
+    await this.gh(['pr', 'ready', String(prNumber), '-R', repo, '--undo']);
   }
 
   /**

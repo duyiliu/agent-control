@@ -17,6 +17,7 @@ function fakeWorkspace(): GitWorkspace {
   return {
     isDirty: async () => false,
     head: async () => 'head-sha',
+    refSha: async (_repo: string, ref: string) => ref,
     diffVsBase: async () => 'diff',
     fetchBranch: async () => {},
     addDetachedWorktree: async (_repo: string, _sha: string, p: string) => p,
@@ -99,6 +100,20 @@ test('PR discovery: first tick only writes the anchor, so a backlog is not queue
     await tickAndDrain(engine);
     assert.equal(store.getTask('me/sandbox', 11), null);
     assert.ok(store.getMeta('pr_review_since:me/sandbox'));
+  } finally { env.done(); }
+});
+
+test('v2 PR discovery pins new advisory tasks without enabling checks or coding', async () => {
+  const env = setup(); try {
+    env.config.review_policy = { version: 2 };
+    env.tracker.openPrs = [openPr()];
+    const { store, engine } = makeEngine(env, async () => ({ result: { verdict: 'PASS', risk: 'low', summary: 'reviewed', findings: [],
+      assessment: { protocol_version: 2, summary: 'reviewed', findings: [], verification_requests: [], decision_requests: [], compatibility: { kind: 'unchanged', evidence: ['callers inspected'] } } }, logPath: 'r' }));
+    await tickAndDrain(engine); await tickAndDrain(engine);
+    const task = store.getTask('me/sandbox', 11)!;
+    assert.equal(store.getReviewControl(task.id)?.policy_version, 2);
+    assert.equal(store.getReviewControl(task.id)?.rounds, 1);
+    assert.equal(task.status, 'AWAITING_HUMAN'); assert.deepEqual(env.tracker.merged, []);
   } finally { env.done(); }
 });
 

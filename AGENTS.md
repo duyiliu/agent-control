@@ -9,6 +9,30 @@
 
 ## Invariants (do not break)
 
+- Review policy v2 is opt-in (`review_policy.version: 2`) and pinned in
+  `tasks.review_control_json` for new tasks. Existing tasks stay legacy until
+  explicit rereview. The legacy high-risk/size and conflict-approval rules below
+  apply only to legacy tasks. In v2, structured findings and verification requests
+  go to bounded AI repair; concrete decision requests require scoped human answers.
+  Reviewer `high`, contract version and change size alone do not require a human.
+  `human_review_paths` match the full diff, including generated and documentation
+  paths; never apply their gate to an already filtered diff.
+  Each requirement version shares 6 review rounds, 3 infrastructure failures and
+  `retry_limit` repairs. Counters are reserved with the claim in a transaction.
+  Recovery of an interrupted v2 review records ERROR and retries through dispatch
+  with backoff; it never resumes that review run outside the persistent budget.
+  Explicit human retry/rereview renews the budget with an event and retains history
+  and unresolved evidence for the same SHA. Every new head (including conflict
+  repair) voids approval and must be reviewed again. Before landing, independently
+  recheck current issue/hash/holds, task version, head/base, guarded checks and
+  unresolved findings/decisions. Merge labels cannot answer decision requests.
+  Answers bind request id, requirement hash and head SHA. A refusal cannot be
+  replaced by ordinary merge approval or budget renewal. Bare PRs stay advisory.
+  Closed issues with no merged PR are CANCELED, preserving explicit dispositions.
+  Schema v12 requires matching code: rollback means stop/drain, restore the
+  pre-upgrade database/config backup, then run the matching old version. The Store
+  rejects schemas newer than its supported version; never attach old code to v12.
+
 - `runs` table: the partial unique index enforces one active run per task.
   Never bypass it with direct writes.
 - All phase transitions go through `Store.transition`/`endRun` → `run_events`.
@@ -16,15 +40,19 @@
   `GH_TOKEN`/`GITHUB_TOKEN` to it. The scrub also kills on-disk auth: empty
   `GH_CONFIG_DIR`, cleared `credential.helper`, dead `GIT_SSH_COMMAND`. Child
   `git push`/`gh` must stay unauthenticated — do not weaken.
-- Reviews are separate runs (`runs.kind='review'`) pinned to one PR head sha.
+- Reviews are separate runs (`runs.kind='review'`) pinned to the PR head and
+  base sha. The host fetches the base and builds the full diff against that
+  exact base commit; a missing base sha is a human path. A moved base invalidates
+  the prior review even when the PR head is unchanged.
   An auto-review project (`review_mode: auto`, the default) publishes into
   `AWAITING_REVIEW` (Human Review: PR open, review pending) and `dispatchReviews`
-  claims one review run per head from that state; `AWAITING_HUMAN` means strictly
-  "reviewed, waiting for a human to merge". `review_mode: manual` spends no
+  claims one review run per head/base scope from that state; `AWAITING_HUMAN` means the PR
+  is ready for human review or needs the stated human intervention. `review_mode: manual` spends no
   reviewer run: the PR publishes straight into AWAITING_HUMAN. Switching a
-  project to manual also parks any in-flight MERGING task. A moved head or a
-  shutdown-cancelled review round returns the task to AWAITING_REVIEW so a new
-  sha can be reviewed; a verdict-based human outcome stays in AWAITING_HUMAN. The review site is a
+  project to manual also parks any in-flight MERGING task. A moved head or base
+  returns auto-review tasks to AWAITING_REVIEW and Draft so the current scope is
+  reviewed; manual-review tasks stay in AWAITING_HUMAN. A shutdown-cancelled
+  review round returns the task to AWAITING_REVIEW; a verdict-based human outcome stays in AWAITING_HUMAN. The review site is a
   materialization of that sha (coding worktree reuse or a detached worktree);
   HEAD sha + clean status is asserted afterwards — a moved HEAD or dirty site
   is reviewer tampering → ERROR verdict + human path, never a fixable verdict.
@@ -35,48 +63,34 @@
   unchanged head and the sha idempotency strands it forever (it shows as
   "reviewing" and can never move). `dispatchReviews` parks such a stranded
   task in `BLOCKED` (retryable) instead of leaving it looking alive.
-  A low-risk PASS parks the task in `MERGING` — a host-side sweep
-  (`reconcileMergeStates`/`driveMerge`) owns landing, never the review run.
-  "Low-risk" is measured on the source change only: `max_files`/`max_lines`
-  count `code` paths, and generated output (`dist/**`, `*.generated.*`) and
-  docs are excluded from both the risk gate and the reviewer diff (the diff
-  carries an explicit "已省略 N 个生成物文件" header). That exclusion is only
-  safe because `projects[].verify_build` (global fallback
-  `approvals.auto_merge.verify_build`), when configured, rebuilds the approved
-  head before landing and refuses the merge if the generated paths drift from
-  the commit. The rebuild site is the coding worktree when it still sits on
-  the approved sha; otherwise the sha is materialized detached and
-  `verify_bootstrap` (e.g. `npm ci`) installs deps first — every failure mode
-  (no site, build failure, drift) goes to the human path, never merges blind.
-  Reviewer `risk=high` and sensitive paths remain hard human gates.
-  The cleared sha is recorded on the task (`approved_sha`, `approved_by`).
-  Each tick the sweep re-verifies PR head == `approved_sha` (a moved head
-  returns to AWAITING_REVIEW for a fresh review), runs
-  `gh pr merge --squash --match-head-commit`, and retries refusals within
-  `merge_attempts < 20` before parking on the human path with
-  `agent-high-risk`. A `CONFLICTING` mergeable instead spawns a fix run via
-  `tasks.pending_fix` (same budget as review-BLOCK fixes): the fix merges
-  `<git_remote>/<base_branch>` — the host fetches it because the child's
-  scrubbed env cannot — resolves conflicts and pushes a new head. The task
-  stays in MERGING for the whole repair, and on publish it returns straight
-  to MERGING with the new head cleared (`approved_sha`/`approved_by` carried
-  over) — no re-review, Symphony-style. The sweep skips MERGING tasks that
-  still have an active repair run. `stopTask` on MERGING returns the
-  task to the human merge path.
-  A human clears an AWAITING_HUMAN task by adding the `agent-merge` PR
+  AI PASS never enters `MERGING`: after validating current Issue authorization,
+  human holds, cancellation, PR HEAD/base and non-empty passing SHA-bound host
+  Checks, the host marks the Draft PR Ready and posts a handoff summary. Missing
+  checks or failed Ready operations leave the PR Draft with an actionable reason.
+  `approvals.auto_merge.enabled` remains for old config compatibility but does
+  not turn an AI verdict into merge approval. Only a human `agent-merge` action
+  enters `MERGING`; the host rechecks Issue, task version, PR head/base, review
+  decisions and guarded checks, then uses `--match-head-commit`.
+  If an explicitly human-approved merge conflicts, `tasks.pending_fix` may queue
+  a repair using the existing shared fix budget. The host fetches
+  `<git_remote>/<base_branch>` because the child cannot authenticate; it clears
+  the old approval and sends the repaired new HEAD back through Checks and Review.
+  The human must approve that new reviewed SHA separately. `stopTask` on MERGING
+  returns the task to the human merge path.
+  A human approves an AWAITING_HUMAN task by adding the `agent-merge` PR
   label: the sweep consumes it one-shot (removes it before the transition),
   records `approved_sha`/`approved_by='human'`, and moves the task to
   MERGING pinned to the last reviewed sha — a head that moved past it voids
   the approval instead. In manual mode there is no verdict sha; the approval
-  pins the head current at consumption time. `driveMerge` honours the
-  manual-mode opt-out only for review-driven approvals (`approved_by='review'`).
-- Only the Pi runner is supported. The coder is one long-lived `pi --mode rpc`
-  session per run (`runners/session.ts`): RUNNING and every FIXING turn share the
-  same conversation, and that child **is** the run's `pid` — it must be closed in
-  the run's `finally`, never left to the next phase. 按 run 持久化：绑定
-  `--session-id <run_id>` 与 `--session-dir <run artifacts>/pi-session`，
-  服务重启后由启动对账重开同一份历史；会话目录只认与该 run id、工作目录
-  匹配的 session 头，外来或歧义文件一律拒绝复用。
+  pins the current head at consumption time. `driveMerge` accepts only
+  `approved_by='human'`.
+- Only the Pi runner is supported. Each code Run owns one `pi --mode rpc`
+  process (`runners/session.ts`): RUNNING and FIXING within that Run share the
+  conversation; close the process in its `finally`. Across Runs, Issue coding
+  and repair reuse the session ID and directory anchored to the first code Run.
+  Each process remains separately logged and owned by its active Run. Session
+  header/cwd ownership checks still apply; ambiguous or corrupt history parks
+  safely rather than silently creating a cold session.
   Review stays a one-shot `pi -p` call (`runners/pi.ts`) with a read-only tool
   allowlist (no bash/edit/write) and stays ephemeral. `review_model` and
   `review_reasoning_effort` may select a different Pi model/settings for review.
