@@ -8,8 +8,11 @@ import { appendProjectToConfigFile, ConfigError } from '../config.js';
 import { runProc } from '../proc.js';
 import { requiredLabelsForProject } from '../tracker/github.js';
 import type { IssueTriage } from '../triage/service.js';
+import { taskActions, taskAttention, type Attention, type TaskActions } from './task-state.js';
 
 export interface TaskSummary {
+  actions?: TaskActions;
+  attention?: Attention | null;
   intake?: IntakeState | null;
   id: number;
   repo: string;
@@ -33,7 +36,7 @@ export interface RunDetail extends RunRow {
 }
 
 export interface TaskDetail {
-  task: TaskRow & { intake?: IntakeState | null };
+  task: TaskRow & { intake?: IntakeState | null; actions?: TaskActions; attention?: Attention | null };
   runs: RunDetail[];
   has_active_run: boolean;
   retryable: boolean;
@@ -254,14 +257,28 @@ export async function addProjectPayload(
 
 const RED_PHASES: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED'];
 
-export function tasksPayload(store: Store): { tasks: TaskSummary[] } {
+function taskPresentation(store: Store, task: TaskRow, last: RunRow | undefined, active: boolean, config?: AppConfig) {
+  const intake = store.getIntake<IntakeState>(task.repo, task.issue_number);
+  let reviewSummary = '';
+  if (last && (last.phase === task.status || task.source === 'pr' && task.status === 'AWAITING_HUMAN' && last.kind === 'review' && last.phase === 'COMPLETED') && ['AWAITING_HUMAN', 'BLOCKED', 'FAILED'].includes(task.status)) {
+    for (const event of store.eventsForRun(last.run_id).reverse()) {
+      try {
+        const detail = JSON.parse(event.detail_json ?? 'null') as { kind?: string; summary?: string } | null;
+        if (detail?.kind === 'review_completed' && typeof detail.summary === 'string') { reviewSummary = detail.summary; break; }
+      } catch { /* Older event details may not be structured. */ }
+    }
+  }
+  return { intake, actions: taskActions(task, active, intake, config), attention: taskAttention(task, last, intake, reviewSummary) };
+}
+
+export function tasksPayload(store: Store, config?: AppConfig): { tasks: TaskSummary[] } {
   return {
     tasks: store.listTasks().map((t) => {
       const runs = store.runsForTask(t.id);
       const active = store.activeRunForTask(t.id);
       const last = runs[runs.length - 1];
       return {
-        intake: store.getIntake<IntakeState>(t.repo, t.issue_number),
+        ...taskPresentation(store, t, last, !!active, config),
         id: t.id,
         repo: t.repo,
         issue_number: t.issue_number,
@@ -282,7 +299,7 @@ export function tasksPayload(store: Store): { tasks: TaskSummary[] } {
   };
 }
 
-export function taskPayload(store: Store, id: number): TaskDetail | null {
+export function taskPayload(store: Store, id: number, config?: AppConfig): TaskDetail | null {
   const task = store.getTaskById(id);
   if (!task) return null;
   const runs: RunDetail[] = store.runsForTask(id).map((r) => ({
@@ -291,7 +308,7 @@ export function taskPayload(store: Store, id: number): TaskDetail | null {
     checks: store.checksForRun(r.run_id),
   }));
   return {
-    task: { ...task, intake: store.getIntake<IntakeState>(task.repo, task.issue_number) },
+    task: { ...task, ...taskPresentation(store, task, store.runsForTask(id).at(-1), !!store.activeRunForTask(id), config) },
     runs,
     has_active_run: store.activeRunForTask(id) !== null,
     retryable: [...RED_PHASES, 'CANCELED'].includes(task.status),

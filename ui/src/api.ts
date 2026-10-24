@@ -26,6 +26,8 @@ export interface IntakeState {
 }
 
 export interface TaskSummary {
+  actions?: { stop: boolean; retry: boolean; rereview: boolean; approve_merge: boolean };
+  attention?: { summary: string; detail: string; next_step: string } | null;
   intake?: IntakeState | null;
   id: number;
   repo: string;
@@ -188,8 +190,8 @@ export const fetchTail = (runId: string, offset: number | null, file: string | n
   return get<TailChunk>(`/api/runs/${encodeURIComponent(runId)}/tail?${params}`);
 };
 
-export async function postAction(id: number, action: 'stop' | 'retry' | 'approve-merge'): Promise<string> {
-  const r = await fetch(`/api/tasks/${id}/${action}`, { method: 'POST' });
+export async function postAction(id: number, action: 'stop' | 'retry' | 'rereview' | 'approve-merge', expectedUpdatedAt?: string): Promise<string> {
+  const r = await fetch(`/api/tasks/${id}/${action}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ expected_updated_at: expectedUpdatedAt }) });
   const d = (await r.json().catch(() => ({}))) as { message?: string; error?: string };
   if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
   return d.message ?? 'done';

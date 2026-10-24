@@ -220,13 +220,13 @@ async function handle(deps: UiDeps, req: IncomingMessage, res: ServerResponse): 
   }
 
   if (method === 'GET' && path === '/api/tasks') {
-    json(res, 200, tasksPayload(deps.store));
+    json(res, 200, tasksPayload(deps.store, deps.config));
     return;
   }
 
   const taskApi = /^\/api\/tasks\/(\d+)$/.exec(path);
   if (method === 'GET' && taskApi) {
-    const detail = taskPayload(deps.store, Number(taskApi[1]));
+    const detail = taskPayload(deps.store, Number(taskApi[1]), deps.config);
     if (!detail) { json(res, 404, { error: 'no such task' }); return; }
     json(res, 200, detail);
     return;

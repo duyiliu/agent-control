@@ -12,6 +12,7 @@ import { fmtDur, fmtTime, isActivePhase, phaseLabel, phaseTextClass } from './gr
 import StatusIcon from './StatusIcon';
 import LiveLog from './LiveLog';
 import IntakeActions from './IntakeActions';
+import TaskAttention from './TaskAttention';
 import type { Toast } from './App';
 
 export default function DetailDrawer(props: {
@@ -23,23 +24,31 @@ export default function DetailDrawer(props: {
   const { taskId, onClose, onChanged, onToast } = props;
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const actionInFlight = useRef(false);
+  const currentTaskId = useRef(taskId);
+  currentTaskId.current = taskId;
   const [artifact, setArtifact] = useState<{ path: string; data: Artifact | null; error: string | null } | null>(null);
 
   const refreshSequence = useRef(0);
   const refresh = useCallback(async () => {
+    if (currentTaskId.current !== taskId) return;
     const sequence = ++refreshSequence.current;
     try {
       const next = await fetchTask(taskId);
-      if (sequence !== refreshSequence.current) return;
+      if (sequence !== refreshSequence.current || currentTaskId.current !== taskId) return;
       setDetail(current => current?.task.id === next.task.id && (current.task.intake?.version ?? 0) > (next.task.intake?.version ?? 0) ? { ...next, task: { ...next.task, intake: current.task.intake } } : next);
       setError(null);
     } catch (e) {
-      setError((e as Error).message);
+      if (currentTaskId.current === taskId && sequence === refreshSequence.current) setError((e as Error).message);
     }
   }, [taskId]);
 
   useEffect(() => {
     setDetail(null);
+    setActionMessage(null);
+    setArtifact(null);
     refresh();
     const id = setInterval(() => {
       if (!document.hidden) refresh();
@@ -57,19 +66,31 @@ export default function DetailDrawer(props: {
     return () => window.removeEventListener('keydown', h);
   }, [artifact, onClose]);
 
-  const act = async (action: 'stop' | 'retry' | 'approve-merge') => {
+  const act = async (action: 'stop' | 'retry' | 'rereview' | 'approve-merge') => {
+    if (actionInFlight.current || !detail) return;
     const verb =
       action === 'stop'
         ? '停止这个任务？调度器会在一个轮询周期内中止当前运行。'
         : action === 'retry'
           ? '重试这个任务？当前 issue 内容将成为新的已批准内容。'
-          : '批准合并？调度器会校验 PR head 仍是被审版本，然后钉 sha 自动合并。';
+          : action === 'rereview'
+            ? '重新评审当前 PR？现有代码与检查证据会保留，旧评审结论和合并批准将撤销。'
+            : '批准合并？调度器会校验 PR head 仍是被审版本，然后钉 sha 自动合并。';
     if (!confirm(verb)) return;
+    actionInFlight.current = true;
+    setBusyAction(action);
+    setActionMessage(null);
     try {
-      onToast({ msg: await postAction(taskId, action) });
+      const message = await postAction(taskId, action, detail.task.updated_at);
+      onToast({ msg: message });
+      if (currentTaskId.current === taskId) setActionMessage(message);
       await Promise.all([refresh(), onChanged()]);
     } catch (e) {
       onToast({ msg: (e as Error).message, err: true });
+      await refresh();
+    } finally {
+      actionInFlight.current = false;
+      setBusyAction(null);
     }
   };
 
@@ -83,7 +104,7 @@ export default function DetailDrawer(props: {
   };
 
   const t = detail?.task;
-  const showStop = detail?.has_active_run || (t ? isActivePhase(t.status) : false);
+  const showStop = t?.actions?.stop ?? (detail?.has_active_run || (t ? isActivePhase(t.status) : false));
 
   return (
     <div className="fixed inset-0 z-20" style={{ animation: 'fade-in .15s ease-out' }}>
@@ -95,7 +116,7 @@ export default function DetailDrawer(props: {
         <header className="flex shrink-0 flex-wrap items-start gap-x-2 gap-y-2 border-b border-edge px-3 py-3 sm:px-4 md:flex-nowrap md:gap-3 md:py-3.5">
           <button
             onClick={onClose}
-            className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-md text-fg-muted hover:bg-elevated hover:text-fg"
+            className="flex size-10 shrink-0 touch-manipulation items-center justify-center rounded-md text-fg-muted hover:bg-elevated hover:text-fg"
             title="关闭"
           >
             <ChevronLeft className="size-4" />
@@ -129,31 +150,35 @@ export default function DetailDrawer(props: {
           </div>
           {t && (
             <div className="order-2 flex w-full items-center justify-end gap-2 md:order-none md:ml-auto md:w-auto md:shrink-0 md:pt-0.5">
-              {t.status === 'AWAITING_HUMAN' && t.pr_url && (
+              {(t.actions?.approve_merge ?? (t.status === 'AWAITING_HUMAN' && t.pr_url && t.source !== 'pr')) && (
                 <button
+                  disabled={!!busyAction}
                   onClick={() => act('approve-merge')}
                   className="flex min-h-10 touch-manipulation items-center gap-1.5 rounded-md border border-ok/30 px-3 py-2 text-xs font-medium text-ok hover:bg-ok/10"
                 >
                   <Check className="size-3" />
-                  批准合并
+                  {busyAction === 'approve-merge' ? '正在提交…' : '批准合并'}
                 </button>
               )}
+              {t.actions?.rereview && <button disabled={!!busyAction} onClick={() => act('rereview')} className="flex min-h-10 touch-manipulation items-center gap-1.5 rounded-md border border-info/30 px-3 py-2 text-xs font-medium text-info hover:bg-info/10 disabled:opacity-40"><RotateCw className="size-3" />{busyAction === 'rereview' ? '正在排队…' : '重新评审'}</button>}
               {showStop && (
                 <button
+                  disabled={!!busyAction}
                   onClick={() => act('stop')}
                   className="flex min-h-10 touch-manipulation items-center gap-1.5 rounded-md border border-danger/30 px-3 py-2 text-xs font-medium text-danger hover:bg-danger/10"
                 >
                   <Square className="size-3" />
-                  停止
+                  {busyAction === 'stop' ? '正在请求…' : '停止'}
                 </button>
               )}
-              {detail!.retryable && !t.intake && (
+              {(t.actions?.retry ?? (detail!.retryable && !t.intake)) && (
                 <button
+                  disabled={!!busyAction}
                   onClick={() => act('retry')}
                   className="flex min-h-10 touch-manipulation items-center gap-1.5 rounded-md border border-info/30 px-3 py-2 text-xs font-medium text-info hover:bg-info/10"
                 >
                   <RotateCw className="size-3" />
-                  重试
+                  {busyAction === 'retry' ? '正在排队…' : '重试'}
                 </button>
               )}
               <a
@@ -175,6 +200,9 @@ export default function DetailDrawer(props: {
               {error}
             </div>
           )}
+          {actionMessage && <p role="status" className="mb-3 rounded-md border border-info/25 bg-info/5 px-3 py-2 text-xs text-info">{actionMessage}</p>}
+          {t?.source === 'pr' && t.status === 'AWAITING_HUMAN' && <a href={t.pr_url ?? t.issue_url} target="_blank" rel="noopener noreferrer" className="mb-3 inline-block text-xs text-info hover:underline">在 GitHub 查看评审并决定是否合并 ↗</a>}
+          {t && <TaskAttention attention={t.attention} />}
           {t && <><MetaGrid detail={detail!} /><IntakeActions task={t} active={detail!.has_active_run} onState={state => { ++refreshSequence.current; setDetail(current => current && state.version >= (current.task.intake?.version ?? 0) ? { ...current, task: { ...current.task, intake: state } } : current); }} onChanged={() => { refresh(); onChanged(); }} onToast={onToast} /></>}
           {detail && (
             <div className="mt-4 space-y-3">
