@@ -216,7 +216,9 @@ export default function Board(props: {
                   {items.length}
                 </span>
               </header>
-              <div className="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain px-2 pb-[max(.5rem,env(safe-area-inset-bottom))]">
+              {/* lg+ only: on mobile this box has zero scroll extent, and a
+                  nested overflow container would swallow the touch scroll. */}
+              <div className="min-h-0 flex-1 space-y-2 px-2 pb-[max(.5rem,env(safe-area-inset-bottom))] lg:overflow-y-auto lg:overscroll-contain">
                 {items.map((t) => (
                   <TaskCard
                     key={t.id}
