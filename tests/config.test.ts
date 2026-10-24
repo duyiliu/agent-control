@@ -179,4 +179,6 @@ test('config: explicit issue intake overrides the deprecated triage switch', asy
   assert.equal(acceptsAllIssues(validateProject(raw)), false);
   assert.equal(acceptsAllIssues(validateProject({ ...raw, issue_intake: 'all' })), true);
   assert.throws(() => validateProject({ ...raw, issue_intake: 'random' }), /issue_intake/);
+  assert.equal(acceptsAllIssues(validateProject({ repo: 'o/r', local_repo: '.' })), false);
+  assert.equal(acceptsAllIssues(validateProject({ repo: 'o/r', local_repo: '.', issue_triage: { enabled: true } })), true);
 });
