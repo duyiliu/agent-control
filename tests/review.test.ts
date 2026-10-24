@@ -103,7 +103,7 @@ test('review: repeated narration is recovered but forced high-risk after retry',
       writeFileSync(opts.lastMessagePath, `已根据 worktree 文件核实证据。改动仅 index.html，符合范围。\n\n${JSON.stringify(passed)}`);
       return ok();
     });
-    assert.equal(calls, 2);
+    assert.equal(calls, 3);
     assert.equal(out.result.verdict, 'PASS');
     assert.equal(out.result.risk, 'high'); // protocol break never earns auto-merge
     assert.match(out.result.summary, /^\[protocol-recovered\]/);
@@ -119,7 +119,7 @@ test('review: two objects in repeated narration stay ambiguous after retry', asy
       writeFileSync(opts.lastMessagePath, `示例格式：{"note":"not a verdict"}\n\n${JSON.stringify(passed)}`);
       return ok();
     });
-    assert.equal(calls, 2);
+    assert.equal(calls, 3);
     assert.equal(out.result.verdict, 'HUMAN_REVIEW_REQUIRED');
   } finally { cleanup(env.dir); }
 });
@@ -205,7 +205,7 @@ test('review: one shape-valid object is recovered even amid example-ish prose (f
       writeFileSync(opts.lastMessagePath, `I could not review. Example only: ${JSON.stringify(passed)}`);
       return ok();
     });
-    assert.equal(calls, 2);
+    assert.equal(calls, 3);
     assert.equal(out.result.verdict, 'PASS');
     // Recovery is deliberately lossy: marker + forced high risk keep it off auto-merge.
     assert.equal(out.result.risk, 'high');
