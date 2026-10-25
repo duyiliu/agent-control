@@ -20,7 +20,7 @@ import type { ReviewControl, ReviewAssessment, ReviewScope, DecisionRequest } fr
 import { publishDraftPr, PublishError } from '../publish/pr.js';
 import { buildCoderPrompt, buildFixPrompt, CODER_RESUME_NOTE, MAX_REVIEW_DIFF_CHARS, type PromptContext } from './prompts.js';
 import {
-  classifyPath, DEFAULT_POLICY, filterGenerated, SENSITIVE_PATH, splitDiff, type PathPolicy,
+  classifyPath, codeStats, DEFAULT_POLICY, filterGenerated, SENSITIVE_PATH, splitDiff, type DiffFile, type PathPolicy,
 } from './diff-paths.js';
 import type { AppConfig, CheckSpec, IssueData, PendingFix, Phase, ProjectConfig, ReviewResult, RunRow, TaskRow } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
@@ -274,6 +274,36 @@ export class Engine {
     return this.store.getTaskById(task.id)?.updated_at === task.updated_at;
   }
 
+  /**
+   * v2 auto-merge eligibility: a PASS verdict only enters MERGING when the
+   * task is proven routine. Unanswered decision requests, review leftovers,
+   * guarded paths, intake vetoes, non-issue sources and the source-code size
+   * gate each bounce the task back to the human path; resolved decisions do
+   * not — answering a question already counts as the human's intervention.
+   */
+  private autoMergeEligibility(task: TaskRow, project: ProjectConfig, sha: string, files: DiffFile[]): { ok: boolean; reason: string } {
+    const cfg = this.config.approvals.auto_merge;
+    const control = this.store.getReviewControl(task.id);
+    if (!cfg.enabled || task.source !== 'issue' || !control) return { ok: false, reason: '' };
+    if (unresolvedDecisions(control, sha).length) return { ok: false, reason: '存在未解决的人工决策' };
+    const assessment = control.assessment;
+    if (assessment && (assessment.findings.length > 0 || assessment.verification_requests.length > 0
+      || assessment.compatibility.kind === 'breaking' || assessment.compatibility.kind === 'unknown')) {
+      return { ok: false, reason: '评审存在未决 findings、补证或兼容性疑点' };
+    }
+    const intake = this.store.getIntake<{ locked?: boolean; external_hold?: boolean; external_needs?: boolean }>(task.repo, task.issue_number);
+    if (intake?.locked || intake?.external_hold || intake?.external_needs) return { ok: false, reason: '任务存在人工门禁' };
+    const guarded = files.filter(file =>
+      classifyPath(file.path, { generated: project.human_review_paths ?? [], docs: [] }) === 'generated'
+      || (project.review_mode === 'manual' && SENSITIVE_PATH.test(file.path)));
+    if (guarded.length) return { ok: false, reason: `触及受保护路径 ${guarded[0]!.path}` };
+    const stats = codeStats(files, this.pathPolicy());
+    if (stats.files > cfg.max_files || stats.lines > cfg.max_lines) {
+      return { ok: false, reason: `源码改动 ${stats.files} 文件 / ${stats.lines} 行超过自动合并阈值 ${cfg.max_files}/${cfg.max_lines}` };
+    }
+    return { ok: true, reason: '' };
+  }
+
   private async handoffPassedReview(run: RunRow, task: TaskRow, project: ProjectConfig, sha: string, baseSha: string | null | undefined, sitePath: string, summary: string, diff: string) {
     const prNumber = prNumberFromUrl(run.pr_url ?? task.pr_url);
     if (!prNumber) { this.finishReview(run, task, 'BLOCKED', 'review PASS but no PR is available for human handoff', 'AWAITING_HUMAN'); return; }
@@ -333,8 +363,20 @@ export class Engine {
         return;
       }
       const checkList = applicable.map(check => `- \`${check.argv.join(' ')}\`: PASS`).join('\n');
-      const files = [...new Set(splitDiff(diff).map(file => file.path))];
+      const diffFiles = splitDiff(diff);
+      const files = [...new Set(diffFiles.map(file => file.path))];
       const fileList = [...files.slice(0, 50).map(file => `- \`${file}\``), ...(files.length > 50 ? [`- 另有 ${files.length - 50} 个文件`] : [])].join('\n') || '- (未解析到文件路径)';
+      const auto = this.autoMergeEligibility(task, project, sha, diffFiles);
+      if (auto.ok) {
+        await this.tracker.commentPr(project.repo, prNumber,
+          `<!-- agent-control-human-handoff:${sha} -->\n## AI 已完成，符合自动合并条件\n\n- HEAD：\`${sha}\`\n- Review：PASS\n- Review 摘要 / 已知风险：${summary.slice(0, 500)}\n\n### 实现范围\n${fileList}\n\n### 宿主 Checks\n${checkList}\n\n已自动批准并进入合并流程（approvals.auto_merge）。`)
+          .catch(error => { this.appLog.event('pr_handoff_comment_error', { task: task.id, pr: prNumber, error: String(error) }); throw error; });
+        this.store.transition(run.run_id, 'REVIEWING', 'REVIEWING', { kind: 'auto_merge_approved', head_sha: sha, base_sha: baseSha });
+        this.appLog.event('auto_merge_approved', { task: task.id, head_sha: sha });
+        this.finishReview(run, task, 'COMPLETED', 'AI 已完成，符合自动合并条件，进入合并', 'MERGING', { merge_attempts: 0, approved_sha: sha, approved_by: 'review' });
+        return;
+      }
+      if (auto.reason) this.appLog.event('auto_merge_ineligible', { task: task.id, reason: auto.reason });
       await this.tracker.commentPr(project.repo, prNumber,
         `<!-- agent-control-human-handoff:${sha} -->\n## AI 已完成，待人工审查\n\n- HEAD：\`${sha}\`\n- Review：PASS\n- Review 摘要 / 已知风险：${summary.slice(0, 500)}\n\n### 实现范围\n${fileList}\n\n### 宿主 Checks\n${checkList}\n\n请在 GitHub 审查并决定是否合并。AI PASS 不会自动合并。`)
         .catch(error => { this.appLog.event('pr_handoff_comment_error', { task: task.id, pr: prNumber, error: String(error) }); throw error; });
@@ -655,7 +697,7 @@ export class Engine {
    */
   private async driveMerge(task: TaskRow, project: ProjectConfig, prNumber: number | undefined) {
     const store = this.store;
-    if (task.approved_by !== 'human') {
+    if (task.approved_by !== 'human' && task.approved_by !== 'review') {
       this.setTaskStatus(task.id, 'AWAITING_HUMAN', { approved_sha: null, approved_by: null });
       this.appLog.event('merge_approval_required', { task: task.id, approved_by: task.approved_by, approved_sha: task.approved_sha });
       return;

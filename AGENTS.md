@@ -63,14 +63,20 @@
   unchanged head and the sha idempotency strands it forever (it shows as
   "reviewing" and can never move). `dispatchReviews` parks such a stranded
   task in `BLOCKED` (retryable) instead of leaving it looking alive.
-  AI PASS never enters `MERGING`: after validating current Issue authorization,
-  human holds, cancellation, PR HEAD/base and non-empty passing SHA-bound host
-  Checks, the host marks the Draft PR Ready and posts a handoff summary. Missing
-  checks or failed Ready operations leave the PR Draft with an actionable reason.
-  `approvals.auto_merge.enabled` remains for old config compatibility but does
-  not turn an AI verdict into merge approval. Only a human `agent-merge` action
-  enters `MERGING`; the host rechecks Issue, task version, PR head/base, review
-  decisions and guarded checks, then uses `--match-head-commit`.
+  AI PASS lands in one of two places. After validating current Issue
+  authorization, human holds, cancellation, PR HEAD/base and non-empty passing
+  SHA-bound host Checks, the host marks the Draft PR Ready and posts a handoff
+  summary. With `approvals.auto_merge.enabled`, a v2 task then checks
+  eligibility — no unresolved decisions (answered ones do not block), no
+  findings/verification requests, no breaking/unknown compatibility, no
+  guarded paths, no intake vetoes, `source='issue'`, and source-code diff
+  under `max_files`/`max_lines` — and a qualifying PASS enters `MERGING`
+  with `approved_by='review'`; everything else waits in AWAITING_HUMAN for a
+  human `agent-merge` label, which records `approved_by='human'`. Missing
+  checks or failed Ready operations leave the PR Draft with an actionable
+  reason. `driveMerge` accepts either `approved_by`, rechecks Issue, task
+  version, PR head/base, review decisions and guarded checks, then uses
+  `--match-head-commit`.
   If an explicitly human-approved merge conflicts, `tasks.pending_fix` may queue
   a repair using the existing shared fix budget. The host fetches
   `<git_remote>/<base_branch>` because the child cannot authenticate; it clears
@@ -82,8 +88,8 @@
   records `approved_sha`/`approved_by='human'`, and moves the task to
   MERGING pinned to the last reviewed sha — a head that moved past it voids
   the approval instead. In manual mode there is no verdict sha; the approval
-  pins the current head at consumption time. `driveMerge` accepts only
-  `approved_by='human'`.
+  pins the current head at consumption time. `driveMerge` accepts
+  `approved_by='human'` or `'review'` (the auto-merge path above).
 - Only the Pi runner is supported. Each code Run owns one `pi --mode rpc`
   process (`runners/session.ts`): RUNNING and FIXING within that Run share the
   conversation; close the process in its `finally`. Across Runs, Issue coding

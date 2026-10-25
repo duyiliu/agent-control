@@ -86,8 +86,25 @@ test('v2 reviewer receives host-recorded findings and repair summary in a new st
   const e = boot({ previousFix: true }); try {
     await tick(e);
     assert.equal(e.calls.reviews, 1);
-    assert.equal(e.store.getTaskById(e.task.id)?.status, 'AWAITING_HUMAN');
+    assert.equal(e.store.getTaskById(e.task.id)?.status, 'MERGING');
   } finally { e.done(); }
+});
+test('v2 eligible PASS is auto-approved and enters MERGING', async () => {
+  const e = boot(); try {
+    await tick(e); const t = e.store.getTaskById(e.task.id)!;
+    assert.equal(t.status, 'MERGING'); assert.equal(t.approved_by, 'review'); assert.equal(t.approved_sha, SHA);
+    assert.ok(e.tracker.prComments.some(([, body]) => body.includes('符合自动合并条件') && body.includes(SHA)));
+  } finally { e.done(); }
+});
+test('v2 auto-merge eligibility refuses protected paths and oversized diffs', async () => {
+  const guarded = boot({ protected: ['src/cli.js'] }); try {
+    await tick(guarded); const t = guarded.store.getTaskById(guarded.task.id)!;
+    assert.equal(t.status, 'AWAITING_HUMAN'); assert.equal(t.approved_by, null);
+  } finally { guarded.done(); }
+  const big = boot({ diff: patch('src/cli.js', 500) }); try {
+    await tick(big); const t = big.store.getTaskById(big.task.id)!;
+    assert.equal(t.status, 'AWAITING_HUMAN'); assert.equal(t.approved_by, null);
+  } finally { big.done(); }
 });
 test('v2 review PASS with no applicable host checks keeps the PR in Draft', async () => {
   const e = boot({ emptyChecks: true }); try {
@@ -155,7 +172,7 @@ test('v2 rerun drops the legacy host-generated breaking question for the same he
       impact: '旧行为变化', reason: '当前评审判定为破坏性变更，需要明确选择兼容策略' });
     e.store.saveReviewControl(e.task.id, c);
     await tick(e); const t = e.store.getTaskById(e.task.id)!;
-    assert.equal(t.status, 'AWAITING_HUMAN');
+    assert.equal(t.status, 'MERGING');
     assert.equal(e.store.getReviewControl(t.id)!.decisions.some(d => d.request_id === 'legacy-host-breaking'), false);
   } finally { e.done(); }
 });
