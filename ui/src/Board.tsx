@@ -274,6 +274,7 @@ function TaskCard(props: {
   const { task, tick, selected, onSelect, onIntakeChanged, onChanged, onToast } = props;
   const active = task.active_run;
   const phase = active?.phase ?? task.status;
+  const prNumber = task.pr_url?.match(/\/pull\/(\d+)/)?.[1];
   const disposition = !active && !['COMPLETED', 'MERGING', 'AWAITING_REVIEW', 'AWAITING_HUMAN'].includes(task.status) ? task.intake : null;
   return (
     <div
@@ -335,6 +336,7 @@ function TaskCard(props: {
                 className="flex items-center gap-1 text-info/80 hover:text-info"
               >
                 <GitPullRequest className="size-3.5" />
+                {task.source === 'issue' && prNumber && <span className="tabular-nums">#{prNumber}</span>}
               </a>
             )}
           </span>

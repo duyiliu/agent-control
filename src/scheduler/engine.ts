@@ -81,10 +81,11 @@ function fmtSpan(fromIso: string, toIso: string | null): string {
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 }
 
-function priorReviewItems(assessment: ReviewAssessment): string {
+export function priorReviewItems(assessment: ReviewAssessment, ciSatisfied = false): string {
   const items = [
     ...assessment.findings.map(f => `[finding] ${f.file}:${f.line} ${f.trigger} → ${f.impact}；验证：${f.verification}`),
-    ...assessment.verification_requests.map(v => `[verification] ${v.claim}；场景：${v.scenario}；通过标准：${v.expected}`),
+    ...assessment.verification_requests.map(v => `[verification] ${v.claim}；场景：${v.scenario}；通过标准：${v.expected}`
+      + (ciSatisfied ? '（宿主核实：当前 SHA 的检查/CI 已全部通过；若本项即为该证据，判为已满足并从本轮输出移除；仅当本项要求代码改动时才可保留）' : '')),
   ];
   return items.length ? items.join('\n') : '（上轮无未解决项）';
 }
@@ -1949,13 +1950,17 @@ export class Engine {
       // scopes the reviewer to the fix delta plus that round's open items.
       // The full diff stays in review-diff.patch; any delta failure falls back.
       let reviewScope: ReviewScope | undefined;
+      const prChecksRes = prNum ? await this.prChecksForHead(project, prNum, reviewedSha) : null;
+      const prChecks = prChecksRes?.list ?? null;
       const priorControl = this.store.getReviewControl(task.id);
       if (priorControl?.assessment && priorControl.head_sha && priorControl.head_sha !== reviewedSha) {
         try {
           const delta = filterGenerated(await this.workspace.diffVsBase(sitePath, priorControl.head_sha, Number.POSITIVE_INFINITY), this.pathPolicy());
           if (delta.patch.trim() && delta.patch.length <= MAX_REVIEW_DIFF_CHARS / 2) {
             reviewDiff = delta;
-            reviewScope = { fromSha: priorControl.head_sha, toSha: reviewedSha, priorItems: priorReviewItems(priorControl.assessment) };
+            const ciSatisfied = (prChecks?.length ?? 0) > 0 && prChecks!.every(c => c.status === 'COMPLETED'
+              && ['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(c.conclusion ?? ''));
+            reviewScope = { fromSha: priorControl.head_sha, toSha: reviewedSha, priorItems: priorReviewItems(priorControl.assessment, ciSatisfied) };
             this.appLog.event('review_incremental_scope', { run: runId, from: priorControl.head_sha.slice(0, 8), to: reviewedSha.slice(0, 8), chars: delta.patch.length });
           }
         } catch (err) {
@@ -1986,7 +1991,7 @@ export class Engine {
             logPath: summary.outcomes.at(-1)!.logPath,
           }; }
         }
-        if (!outcome) outcome = await this.runReviewFn(ctx, this.testEvidenceFor(task, reviewedSha) + await this.prChecksEvidence(project, prNum, reviewedSha), reviewDiff.patch, {
+        if (!outcome) outcome = await this.runReviewFn(ctx, this.testEvidenceFor(task, reviewedSha) + this.prChecksEvidenceText(prChecksRes), reviewDiff.patch, {
           agentConfig: this.config.agent,
           timeoutMs: Math.min(this.config.server.max_task_minutes, this.store.getReviewControl(task.id) ? this.config.review_policy?.timeout_minutes ?? 10 : this.config.server.max_task_minutes) * 60_000,
           policyVersion: this.store.getReviewControl(task.id) ? 2 : 1,
@@ -2369,22 +2374,28 @@ export class Engine {
    * blocks forever. Feed the host-fetched CI rollup for the reviewed head so
    * that evidence is inspectable instead of demanded.
    */
-  private async prChecksEvidence(project: ProjectConfig, prNumber: number | null, headSha: string): Promise<string> {
-    if (!prNumber) return '';
+  private async prChecksForHead(project: ProjectConfig, prNumber: number | null, headSha: string): Promise<{ list?: { name: string; status: string; conclusion: string | null }[]; error?: string } | null> {
+    if (!prNumber) return null;
     try {
       const pr = await this.tracker.getPrDetails(project.repo, prNumber);
-      if (pr.headSha !== headSha) return '';
-      const checks = pr.checks ?? [];
-      if (!checks.length) return '\n\n# PR CI 检查（数据）\n该 SHA 上 PR 尚无 CI 检查记录（CI 可能尚未触发或仍在排队；宿主会在合并前独立核对，不得作为阻塞理由）。';
-      const pending = checks.some((c) => c.status !== 'COMPLETED');
-      return '\n\n# PR CI 检查（数据，GitHub 报告于同一 SHA）\n'
-        + checks.map((c) => `- ${c.name}: ${c.status}${c.conclusion ? ` / ${c.conclusion}` : ''}`).join('\n')
-        + (pending
-          ? '\n部分作业尚未完成；宿主会在合并前独立核对，等待 CI 不是阻塞理由。'
-          : '\n以上为同一 SHA 的完整 CI 结果。');
+      if (pr.headSha !== headSha) return null;
+      return { list: pr.checks ?? [] };
     } catch (err) {
-      return `\n\n# PR CI 检查（数据）\n无法读取 PR CI 状态：${String(err).slice(0, 120)}`;
+      return { error: String(err).slice(0, 120) };
     }
+  }
+
+  private prChecksEvidenceText(res: Awaited<ReturnType<Engine['prChecksForHead']>>): string {
+    if (!res) return '';
+    if (res.error) return `\n\n# PR CI 检查（数据）\n无法读取 PR CI 状态：${res.error}`;
+    const checks = res.list ?? [];
+    if (!checks.length) return '\n\n# PR CI 检查（数据）\n该 SHA 上 PR 尚无 CI 检查记录（CI 可能尚未触发或仍在排队；宿主会在合并前独立核对，不得作为阻塞理由）。';
+    const pending = checks.some((c) => c.status !== 'COMPLETED');
+    return '\n\n# PR CI 检查（数据，GitHub 报告于同一 SHA）\n'
+      + checks.map((c) => `- ${c.name}: ${c.status}${c.conclusion ? ` / ${c.conclusion}` : ''}`).join('\n')
+      + (pending
+        ? '\n部分作业尚未完成；宿主会在合并前独立核对，等待 CI 不是阻塞理由。'
+        : '\n以上为同一 SHA 的完整 CI 结果。');
   }
 
   private testEvidenceFor(task: TaskRow, headSha: string): string {
@@ -2706,7 +2717,16 @@ export class Engine {
         this.recordError('cleanup_error', err);
       }
     };
-    await step('worktree', () => this.workspace.removeWorktree(project.local_repo, worktree));
+    await step('worktree', async () => {
+      try {
+        await this.workspace.removeWorktree(project.local_repo, worktree);
+      } catch {
+        // node_modules or a still-held file can make `worktree remove`
+        // refuse on Windows; delete the dir and prune the registration.
+        rmSync(worktree, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+        await this.workspace.pruneWorktrees(project.local_repo);
+      }
+    });
     const branch = task.branch;
     if (branch && branch.startsWith(project.branch_prefix)) {
       await step('local-branch', () => this.workspace.deleteLocalBranch(project.local_repo, branch));

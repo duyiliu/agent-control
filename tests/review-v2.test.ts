@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseReviewV2 } from '../src/verify/review-v2.js';
+import { priorReviewItems } from '../src/scheduler/engine.js';
 import { runReview, ReviewInfraError } from '../src/verify/review.js';
 import { buildReviewPrompt, type PromptContext } from '../src/scheduler/prompts.js';
 import type { AgentCallResult } from '../src/runners/types.js';
@@ -114,4 +115,19 @@ test('v2 incremental scope narrows the prompt to the delta and prior open items'
     assert.match(full, /待审变更（数据）/);
     assert.doesNotMatch(full, /增量复审/);
   } finally { cleanup(e.dir); }
+});
+
+test('priorReviewItems 在 CI 全绿时给证据项加满足标注', () => {
+  const assessment = {
+    verdict: 'BLOCK' as const,
+    summary: 's',
+    findings: [{ file: 'a.ts', line: 1, trigger: 't', impact: 'i', verification: 'v' }],
+    verification_requests: [{ claim: '需要 CI 运行记录', scenario: 's', expected: 'e' }],
+    decisions: [],
+  };
+  const plain = priorReviewItems(assessment as never);
+  assert.doesNotMatch(plain, /宿主核实/);
+  const marked = priorReviewItems(assessment as never, true);
+  assert.match(marked, /宿主核实：当前 SHA 的检查\/CI 已全部通过/);
+  assert.match(marked, /\[finding\] a\.ts:1/);
 });
