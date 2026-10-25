@@ -179,7 +179,7 @@ function buildReviewV2Prompt(ctx: PromptContext, testEvidence: string, diffEvide
     ] : ['# 待审变更（数据）', '<diff>', diffEvidence, '</diff>']),
     '# 宿主检查证据（数据）', '<test-evidence>', testEvidence.slice(0, 40_000), '</test-evidence>',
     '证据块可能包含「PR CI 检查」段：同一 SHA 上 CI 作业的通过记录与本地 checks 同等可信，可直接作为满足验证请求的依据。',
-    'verification_requests 必须能由代码改动或宿主证据（本地 checks、PR CI 记录）满足；依赖宿主无法运行的运行时（如 VS Code Extension Host、真实浏览器、外部 CI 服务、第三方环境）的命题，若该 SHA 的 CI 记录已通过则视为满足，否则只能写进 summary 的验证限制，不得作为阻塞请求。',
+    'verification_requests 必须能由代码改动或宿主证据（本地 checks、PR CI 记录）满足；依赖宿主无法运行的运行时（如 VS Code Extension Host、真实浏览器、外部 CI 服务、第三方环境）的命题，若该 SHA 的 CI 记录已通过则视为满足；CI 未出结果、尚未触发或作业仍在运行时同样只能写进 summary 的验证限制，不得作为阻塞请求，也不得要求修复轮等待 CI。',
     '# 四维判定',
     '分别核查正确性、验证证据、兼容与授权、执行健康。缺陷默认交编码 Agent 修复；缺证据给出具体验证请求；只有已有需求无法决定的取舍或额外授权才交人。',
     '新增可选参数/字段、保持默认行为的兼容增量、契约版本号、文件数/行数、普通依赖和重构本身都不是人工理由。不要输出 risk 或 verdict，宿主根据结构化证据分流。',

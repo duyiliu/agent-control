@@ -2361,9 +2361,13 @@ export class Engine {
       const pr = await this.tracker.getPrDetails(project.repo, prNumber);
       if (pr.headSha !== headSha) return '';
       const checks = pr.checks ?? [];
-      if (!checks.length) return '\n\n# PR CI 检查（数据）\n该 SHA 上 PR 尚无 CI 检查记录。';
+      if (!checks.length) return '\n\n# PR CI 检查（数据）\n该 SHA 上 PR 尚无 CI 检查记录（CI 可能尚未触发或仍在排队；宿主会在合并前独立核对，不得作为阻塞理由）。';
+      const pending = checks.some((c) => c.status !== 'COMPLETED');
       return '\n\n# PR CI 检查（数据，GitHub 报告于同一 SHA）\n'
-        + checks.map((c) => `- ${c.name}: ${c.status}${c.conclusion ? ` / ${c.conclusion}` : ''}`).join('\n');
+        + checks.map((c) => `- ${c.name}: ${c.status}${c.conclusion ? ` / ${c.conclusion}` : ''}`).join('\n')
+        + (pending
+          ? '\n部分作业尚未完成；宿主会在合并前独立核对，等待 CI 不是阻塞理由。'
+          : '\n以上为同一 SHA 的完整 CI 结果。');
     } catch (err) {
       return `\n\n# PR CI 检查（数据）\n无法读取 PR CI 状态：${String(err).slice(0, 120)}`;
     }
