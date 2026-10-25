@@ -89,9 +89,14 @@ function parseProject(v: unknown, idx: number | string): ProjectConfig {
   if (humanPaths !== undefined && (!Array.isArray(humanPaths) || humanPaths.some(path => typeof path !== 'string' || !path.trim()))) {
     fail(`${name}.human_review_paths must be a string array`);
   }
+  const authorAssoc = o['issue_author_association'];
+  if (authorAssoc !== undefined && (!Array.isArray(authorAssoc) || authorAssoc.some(a => typeof a !== 'string' || !a.trim()))) {
+    fail(`${name}.issue_author_association must be a string array`);
+  }
   return {
     human_review_paths: humanPaths as string[] | undefined,
     issue_intake: intake as ProjectConfig['issue_intake'],
+    issue_author_association: authorAssoc as string[] | undefined,
     repo: asStr(o['repo'], `${name}.repo`),
     local_repo: resolve(asStr(o['local_repo'], `${name}.local_repo`)),
     base_branch: asStr(o['base_branch'] ?? 'main', `${name}.base_branch`),

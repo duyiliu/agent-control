@@ -144,6 +144,10 @@
   Legacy `issue_triage.enabled=true` maps to all unless explicitly overridden.
   Discovery never calls a model. Every open issue gets one task/card; existing
   tasks and persisted human/deferred/skipped dispositions never auto-retry.
+  `issue_author_association` (all-mode only) allowlists GitHub
+  `author_association` values; non-matching issues persist a `skipped`
+  disposition, create no card, and are also re-checked at authorize time —
+  missing association data fails closed.
   SQLite owns local intake state; one instance manages each repo's all intake.
   `agent-human-hold` and `agent-needs-human` remain external dispatch vetoes.
   Manual actions persist locally first; pending remote label removal blocks

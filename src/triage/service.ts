@@ -83,6 +83,22 @@ export class IssueTriage {
         const issues = await this.deps.tracker.listOpenIssues(project.repo);
         for (const issue of issues) {
           if (this.stopped) return;
+          const allowedAuthors = project.issue_author_association;
+          if (allowedAuthors?.length && !allowedAuthors.includes(issue.author_association ?? 'NONE')) {
+            // Persist a skipped disposition so the disposition model stays
+            // honest and the issue never creates a task card. Persisted
+            // dispositions are never auto-retried: trusting the author later
+            // requires an explicit human action, same as any other skip.
+            const known = this.state(project.repo, issue.number);
+            if (!known?.imported) {
+              const skipped = { ...emptyIntake(), imported: true, kind: 'skipped' as const,
+                reason: `非可信作者（${issue.author ?? '?'}:${issue.author_association ?? 'NONE'}），issue_author_association 白名单过滤` };
+              this.deps.store.saveIntake(project.repo, issue.number, skipped);
+              this.cache(project.repo, issue, skipped);
+              this.deps.appLog.event('issue_intake_author_filtered', { repo: project.repo, issue: issue.number, author: issue.author ?? null, author_association: issue.author_association ?? 'NONE' });
+            }
+            continue;
+          }
           let value = await this.importIssue(project, issue);
           const externalHold = issue.labels.includes(HUMAN_HOLD);
           const externalNeeds = issue.labels.includes(NEEDS_HUMAN);
@@ -116,6 +132,9 @@ export class IssueTriage {
     try {
       const current = await this.deps.tracker.getIssue(project.repo, issue.number);
       if (!current || current.state !== 'OPEN' || current.labels.some(l => [HUMAN_HOLD, NEEDS_HUMAN].includes(l))) return null;
+      // Defense in depth: a task card created before the allowlist existed
+      // (or by a path other than scan) must not dispatch either.
+      if (project.issue_author_association?.length && !project.issue_author_association.includes(current.author_association ?? 'NONE')) return null;
       const state = this.state(project.repo, issue.number);
       if (!state?.imported || state.kind || state.locked || state.pending || state.error) return null;
       const comments = await this.deps.tracker.issueComments(project.repo, issue.number);

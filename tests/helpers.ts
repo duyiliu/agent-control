@@ -75,7 +75,7 @@ export const nullLog: AppLog = {
 } as unknown as AppLog;
 
 export interface FakeTracker {
-  issues: Map<number, { title: string; body: string; labels: string[]; state: string; url: string }>;
+  issues: Map<number, { title: string; body: string; labels: string[]; state: string; url: string; author?: string; author_association?: string }>;
   prs: Map<string, { number: number; url: string; state: string; isDraft: boolean }>;
   prStates: Map<number, 'OPEN' | 'CLOSED' | 'MERGED'>;
   labelsAdded: [number, string][];

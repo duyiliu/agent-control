@@ -55,6 +55,12 @@ export interface CheckSpec {
 export interface ProjectConfig {
   human_review_paths?: string[];
   issue_intake?: 'all' | 'labeled';
+  /** Optional allowlist of GitHub `author_association` values for
+   *  `issue_intake: all`. Unset = import every open issue. Set = only issues
+   *  whose author association matches get imported; the rest are recorded as
+   *  skipped and never dispatch. `labeled` intake is unaffected — the ready
+   *  label is already a human gate. */
+  issue_author_association?: string[];
   issue_triage?: { enabled: boolean; timeout_seconds: number };
   repo: string;
   local_repo: string;
@@ -168,6 +174,10 @@ export interface IssueData {
   url: string;
   updatedAt?: string;
   createdAt?: string;
+  /** GitHub `user.login` of the issue author. */
+  author?: string;
+  /** GitHub `author_association`: OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, FIRST_TIMER, ... */
+  author_association?: string;
 }
 
 export interface PrInfo {

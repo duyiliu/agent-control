@@ -157,6 +157,30 @@ test('old active jobs remain quarantined without spawning another model', async 
   assert.equal(f.modelCalls(), 0); assert.equal(f.store.triageJobs().length, 1);
 });
 
+test('author association allowlist skips untrusted authors without a task card', async t => {
+  const f = setup(t);
+  f.config.projects[0]!.issue_author_association = ['OWNER', 'COLLABORATOR'];
+  f.fake.issues.get(8)!.author = 'stranger';
+  f.fake.issues.get(8)!.author_association = 'FIRST_TIMER';
+  await f.triage.scan();
+  assert.equal(f.triage.state('me/sandbox', 8)?.kind, 'skipped');
+  assert.equal(f.store.getTask('me/sandbox', 8), null);
+  await f.triage.scan();
+  assert.equal(f.store.listTasks().length, 0);
+  // Trusted authors import and dispatch normally.
+  f.fake.issues.set(9, { title: 'Issue 9', body: 'x', labels: [], state: 'OPEN', url: 'u/9', author: 'me', author_association: 'OWNER' });
+  await f.triage.scan();
+  assert.equal(f.store.getTask('me/sandbox', 9)?.status, 'DISCOVERED');
+  // TOCTOU: the author loses collaborator standing after import — authorize
+  // re-reads the fresh issue and must block dispatch of the existing card.
+  f.fake.issues.get(9)!.author_association = 'NONE';
+  assert.equal(await f.triage.authorize(f.config.projects[0]!, (await f.tracker.getIssue('me/sandbox', 9))!), null);
+  // Missing association data fails closed under a configured allowlist.
+  f.fake.issues.set(12, { title: 'Issue 12', body: 'x', labels: [], state: 'OPEN', url: 'u/12' });
+  await f.triage.scan();
+  assert.equal(f.store.getTask('me/sandbox', 12), null);
+});
+
 test('agent result JSON is strict', async () => {
   const { parseOutcome, acceptsAllIssues } = await import('../src/triage/intake.js');
   assert.equal(parseOutcome('{"outcome":"NEEDS_HUMAN","reason":"missing acceptance criteria"}').outcome, 'NEEDS_HUMAN');

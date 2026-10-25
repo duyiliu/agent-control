@@ -109,6 +109,8 @@ export class GitHubTracker {
       number: r.number as number, title: r.title as string, body: (r.body as string) ?? '',
       labels: (r.labels as { name: string }[]).map(l => l.name), state: 'OPEN', url: r.html_url as string,
       updatedAt: r.updated_at as string, createdAt: r.created_at as string,
+      author: (r.user as { login?: string } | undefined)?.login,
+      author_association: r.author_association as string | undefined,
     }));
   }
 
@@ -173,7 +175,7 @@ export class GitHubTracker {
   async getIssue(repo: string, issueNumber: number): Promise<IssueData | null> {
     const res = await this.gh([
       'issue', 'view', String(issueNumber), '-R', repo,
-      '--json', 'number,title,body,labels,state,url',
+      '--json', 'number,title,body,labels,state,url,author,authorAssociation',
     ]).catch((err) => {
       if (err instanceof TrackerError && /not found|Could not resolve/i.test(err.message)) return null;
       throw err;
@@ -181,6 +183,7 @@ export class GitHubTracker {
     if (res === null) return null;
     const r = JSON.parse(res.stdoutTail) as {
       number: number; title: string; body: string; labels: { name: string }[]; state: string; url: string;
+      author?: { login?: string }; authorAssociation?: string;
     };
     return {
       number: r.number,
@@ -189,6 +192,8 @@ export class GitHubTracker {
       labels: (r.labels ?? []).map((l) => l.name),
       state: r.state,
       url: r.url,
+      author: r.author?.login,
+      author_association: r.authorAssociation,
     };
   }
 
