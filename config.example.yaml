@@ -22,9 +22,10 @@ projects:
   - repo: your-org/your-sandbox-repo
     local_repo: C:/path/to/your-sandbox-repo
     base_branch: main
-    ready_label: agent-ready
+    ready_label: agent-ready            # workflow 模式不使用；legacy 模式的人工领取门禁
     branch_prefix: agent/issue-
-    review_mode: auto                # auto（默认）：每个 PR head 自动派独立评审 run；manual：不派评审，PR 停在 AWAITING_HUMAN 等人审人合
+    workflow_mode: github            # github（默认）：Issue 七状态驱动，人工批准后才合并；legacy：旧标签/自动评审流程
+    review_mode: manual              # github 模式默认 manual（不派独立评审）；legacy 默认 auto                # auto（默认）：每个 PR head 自动派独立评审 run；manual：不派评审，PR 停在 AWAITING_HUMAN 等人审人合
     pr_review: auto                  # auto（默认）：没有 issue 的 PR 也自动评审；manual：只评审打了 agent-review 标签的 PR
     # human_review_paths: [src/auth/**] # v2 显式保护路径；即使是生成物/文档也必须逐项授权
     # issue_intake: all                # 全部开放 Issue 默认排队；同一 Agent 判断并处理

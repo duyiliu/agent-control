@@ -9,6 +9,52 @@
 
 ## Invariants (do not break)
 
+- Issue #6 workflow is opt-in per project (`workflow_mode: github`, the config
+  default). `tasks.issue_workflow_json` pins it per task at creation; NULL keeps
+  every pre-upgrade task on the legacy path forever, and a project default never
+  reinterprets an existing task. The seven labels `Backlog`/`Todo`/`In Progress`/
+  `Human Review`/`Rework`/`Merging`/`Done` are the only Issue business state;
+  SQLite phases remain execution records. Backlog never dispatches; only Todo or
+  an already-claimed In Progress run may code. Default `review_mode` in this mode
+  is `manual`: a single coder session implements, self-checks and publishes, and
+  no reviewer run is required. A handoff binds the published PR to its head/base,
+  requirement hash and generation; host checks stay recorded for the dashboard
+  but do not gate the handoff, so a project without configured checks still
+  reaches Human Review. A failed Ready operation is recorded as a diagnostic,
+  not as a missing scope. `Human Review -> Merging/Rework` requires either the newest
+  labelled event after the handoff by a non-bot actor with repo write permission
+  who is not the host's authenticated login, or a token-authenticated board
+  approval bound to the same head/base/requirement hash/generation. Bots, host
+  identity, stale events, PR `agent-merge` and AI PASS never authorize. Merge
+  rechecks the event or board approval, permission, issue hash/holds, task
+  version, PR head/base and the PR CI rollup (an empty rollup proves nothing),
+  then uses non-admin `--match-head-commit` (branch protection remains GitHub's
+  own gate); Done
+  and issue close happen only after observing MERGED, and a half-finished Done
+  is completed by the next tick.
+  Rework closes the old PR without deleting its branch/worktree, starts the next
+  generation from the freshly fetched remote base with a new branch, worktree
+  and Pi session, and records the old generation in the workflow history. Every
+  workflow generation, including generation 1, uses `agent/issue-N-rG`; legacy
+  `agent/issue-N` branches/PRs stay untouched history and are never reused.
+  Corrupt workflow JSON, missing/conflicting labels and event-read failures fail
+  closed; no new business Blocked state exists. A workflow project provisions
+  exactly the seven state labels and nothing else: no `ready_label`, no
+  `agent-running`, no `agent-human-hold`/`agent-needs-human`, no legacy signals
+  and no `agent-complex`. `Backlog` is the only human gate; external blockers
+  are expressed by moving the Issue to `Human Review` with a reason comment.
+  Execution state (Running/Retrying/Recovering) and duplicate-run prevention
+  live only in agent-control: the SQLite one-active-run index is the lock.
+  The dashboard renders `workflow_state` as the business state and the phase /
+  active run as execution status. It is a token-authenticated human channel: it
+  may move Backlog/Todo/Human Review/Rework/Merging by writing the label and,
+  for Merging/Rework, records a scope-bound board approval. It never offers the
+  legacy approve/retry/rereview actions for a workflow task; `stop` only
+  cancels an in-flight run.
+  Workflow tasks write no claim label and no claim comment to GitHub. Legacy tasks keep their old label
+  semantics; the cleanup command may delete those labels from the repo, which
+  freezes legacy dispatch by design.
+
 - Review policy v2 is opt-in (`review_policy.version: 2`) and pinned in
   `tasks.review_control_json` for new tasks. Existing tasks stay legacy until
   explicit rereview. The legacy high-risk/size and conflict-approval rules below
@@ -129,8 +175,8 @@
   per tick. GitHub shares one number sequence between issues and PRs, which is
   why `tasks.issue_number` holds a PR number unchanged and `UNIQUE(repo,
   issue_number)` still holds.
-- Cross-instance claiming is label-based: `agent-running` on an issue means
-  another scheduler owns it — `listReadyIssues` filters it and `tryDispatch`
+- Legacy cross-instance claiming is label-based: `agent-running` on an issue means
+  another scheduler owns it (workflow tasks do not use this label) — `listReadyIssues` filters it and `tryDispatch`
   skips it (stays DISCOVERED, reconciles via the existing-PR path). The label
   claim itself is not atomic, so after claiming the engine posts a
   `已领取（host）（run id）` comment, waits a settle window, and re-reads
@@ -167,6 +213,11 @@
   always check `findPrForBranch` before creating.
 - Recovery must never start a second process for a run whose child may still
   be alive (`RECOVERY_REQUIRED` instead).
+- The dashboard live log reads pi's JSONL: `/api/runs/:id/stream` (SSE,
+  cookie-auth, 250ms ticks) with `/tail` polling as the fallback. Thinking,
+  tool output and text all come from the same event stream — never render from
+  a reduced model. Interval/tick callbacks must never throw: an uncaught error
+  there kills the scheduler, so a rotated/removed log file is caught per tick.
 
 ## Commands
 

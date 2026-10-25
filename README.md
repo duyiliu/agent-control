@@ -149,23 +149,23 @@ Issue 关联 PR 重新评审时，会补跑该提交缺失的宿主检查，命�
 
 ## 使用流程
 
-一条主线：**提 Issue → 排队 → 同一个 Coder 会话实现与修复 → Draft PR → 独立 Review → Ready for review → 人工审查与合并**。
+一条主线（legacy 模式）：**提 Issue → 排队 → 同一个 Coder 会话实现与修复 → Draft PR → 独立 Review → Ready for review → 人工审查与合并**。`workflow_mode: github`（默认）改用 GitHub Issue 七状态标签驱动，流程见文末「GitHub 七状态工作流」。
 
 ### 1. 下任务
 
 在托管仓提 Issue，正文写清背景、范围、验收标准、测试命令和依赖。
 
-### Issue 自动接手
+### Issue 自动接手（legacy 模式）
 
 项目配置 `issue_intake: all` 后，程序分页发现所有开放 Issue 并创建唯一任务卡，无需 `agent-ready`；扫描不调用 AI。同一个编码 Agent 读取需求和必要代码，能实现则继续，缺信息则转人工，等待条件则暂缓，无需处理则进入历史。
 
-只保留执行看板。卡片显示原因、人工锁定和同步状态，提供“继续处理、暂缓、人工锁定”。暂缓及无需处理通过同一看板的筛选查看。修改 Issue 不会自动解除人工处置，需显式继续。
+legacy 任务卡片显示原因、人工锁定和同步状态，提供“继续处理、暂缓、人工锁定”。暂缓及无需处理通过同一看板的筛选查看。修改 Issue 不会自动解除人工处置，需显式继续。工作流任务不使用这套处置：业务状态只看 Issue 的七状态标签。
 
 暂缓可选提醒时间，到期时在“暂缓”筛选和卡片中提示，仍需点击“继续处理”才会派工。提醒不会自动撤销人工锁定。
 
 待人工的 PR 在详情中展示具体原因、建议操作和“重新评审”。重新评审核对当前任务版本、开放 PR、需求快照及人工门禁，撤销旧评审的幂等标记与未消费的合并批准，保留代码、检查证据和历史事件；manual 项目仍由人工审阅。独立 PR 只提供重评和 GitHub 处理入口，不显示“批准合并”。
 
-处置保存在本机 SQLite，每个仓库由一个实例管理自动入口。GitHub 的 `agent-human-hold`、`agent-needs-human` 仍会阻止启动。人工操作先保存，需移除远端门禁时后台同步，成功前不会派发；重复解锁不会重新加锁。
+legacy 处置保存在本机 SQLite，每个仓库由一个实例管理自动入口。旧标签已从仓库清理，legacy 派发因此冻结；工作流任务不读取这些标签。
 
 `issue_intake: labeled`（默认）保留原来的 ready 标签入口。旧 `issue_triage.enabled: true` 兼容为 all，不再运行独立 AI 评估，旧 timeout_seconds 不再使用。首次切换保留旧 HUMAN/DEFER/SKIP 和任务历史；损坏或未结束的旧认领显示为阻塞卡，核验后恢复。
 
@@ -278,13 +278,11 @@ npm run ac -- undrain
 http://127.0.0.1:8787     # 端口以 agent-control.yaml 的 server.ui.port 为准
 ```
 
-看板示例：
+看板布局已按七状态工作流调整；旧版截图不再代表当前状态分组，状态语义以本节文字为准。
 
-![agent-control Web 管理界面](docs/images/ui-board.png)
-
-- **七列看板**：排队中 → 进行中 → 审查中 → 合并中 → 待人工处理 → 已完成 → 异常需介入。卡片带 repo#issue、相位徽章、实时运行时长和 PR 链接；支持按仓库筛选、按 `/` 聚焦搜索、5 秒自动刷新。
-- **详情抽屉**：相位时间线（`run_events`）、checks 结果、修复轮次、实时日志（跟随/暂停、原始 JSONL）、artifact 弹窗（测试日志、review 结论、`review-diff.patch`、`run-*.jsonl`）。`.jsonl` 会逐行解析成事件流；服务端强制路径必须落在 `logs_dir` 内，越界访问返回 403。
-- **操作**：停止、重试、批准合并，均有确认弹窗；进行中的卡片也可以拖到「异常需介入」触发停止。所有写操作与 CLI 走同一 Store/ops 路径，两者可以混用。
+- **状态看板**：`workflow_mode: github` 的任务按 GitHub Issue 的七个互斥标签分组——`Backlog`、`Todo`、`In Progress`、`Human Review`、`Rework`、`Merging`、`Done`；看板视图分为「待我处理（Human Review/异常）」「执行中（Todo/In Progress/Rework/Merging）」「Backlog」「历史记录」。卡片同时显示业务状态与本地执行状态（Running/Verifying/Fixing 等只在 agent-control 中记录），带 repo#issue、代际、实时运行时长和 PR 链接；支持按仓库筛选、按 `/` 聚焦搜索、5 秒自动刷新。旧流程任务（`issue_workflow_json` 为 NULL）仍按相位展示并归入对应列。
+- **详情抽屉**：Issue 状态与本地执行状态分开显示；工作流任务展示代际、需求哈希、最近诊断、看板状态操作与 GitHub 入口。相位时间线（`run_events`）、checks 结果、修复轮次、实时日志（跟随/暂停、原始 JSONL）、artifact 弹窗（测试日志、review 结论、`review-diff.patch`、`run-*.jsonl`）仍作为本地执行记录保留。`.jsonl` 会逐行解析成事件流；服务端强制路径必须落在 `logs_dir` 内，越界访问返回 403。
+- **操作**：工作流任务可在详情抽屉直接改状态——`Backlog ↔ Todo`、`In Progress → Human Review`、`Human Review → Merging/Rework`、`Rework/Merging → Human Review`。合并/返工授权会绑定当前 PR head/base、需求哈希和代际，调度器仍会重新核验 Issue 需求、PR head/base、批准范围与 PR CI（无 CI 不拦）后才执行；分支保护由 GitHub 自身把关。Human Review 只要求 PR 与绑定，宿主 checks 是执行记录与看板证据，不作为进入门槛。工作流任务不再使用旧的重试/重新评审/`agent-merge` 面板操作，只保留停止在途运行。旧流程任务保留停止、重试、批准合并，均有确认弹窗。所有写操作与 CLI 走同一 Store/ops 路径，两者可以混用。
 - **健康条**：pid、uptime、当前进程内活动 run 数、最近一次内部错误。
 - **主题**：顶部可切换 5 套配色，选择存在浏览器本地。
 
@@ -425,3 +423,30 @@ npm run build         # → dist/ + ui/dist（ui/dist 不入库，发版必须�
 - `docs/design-workflow.md` — 设计与执行分离的流程约定（合并语义以本 README 为准）。
 - `docs/pr-review-optimization-plan.md` — PR 反馈回路的优化提案（历史）。
 - `work/任务/` — 历史设计与任务记录，仅作背景，不代表当前实现。
+
+
+## GitHub 七状态工作流（Issue #6）
+
+`workflow_mode: github` 的项目以 Issue 上的互斥状态标签作为唯一业务状态：
+`Backlog`、`Todo`、`In Progress`、`Human Review`、`Rework`、`Merging`、`Done`。
+workflow 项目只预置 **7 个**标签：`Backlog`、`Todo`、`In Progress`、`Human Review`、
+`Rework`、`Merging`、`Done`。`Backlog` 是唯一人工门禁；外部阻塞通过把 Issue 移到
+`Human Review` 并写原因表达。运行状态（Running/Retrying/Recovering）只在
+agent-control 内部维护，GitHub 上不写领取标签、也不写领取评论；防重复执行依靠
+SQLite 单活跃 run 索引。不再使用 `agent-running`、`agent-human-hold`、
+`agent-needs-human`、`agent-ready`、`agent-complex` 或任何 legacy 信号。清理命令会
+删除这些旧标签，legacy 任务因此停止派发。
+
+`Backlog` 不调度；`Todo` 领取后转 `In Progress`；只有宿主核实当前 SHA 的检查证据后
+才转 `Human Review`。`Human Review -> Merging/Rework` 必须是最新的人工标签事件，
+或看板上经过令牌鉴权、绑定同一 head/base/需求哈希/代际的人工操作；操作者需具备仓库
+写权限、不是宿主自动化身份。PR 的 `agent-merge` 标签和 AI PASS 都不能授权合并。
+合并前会重读 Issue 需求、人工 hold、PR head/base 和 CI，使用 `--match-head-commit`，
+只有观察到 MERGED 才写 `Done` 并关闭 Issue。
+
+`Rework` 会保留旧 PR/分支/历史，创建新代际分支、工作目录和 Pi 会话，并重新读取
+最新 Issue 与人工评论。新流程每一代（包括第 1 代）都使用 `agent/issue-N-rG`，
+旧流程的 `agent/issue-N` 分支/PR 原样保留，不会被新流程复用或误认。`tasks.issue_workflow_json` 在任务创建时固定；升级前的任务
+（NULL）保持 legacy 行为。`workflow_mode: legacy` 可让项目继续使用旧的 ready label
+与可选自动评审流程。数据库升级到 schema v13 后不可用旧代码打开：回滚需停机并恢复
+升级前的数据库与配置备份。
