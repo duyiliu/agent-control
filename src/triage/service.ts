@@ -92,8 +92,16 @@ export class IssueTriage {
             this.deps.store.saveIntake(project.repo, issue.number, value);
           } else value = latest;
           const { task } = this.deps.store.upsertDiscovered({ repo: project.repo, issue_number: issue.number, issue_title: issue.title, issue_url: issue.url });
-          if (!this.deps.store.activeRunForTask(task.id) && task.status === 'DISCOVERED' && (value.kind || value.locked || value.external_hold || value.external_needs || value.error)) {
+          const gated = Boolean(value.kind || value.locked || value.external_hold || value.external_needs || value.error);
+          if (!this.deps.store.activeRunForTask(task.id) && task.status === 'DISCOVERED' && gated) {
             this.deps.store.setTaskStatus(task.id, 'BLOCKED');
+          }
+          // A card parked only by an intake gate has never run; once every
+          // gate clears it must return to DISCOVERED, otherwise it is
+          // stranded in BLOCKED forever. Tasks that actually ran (and then
+          // failed) keep their BLOCKED until an explicit retry.
+          if (task.status === 'BLOCKED' && !gated && !this.deps.store.runsForTask(task.id).length) {
+            this.deps.store.setTaskStatus(task.id, 'DISCOVERED');
           }
           this.cache(project.repo, issue, value);
           if (value.pending) this.startSync(project, issue.number);
