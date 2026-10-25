@@ -57,7 +57,7 @@ test('migration 12 leaves legacy evidence null and persists budgets across resta
     const run = store.claimRun(task.id);
     store.addCheck({ run_id: run.run_id, kind: 'check', command: 'test', exit_code: 0, verdict: 'PASS' });
     assert.equal(store.checksForRun(run.run_id)[0]?.review_detail_json, null);
-    store.db.exec('ALTER TABLE tasks DROP COLUMN review_control_json; ALTER TABLE check_results DROP COLUMN review_detail_json; DELETE FROM schema_version WHERE version=12;');
+    store.db.exec('ALTER TABLE tasks DROP COLUMN review_control_json; ALTER TABLE tasks DROP COLUMN issue_workflow_json; ALTER TABLE check_results DROP COLUMN review_detail_json; DELETE FROM schema_version WHERE version IN (12,13);');
     store.close();
     store = new Store(file);
     assert.equal(store.getReviewControl(task.id), null);

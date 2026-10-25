@@ -5,6 +5,7 @@ import { resolve } from 'node:path';
 import { loadConfig } from './config.js';
 import { createApp, runDoctor, startService } from './app.js';
 import { GitHubTracker } from './tracker/github.js';
+import { desiredLabels, planLabelSync } from './labels.js';
 import { requestDrain, resumeDispatch, retryTask, stopTask, waitForDrain } from './ops.js';
 import { Store } from './store/sqlite.js';
 import type { AppConfig } from './types.js';
@@ -20,6 +21,7 @@ Usage:
   agent-control [--config <path>] stop  <issue-number> [--repo owner/name]
   agent-control [--config <path>] drain [--timeout-seconds <n>]
   agent-control [--config <path>] undrain
+  agent-control [--config <path>] labels [--repo owner/name] [--apply]
 
 Config resolution: --config > AGENT_CONTROL_CONFIG > ./agent-control.yaml > ./config.yaml
 `;
@@ -43,7 +45,7 @@ function pickRepo(config: AppConfig, flag?: string): string {
 async function main() {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
-    options: { config: { type: 'string' }, repo: { type: 'string' }, 'timeout-seconds': { type: 'string' } },
+    options: { config: { type: 'string' }, repo: { type: 'string' }, 'timeout-seconds': { type: 'string' }, apply: { type: 'boolean' } },
   });
   const cmd = positionals[0];
   if (!cmd || cmd === 'help' || cmd === '--help') {
@@ -193,6 +195,34 @@ async function main() {
       } finally {
         store.close();
       }
+      return;
+    }
+
+    case 'labels': {
+      if (!config) die(`config required: ${configError}`);
+      const apply = values.apply === true;
+      const projects = values.repo ? config.projects.filter(p => p.repo === values.repo) : config.projects;
+      if (projects.length === 0) die(`no project matches ${values.repo}`);
+      const tracker = new GitHubTracker();
+      for (const project of projects) {
+        const existing = await tracker.listLabels(project.repo);
+        const plan = planLabelSync(project, existing);
+        console.log(`
+${project.repo} (${project.workflow_mode ?? 'github'})`);
+        console.log(`  desired: ${desiredLabels(project).join(', ')}`);
+        console.log(`  create : ${plan.create.length ? plan.create.join(', ') : '-'}`);
+        console.log(`  remove : ${plan.remove.length ? plan.remove.join(', ') : '-'}`);
+        if (!apply) continue;
+        for (const label of plan.remove) {
+          await tracker.deleteLabel(project.repo, label);
+          console.log(`  removed ${label}`);
+        }
+        for (const label of plan.create) {
+          await tracker.createLabel(project.repo, label);
+          console.log(`  created ${label}`);
+        }
+      }
+      if (!apply) console.log('dry-run only; pass --apply to delete/create labels');
       return;
     }
 

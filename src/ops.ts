@@ -38,6 +38,9 @@ async function withTaskOperation<T>(store: Store, taskId: number, operation: () 
 }
 
 export function rereviewTask(store: Store, config: AppConfig, tracker: OpsTracker, task: TaskRow, expectedUpdatedAt: string): Promise<string> {
+  if (task.issue_workflow_json !== null) {
+    return Promise.reject(new OpsError('该任务由 GitHub 七状态驱动：请在 Issue 上把状态改为 Human Review/Todo 触发新一轮，面板不会另建状态'));
+  }
   return withTaskOperation(store, task.id, () => doRereviewTask(store, config, tracker, task, expectedUpdatedAt));
 }
 
@@ -171,6 +174,10 @@ export function stopTask(store: Store, task: TaskRow): string {
  * the merge sweep keeps its sha check, one-shot consumption and retry loop.
  */
 export function approveMergeTask(store: Store, tracker: OpsTracker, task: TaskRow, expectedUpdatedAt = task.updated_at): Promise<string> {
+  // A github-workflow task is authorized only by a verified Issue event.
+  if (task.issue_workflow_json !== null) {
+    return Promise.reject(new OpsError('该任务由 GitHub 七状态驱动：请在 Issue 上将 Human Review 改为 Merging，面板批准不会绕过授权校验'));
+  }
   return withTaskOperation(store, task.id, () => doApproveMergeTask(store, tracker, task, expectedUpdatedAt));
 }
 
@@ -220,6 +227,9 @@ export async function retryTask(
   task: TaskRow,
   processDeps: ProcessSafetyDeps = {},
 ): Promise<string> {
+  if (task.issue_workflow_json !== null) {
+    throw new OpsError('该任务由 GitHub 七状态驱动：请在 Issue 上把状态改为 Todo 后由调度器重新领取');
+  }
   // A bare PR has no issue to re-approve: retrying means "judge the current
   // head again", which is why the recorded verdicts are dropped instead of
   // re-reading a ready label that will never exist. This is the only way back

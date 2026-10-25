@@ -80,6 +80,9 @@ export class IssueTriage {
         }
       }
       try {
+        // github-workflow projects own discovery and state in issue-workflow;
+        // a second legacy importer here would create a competing state source.
+        if (project.workflow_mode === 'github') continue;
         const issues = await this.deps.tracker.listOpenIssues(project.repo);
         for (const issue of issues) {
           if (this.stopped) return;

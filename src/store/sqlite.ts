@@ -12,7 +12,7 @@ import type {
 import { RUN_ACTIVE_PHASES } from '../types.js';
 import { parseReviewControl } from '../verify/review-policy.js';
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -245,7 +245,27 @@ export class Store {
         this.db.prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)').run(12, now());
       });
     }
+    if (current < 13) {
+      // v13: opt-in GitHub issue workflow. NULL keeps every pre-upgrade task
+      // on the legacy path; corrupt JSON is never reinterpreted as legacy.
+      this.tx(() => {
+        this.db.exec('ALTER TABLE tasks ADD COLUMN issue_workflow_json TEXT');
+        this.db.prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)').run(13, now());
+      });
+    }
 
+  }
+
+  getIssueWorkflow(taskId: number): string | null {
+    const task = this.getTaskById(taskId);
+    if (!task) throw new Error(`task ${taskId} not found`);
+    return task.issue_workflow_json;
+  }
+
+  saveIssueWorkflow(taskId: number, json: string | null) {
+    const timestamp = now();
+    const result = this.db.prepare('UPDATE tasks SET issue_workflow_json=?, updated_at=? WHERE id=?').run(json, timestamp, taskId);
+    if (result.changes === 0) throw new Error(`task ${taskId} not found`);
   }
 
   getReviewControl(taskId: number): ReviewControl | null {
@@ -351,6 +371,7 @@ export class Store {
     issue_number: number;
     issue_title: string;
     issue_url: string;
+    issue_workflow_json?: string | null;
   }): { task: TaskRow; created: boolean } {
     return this.tx(() => {
       const existing = this.getTask(input.repo, input.issue_number);
@@ -358,10 +379,10 @@ export class Store {
       const t = now();
       this.db
         .prepare(
-          `INSERT INTO tasks (repo, issue_number, issue_title, issue_url, status, updated_at, created_at)
-           VALUES (?, ?, ?, ?, 'DISCOVERED', ?, ?)`,
+          `INSERT INTO tasks (repo, issue_number, issue_title, issue_url, status, issue_workflow_json, updated_at, created_at)
+           VALUES (?, ?, ?, ?, 'DISCOVERED', ?, ?, ?)`,
         )
-        .run(input.repo, input.issue_number, input.issue_title, input.issue_url, t, t);
+        .run(input.repo, input.issue_number, input.issue_title, input.issue_url, input.issue_workflow_json ?? null, t, t);
       return { task: this.getTask(input.repo, input.issue_number)!, created: true };
     });
   }

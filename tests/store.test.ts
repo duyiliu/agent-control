@@ -9,7 +9,7 @@ test('migrations are idempotent and schema_version recorded', () => {
     s1.close();
     const s2 = makeStore(dir); // reopen same db
     const v = s2.db.prepare('SELECT MAX(version) v FROM schema_version').get() as { v: number };
-    assert.equal(v.v, 12);
+    assert.equal(v.v, 13);
     // v4 columns exist with sane defaults
     const runCols = s2.db.prepare("PRAGMA table_info(runs)").all() as { name: string }[];
     assert.ok(runCols.some((c) => c.name === 'kind') && runCols.some((c) => c.name === 'head_sha'));
@@ -19,7 +19,7 @@ test('migrations are idempotent and schema_version recorded', () => {
     const busy = s2.db.prepare('PRAGMA busy_timeout').get() as { timeout: number };
     assert.ok(busy.timeout > 0, 'second connections (CLI) must wait instead of failing fast with SQLITE_BUSY');
     assert.ok(taskCols.some((c) => c.name === 'pending_fix') && taskCols.some((c) => c.name === 'merge_attempts') && taskCols.some((c) => c.name === 'approved_sha'));
-    assert.ok(taskCols.some((c) => c.name === 'source'));
+    assert.ok(taskCols.some((c) => c.name === 'source') && taskCols.some((c) => c.name === 'issue_workflow_json'));
     s2.close();
   } finally {
     cleanup(dir);

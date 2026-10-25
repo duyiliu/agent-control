@@ -39,7 +39,14 @@ export const SYSTEM_LABELS = [
 ];
 export const TRIAGE_LABELS = ['agent-needs-human', 'agent-human-hold', 'agent-triage-managed'];
 
-export function requiredLabelsForProject(readyLabel: string, triageEnabled: boolean): string[] {
+/** Symphony's seven mutually exclusive Issue states (#6). */
+export const WORKFLOW_STATE_LABELS = ['Backlog', 'Todo', 'In Progress', 'Human Review', 'Rework', 'Merging', 'Done'];
+
+export function requiredLabelsForProject(readyLabel: string, triageEnabled: boolean, workflow = false): string[] {
+  if (workflow) {
+    // Issue #6: the seven state labels are the only labels this design owns.
+    return [...WORKFLOW_STATE_LABELS];
+  }
   return [...new Set([...(triageEnabled ? [] : [readyLabel]), ...SYSTEM_LABELS.filter(label => label !== 'agent-triage-managed' && (triageEnabled || !TRIAGE_LABELS.includes(label)))])];
 }
 
@@ -173,28 +180,73 @@ export class GitHubTracker {
   }
 
   async getIssue(repo: string, issueNumber: number): Promise<IssueData | null> {
-    const res = await this.gh([
-      'issue', 'view', String(issueNumber), '-R', repo,
-      '--json', 'number,title,body,labels,state,url,author,authorAssociation',
-    ]).catch((err) => {
-      if (err instanceof TrackerError && /not found|Could not resolve/i.test(err.message)) return null;
+    // REST, not `gh issue view`: the CLI's --json field set differs across gh
+    // versions and rejects authorAssociation on some installs.
+    const res = await this.gh(['api', `repos/${repo}/issues/${issueNumber}`]).catch((err) => {
+      if (err instanceof TrackerError && /not found|Not Found|Could not resolve/i.test(err.message)) return null;
       throw err;
     });
     if (res === null) return null;
     const r = JSON.parse(res.stdoutTail) as {
-      number: number; title: string; body: string; labels: { name: string }[]; state: string; url: string;
-      author?: { login?: string }; authorAssociation?: string;
+      number: number; title: string; body: string | null; labels: { name: string }[];
+      state: string; html_url: string; user?: { login?: string }; author_association?: string;
     };
     return {
       number: r.number,
       title: r.title,
       body: r.body ?? '',
       labels: (r.labels ?? []).map((l) => l.name),
-      state: r.state,
-      url: r.url,
-      author: r.author?.login,
-      author_association: r.authorAssociation,
+      // REST returns lowercase open/closed; the rest of the engine compares
+      // against the CLI's OPEN/CLOSED contract.
+      state: r.state.toUpperCase(),
+      url: r.html_url,
+      author: r.user?.login,
+      author_association: r.author_association,
     };
+  }
+
+  /** Paginated label events: the only place a human approval actor is visible. */
+  async issueLabelEvents(repo: string, issueNumber: number): Promise<{
+    id: number; event: string; label: string | null; actor: string; actorType: string; createdAt: string;
+  }[]> {
+    const rows = await this.pages<{
+      id: number; event: string; label?: { name?: string }; actor?: { login?: string; type?: string }; created_at: string;
+    }>(`repos/${repo}/issues/${issueNumber}/events?per_page=50`);
+    return rows.map(row => ({
+      id: row.id, event: row.event, label: row.label?.name ?? null,
+      actor: row.actor?.login ?? '', actorType: row.actor?.type ?? '', createdAt: row.created_at,
+    }));
+  }
+
+  /** Repository permission of a login; null when it cannot be resolved. */
+  async collaboratorPermission(repo: string, login: string): Promise<string | null> {
+    try {
+      const row = await this.ghJson<{ permission?: string; role_name?: string }>([
+        'api', `repos/${repo}/collaborators/${encodeURIComponent(login)}/permission`,
+      ]);
+      return row.permission ?? row.role_name ?? null;
+    } catch (err) {
+      if (err instanceof TrackerError && /404|Not Found/i.test(err.message)) return null;
+      throw err;
+    }
+  }
+
+  async closeIssue(repo: string, issueNumber: number): Promise<void> {
+    await this.gh(['issue', 'close', String(issueNumber), '-R', repo]);
+  }
+
+  /**
+   * Set the single workflow state label while preserving every other label.
+   * GitHub has no compare-and-swap, so the caller persists intent first and
+   * re-reads afterwards; a concurrent human edit must not be overwritten.
+   */
+  async setWorkflowState(repo: string, issueNumber: number, label: string, allLabels: readonly string[]): Promise<void> {
+    const remove = WORKFLOW_STATE_LABELS.filter(existing => existing !== label && allLabels.includes(existing));
+    // Add first: a failed add must leave the previous state label in place,
+    // never an Issue with zero state labels. A failed remove leaves a visible
+    // conflict, which the engine already fails closed on.
+    if (!allLabels.includes(label)) await this.addLabel(repo, issueNumber, label);
+    for (const existing of remove) await this.removeLabel(repo, issueNumber, existing);
   }
 
   async addLabel(repo: string, issueNumber: number, label: string): Promise<void> {
@@ -328,6 +380,17 @@ export class GitHubTracker {
       'issue', 'view', String(issueNumber), '-R', repo,
       '--json', 'comments', '--jq', '[.comments[] | {body, createdAt}]',
     ]);
+  }
+
+  async listLabels(repo: string): Promise<string[]> {
+    const rows = await this.ghJson<{ name: string }[]>([
+      'label', 'list', '-R', repo, '--json', 'name', '--limit', '500',
+    ]);
+    return rows.map(row => row.name);
+  }
+
+  async deleteLabel(repo: string, name: string): Promise<void> {
+    await this.gh(['label', 'delete', name, '-R', repo, '--yes']);
   }
 
   async ensureLabels(repo: string, labels: string[]): Promise<{ ok: boolean; missing: string[] }> {

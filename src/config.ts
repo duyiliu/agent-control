@@ -78,7 +78,9 @@ function parseProject(v: unknown, idx: number | string): ProjectConfig {
   const checksRaw = o['checks'] ?? [];
   if (!Array.isArray(checksRaw)) fail(`${name}.checks must be an array`);
   if (o['review'] !== undefined) fail(`${name}.review was removed — use review_mode: auto | manual`);
-  const mode = o['review_mode'] ?? 'auto';
+  const workflowMode = o['workflow_mode'] ?? 'github';
+  if (workflowMode !== 'github' && workflowMode !== 'legacy') fail(`${name}.workflow_mode: expected github or legacy`);
+  const mode = o['review_mode'] ?? (workflowMode === 'github' ? 'manual' : 'auto');
   if (mode !== 'auto' && mode !== 'manual') fail(`${name}.review_mode: expected auto or manual`);
   const prReview = o['pr_review'] ?? 'auto';
   if (prReview !== 'auto' && prReview !== 'manual') fail(`${name}.pr_review: expected auto or manual`);
@@ -94,6 +96,7 @@ function parseProject(v: unknown, idx: number | string): ProjectConfig {
     fail(`${name}.issue_author_association must be a string array`);
   }
   return {
+    workflow_mode: workflowMode,
     human_review_paths: humanPaths as string[] | undefined,
     issue_intake: intake as ProjectConfig['issue_intake'],
     issue_author_association: authorAssoc as string[] | undefined,

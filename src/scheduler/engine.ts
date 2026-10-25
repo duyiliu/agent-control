@@ -27,6 +27,11 @@ import { RUN_ACTIVE_PHASES } from '../types.js';
 import { IssueTriage } from '../triage/service.js';
 import { MANAGED } from '../triage/state.js';
 import { acceptsAllIssues, parseOutcome } from '../triage/intake.js';
+import {
+  authorizeHumanEvent, initialState, isWorkflowTask, newWorkflowRecord, parseWorkflow, stateFromLabels,
+  workflowEnabled, workflowOf, WORKFLOW_LABEL, type WorkflowApproval, type WorkflowRecord, type WorkflowState,
+} from './issue-workflow.js';
+import { sameApprovalScope } from '../workflow-board.js';
 
 // Older v2 rounds auto-generated this exact question for any breaking change.
 // It is a host template, not a reviewer judgement, so reruns drop it.
@@ -99,6 +104,8 @@ export class Engine {
   private verifiedBuilds = new Set<string>();
   /** Resumable runs held back by max_concurrent: run_id -> target phase. */
   private deferredResumes = new Map<string, Phase>();
+  /** Backfill cooldown for Human Review tasks whose PR was never bound. */
+  private handoffRetryAt = new Map<number, number>();
   private openCoderSessionFn: NonNullable<EngineDeps['openCoderSessionFn']>;
   private runReviewFn: NonNullable<EngineDeps['runReviewFn']>;
   private runChecksFn: NonNullable<EngineDeps['runChecksFn']>;
@@ -110,7 +117,8 @@ export class Engine {
 
   private async reconcileClosedIssues() {
     const candidates = this.store.listTasks().filter(t => t.source === 'issue'
-      && !['COMPLETED', 'CANCELED'].includes(t.status) && !this.store.activeRunForTask(t.id)
+      && (!['COMPLETED', 'CANCELED'].includes(t.status) || workflowOf(t)?.pending_label)
+      && !this.store.activeRunForTask(t.id)
       && !this.store.getIntake<{ kind?: string; locked?: boolean }>(t.repo, t.issue_number)?.kind
       && !this.store.getIntake<{ locked?: boolean }>(t.repo, t.issue_number)?.locked);
     const ordered = [...candidates.filter(t => t.id > this.closedCursor), ...candidates.filter(t => t.id <= this.closedCursor)].slice(0, 10);
@@ -120,6 +128,10 @@ export class Engine {
       try {
         const issue = await this.tracker.getIssue(task.repo, task.issue_number);
         if (!issue || issue.state !== 'CLOSED') continue;
+        // Workflow tasks finish their own bookkeeping (Done label, observed
+        // state) through reconcileWorkflowTask, not the legacy close path.
+        const wfProject = isWorkflowTask(task) ? this.projectFor(task.repo) : undefined;
+        if (wfProject) { await this.reconcileWorkflowTask(task, wfProject); continue; }
         const version = task.updated_at;
         const prNumber = prNumberFromUrl(task.pr_url);
         if (prNumber && await this.tracker.getPrState(task.repo, prNumber) === 'MERGED') {
@@ -509,6 +521,8 @@ export class Engine {
         if (this.config.review_policy?.version === 2) await this.reconcileClosedIssues();
         await this.reconcileMergeStates();
         if (this.stopping) return;
+        await this.reconcileWorkflowIssues();
+        if (this.stopping) return;
         await this.triage.scan();
         if (this.stopping) return;
         await this.discover();
@@ -548,6 +562,416 @@ export class Engine {
    *   failures within a bounded budget, hands conflicts to a fix run, and
    *   parks for a human only after the budget is gone.
    */
+  // ---------------- GitHub issue workflow (#6) ----------------
+
+  private saveWorkflow(task: TaskRow, record: WorkflowRecord) {
+    this.store.saveIssueWorkflow(task.id, JSON.stringify(record));
+  }
+
+  /** Persist the intent before touching GitHub; a retry resumes the same target. */
+  private async setWorkflowLabel(task: TaskRow, project: ProjectConfig, record: WorkflowRecord, target: WorkflowState) {
+    record.pending_label = target;
+    this.saveWorkflow(task, record);
+    const issue = await this.tracker.getIssue(project.repo, task.issue_number);
+    // A PR that lands with "Closes #N" auto-closes the Issue at merge time;
+    // Done must still be writable on the closed Issue or pending never drains.
+    if (!issue || (issue.state !== 'OPEN' && target !== 'Done')) return false;
+    const current = stateFromLabels(issue.labels);
+    if (current.state === target && !current.conflicts.length) {
+      record.pending_label = null; record.observed_state = target; this.saveWorkflow(task, record); return true;
+    }
+    await this.tracker.setWorkflowState(project.repo, task.issue_number, WORKFLOW_LABEL[target], issue.labels);
+    const after = await this.tracker.getIssue(project.repo, task.issue_number);
+    const confirmed = after ? stateFromLabels(after.labels) : { state: null, conflicts: [] };
+    if (confirmed.state !== target || confirmed.conflicts.length) {
+      record.diagnostic = `状态标签写入未确认：期望 ${target}，实际 ${confirmed.conflicts.length ? `冲突 ${confirmed.conflicts.join('/')}` : confirmed.state ?? '缺失'}`;
+      this.saveWorkflow(task, record);
+      return false;
+    }
+    record.pending_label = null;
+    record.observed_state = target;
+    this.saveWorkflow(task, record);
+    return true;
+  }
+
+  /** New issues in a github-workflow project get one card and one state label. */
+  private async reconcileWorkflowIssues() {
+    for (const project of this.config.projects) {
+      if (!workflowEnabled(project)) continue;
+      let issues: IssueData[];
+      try { issues = await this.tracker.listOpenIssues(project.repo); }
+      catch (err) { this.appLog.event('workflow_scan_error', { repo: project.repo, error: String(err) }); continue; }
+      for (const issue of issues) {
+        if (this.stopping) return;
+        try {
+          const known = this.store.getTask(project.repo, issue.number);
+          if (!known) {
+            if (project.issue_author_association?.length && !project.issue_author_association.includes(issue.author_association ?? 'NONE')) continue;
+            const record = newWorkflowRecord();
+            record.observed_state = initialState(issue.labels);
+            const { task } = this.store.upsertDiscovered({
+              repo: project.repo, issue_number: issue.number, issue_title: issue.title, issue_url: issue.url,
+              issue_workflow_json: JSON.stringify(record),
+            });
+            await this.setWorkflowLabel(task, project, record, record.observed_state);
+            this.appLog.event('workflow_task_discovered', { repo: project.repo, issue: issue.number, state: record.observed_state });
+            continue;
+          }
+          if (isWorkflowTask(known)) await this.reconcileWorkflowTask(known, project);
+        } catch (err) {
+          this.appLog.event('workflow_issue_error', { repo: project.repo, issue: issue.number, error: String(err) });
+          this.recordError('workflow_issue_error', err);
+        }
+      }
+    }
+  }
+
+  private async reconcileWorkflowTask(task: TaskRow, project: ProjectConfig) {
+    const record = workflowOf(task);
+    if (!record) return;
+    const issue = await this.tracker.getIssue(project.repo, task.issue_number);
+    if (!issue) return;
+    const prNum = prNumberFromUrl(task.pr_url);
+    if (issue.state === 'CLOSED') {
+      const merged = prNum ? await this.tracker.getPrState(project.repo, prNum).catch(() => 'UNKNOWN') : 'UNKNOWN';
+      if (merged === 'MERGED') {
+        this.setTaskStatus(task.id, 'COMPLETED');
+        if (stateFromLabels(issue.labels).state !== 'Done') await this.setWorkflowLabel(task, project, record, 'Done');
+      } else {
+        record.diagnostic = 'Issue 已在外部关闭，关联 PR 未合并';
+        this.saveWorkflow(task, record);
+        this.setTaskStatus(task.id, 'CANCELED');
+      }
+      return;
+    }
+    let currentIssue = issue;
+    if (record.pending_label) {
+      await this.setWorkflowLabel(task, project, record, record.pending_label);
+      // setWorkflowLabel may have changed the labels; never derive the current
+      // state from the pre-write read, or a stale read can overwrite the new
+      // local state (and hide a human/board transition).
+      const fresh = await this.tracker.getIssue(project.repo, task.issue_number);
+      if (!fresh) return;
+      currentIssue = fresh;
+    }
+    const current = stateFromLabels(currentIssue.labels);
+    if (current.conflicts.length || !current.state) {
+      record.diagnostic = current.conflicts.length ? `状态标签冲突：${current.conflicts.join('/')}` : '缺少七状态标签';
+      this.saveWorkflow(task, record);
+      return;
+    }
+    const state = current.state;
+    if (record.observed_state !== state) { record.observed_state = state; this.saveWorkflow(task, record); }
+    // Human Review/Backlog/Rework/Merging pause coding: an in-flight child
+    // must stop instead of finishing into a state a human already left.
+    const activeRun = this.store.activeRunForTask(task.id);
+    if (activeRun && ['Human Review', 'Backlog', 'Rework', 'Merging', 'Done'].includes(state)) {
+      this.abortRun(activeRun.run_id, `issue moved to ${state}`);
+    }
+    // Leaving the human gate voids the reviewed scope: a later return to
+    // Human Review without a new publish must not inherit mergeable evidence.
+    if (record.handoff && state !== 'Human Review' && state !== 'Merging') {
+      record.handoff = null; record.approval = null; this.saveWorkflow(task, record);
+    }
+    if (state === 'Done') {
+      const merged = prNum ? await this.tracker.getPrState(project.repo, prNum).catch(() => 'UNKNOWN') : 'UNKNOWN';
+      if (merged !== 'MERGED') {
+        record.diagnostic = 'Issue 被直接标记 Done，但关联 PR 未合并；未将其视为完成';
+        this.saveWorkflow(task, record);
+        await this.setWorkflowLabel(task, project, record, 'Human Review');
+        return;
+      }
+      this.setTaskStatus(task.id, 'COMPLETED');
+      await this.tracker.closeIssue(project.repo, task.issue_number).catch(error => this.appLog.event('issue_close_error', { task: task.id, error: String(error) }));
+      return;
+    }
+    // A task stranded by the removed "configured checks" gate still has a
+    // readable PR: bind it once instead of leaving Human Review permanently
+    // unmergeable. Deliberately voided scopes (a human moved the Issue out of
+    // Human Review) never match, so they stay unbound until a new publish.
+    if (state === 'Human Review' && task.status === 'AWAITING_HUMAN' && task.pr_url && !record.handoff && !activeRun
+      && /未配置可执行的检查命令|缺少宿主核实的通过检查证据/.test(record.diagnostic ?? '')) {
+      const prFromUrl = prNumberFromUrl(task.pr_url);
+      if (prFromUrl && Date.now() >= (this.handoffRetryAt.get(task.id) ?? 0)) {
+        this.handoffRetryAt.set(task.id, Date.now() + 10 * 60_000);
+        await this.handoffWorkflow(task, project, { number: prFromUrl, url: task.pr_url });
+        return;
+      }
+    }
+    const blocked = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED', 'CANCELED'].includes(task.status);
+    if (blocked && state === 'In Progress' && !this.store.activeRunForTask(task.id)) {
+      const last = this.store.runsForTask(task.id).at(-1);
+      record.handoff = null;
+      record.diagnostic = `执行未完成，需人工判断：${last?.reason ?? task.status}`;
+      this.saveWorkflow(task, record);
+      await this.setWorkflowLabel(task, project, record, 'Human Review');
+      return;
+    }
+    if (state === 'Rework' && !this.store.activeRunForTask(task.id) && (task.status === 'AWAITING_HUMAN' || record.rework)) {
+      await this.startWorkflowRework(task, project, record);
+      return;
+    }
+    if (state === 'Merging' && !this.store.activeRunForTask(task.id)) {
+      await this.driveWorkflowMerge(task, project, record);
+      return;
+    }
+    if (task.status === 'AWAITING_HUMAN' && state === 'Todo') {
+      this.setTaskStatus(task.id, 'DISCOVERED', { pending_fix: null });
+    }
+    // A publish interrupted before handoff must not look like a reviewed PR.
+    if (task.status === 'AWAITING_HUMAN' && state === 'In Progress' && task.pr_url && !record.handoff) {
+      record.diagnostic = 'PR 已发布但缺少可审查的验证证据，需人工复核';
+      this.saveWorkflow(task, record);
+      await this.setWorkflowLabel(task, project, record, 'Human Review');
+    }
+  }
+
+  private async tryDispatchWorkflow(task: TaskRow, project: ProjectConfig) {
+    const record = workflowOf(task);
+    if (!record) return;
+    const issue = await this.tracker.getIssue(project.repo, task.issue_number);
+    if (!issue || issue.state !== 'OPEN') { this.setTaskStatus(task.id, 'CANCELED'); return; }
+    const { state, conflicts } = stateFromLabels(issue.labels);
+    if (conflicts.length || !state) {
+      record.diagnostic = conflicts.length ? `状态标签冲突：${conflicts.join('/')}` : '缺少七状态标签';
+      this.saveWorkflow(task, record);
+      return;
+    }
+    if (!['Todo', 'In Progress'].includes(state)) return;
+    const hash = approvalHash(issue);
+    // A workflow generation always carries its generation suffix, including
+    // generation 1: legacy `agent/issue-N` branches/PRs stay untouched history
+    // and can never be mistaken for this generation's work.
+    const branch = task.branch ?? `${project.branch_prefix}${task.issue_number}-r${record.generation}`;
+    if (task.branch !== branch) this.store.setTaskStatus(task.id, task.status, { branch });
+    const existingPr = await this.tracker.findPrForBranch(project.repo, branch);
+    if (existingPr && existingPr.state === 'OPEN' && !task.pending_fix) {
+      this.setTaskStatus(task.id, 'AWAITING_HUMAN', { branch, pr_url: existingPr.url });
+      await this.setWorkflowLabel(task, project, record, 'Human Review');
+      return;
+    }
+    if (existingPr && existingPr.state === 'MERGED') { this.setTaskStatus(task.id, 'COMPLETED', { branch, pr_url: existingPr.url }); return; }
+    this.store.setApprovedHash(task.id, hash);
+    const run = this.store.tx(() => this.store.claimRun(task.id, { outcomeProtocol: 0 }));
+    this.store.updateRunFields(run.run_id, { branch, pr_url: existingPr?.url ?? null });
+    // Execution state lives in agent-control, not on GitHub: no claim label
+    // and no claim comment. The SQLite one-active-run index is the only lock.
+    await this.setWorkflowLabel(task, project, record, 'In Progress');
+    this.appLog.event('workflow_run_claimed', { run: run.run_id, task: task.id, state });
+    this.launch(run.run_id);
+  }
+
+  /**
+   * Bind the published PR to the workflow record. Checks do not gate the
+   * handoff: the host still records them for the dashboard and the merge
+   * recheck, but a project without configured checks must not be stranded in
+   * Human Review. The merge path re-reads the Issue hash, PR head/base and
+   * approval scope before landing, so the binding stays authoritative.
+   */
+  private async handoffWorkflow(task: TaskRow, project: ProjectConfig, pr: { number: number; url: string }, headSha?: string) {
+    const record = workflowOf(task);
+    if (!record) return;
+    const issue = await this.tracker.getIssue(project.repo, task.issue_number);
+    const details = await this.tracker.getPrDetails(project.repo, pr.number).catch(() => null);
+    if (!issue || !details) { record.diagnostic = '交付时无法读取 Issue/PR'; this.saveWorkflow(task, record); return; }
+    let readyError = '';
+    if (details.isDraft) {
+      try { await this.tracker.markPrReady(project.repo, pr.number); }
+      catch (error) { readyError = `PR 无法转为 Ready：${String(error).slice(0, 180)}`; }
+    }
+    record.handoff = {
+      pr: pr.number, pr_url: pr.url, head_sha: headSha ?? details.headSha, base_sha: details.baseSha ?? null,
+      requirement_hash: task.approved_hash ?? approvalHash(issue), generation: record.generation, at: new Date().toISOString(),
+    };
+    record.approval = null;
+    record.diagnostic = readyError || null;
+    this.store.setTaskStatus(task.id, 'AWAITING_HUMAN', { pr_url: pr.url });
+    this.saveWorkflow(task, record);
+    await this.setWorkflowLabel(task, project, record, 'Human Review');
+  }
+
+  private async driveWorkflowMerge(task: TaskRow, project: ProjectConfig, record: WorkflowRecord) {
+    const prNum = prNumberFromUrl(task.pr_url) ?? record.handoff?.pr ?? null;
+    if (!prNum || !record.handoff) {
+      record.diagnostic = '缺少可合并的交付范围（没有关联 PR 或交付绑定）';
+      this.saveWorkflow(task, record);
+      await this.setWorkflowLabel(task, project, record, 'Human Review');
+      return;
+    }
+    const issue = await this.tracker.getIssue(project.repo, task.issue_number);
+    const pr = await this.tracker.getPrDetails(project.repo, prNum).catch(() => null);
+    if (!issue || !pr) { record.diagnostic = '合并前无法读取 Issue/PR'; this.saveWorkflow(task, record); return; }
+    if (pr.state === 'MERGED') { await this.completeWorkflowLanded(task, project, record); return; }
+    if (pr.state !== 'OPEN') { record.diagnostic = 'PR 已关闭但未合并'; this.saveWorkflow(task, record); await this.setWorkflowLabel(task, project, record, 'Human Review'); return; }
+    // CI is GitHub's own signal and needs no agent-control configuration: a
+    // red rollup blocks the landing, an empty one proves nothing and is not
+    // treated as a failure.
+    if (pr.checks?.length) {
+      const failed = pr.checks.filter(check => check.status !== 'COMPLETED'
+        || !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes((check.conclusion ?? '').toUpperCase()));
+      if (failed.length) {
+        record.diagnostic = `PR CI 未全部通过：${failed.map(check => `${check.name}=${check.conclusion ?? check.status}`).join(', ')}`;
+        this.saveWorkflow(task, record);
+        await this.setWorkflowLabel(task, project, record, 'Human Review');
+        return;
+      }
+    }
+    const requirementHash = task.approved_hash ?? approvalHash(issue);
+    const scope = {
+      generation: record.generation, pr: prNum, headSha: pr.headSha,
+      baseSha: pr.baseSha ?? null, requirementHash: record.handoff.requirement_hash,
+    };
+    // A board approval is already bound to the handoff scope; a GitHub event
+    // is re-verified against the same scope. Either way the host rechecks the
+    // PR, checks and CI below before merging.
+    const existingBoard = record.approval?.source === 'board' ? record.approval : null;
+    const pendingBoard = record.board_approval?.target === 'Merging' ? record.board_approval : null;
+    let approval: WorkflowApproval;
+    if (existingBoard || pendingBoard) {
+      const candidate = existingBoard ?? pendingBoard!;
+      if (!sameApprovalScope(candidate, scope)) {
+        record.diagnostic = '面板批准与当前交付范围不匹配';
+        record.approval = null;
+        record.board_approval = null;
+        this.saveWorkflow(task, record);
+        await this.setWorkflowLabel(task, project, record, 'Human Review');
+        return;
+      }
+      approval = {
+        event_id: existingBoard?.event_id ?? 0,
+        actor: candidate.actor,
+        target: 'Merging',
+        head_sha: pr.headSha,
+        base_sha: pr.baseSha ?? null,
+        requirement_hash: record.handoff.requirement_hash,
+        pr: prNum,
+        generation: record.generation,
+        at: candidate.at,
+        source: 'board',
+      };
+      record.board_approval = null;
+    } else {
+      const events = await this.tracker.issueLabelEvents(project.repo, task.issue_number);
+      const hostLogin = await this.tracker.authLogin().catch(() => null);
+      const approvalEvent = events.filter(event => event.label === WORKFLOW_LABEL.Merging && event.event === 'labeled').at(-1);
+      const permission = approvalEvent ? await this.tracker.collaboratorPermission(project.repo, approvalEvent.actor).catch(() => null) : null;
+      const check = authorizeHumanEvent({
+        events, target: 'Merging', hostLogin, permission, handoff: record.handoff,
+        requirementHash, pr: prNum, headSha: pr.headSha, baseSha: pr.baseSha ?? null, generation: record.generation,
+      });
+      if (!check.event) {
+        record.diagnostic = check.reason;
+        this.saveWorkflow(task, record);
+        await this.setWorkflowLabel(task, project, record, 'Human Review');
+        await this.tracker.commentPr(project.repo, prNum, `## 合并授权未通过\n\n${check.reason}\n\n未执行合并。`).catch(() => {});
+        return;
+      }
+      approval = {
+        event_id: check.event.id, actor: check.event.actor, target: 'Merging', head_sha: pr.headSha,
+        base_sha: pr.baseSha ?? null, requirement_hash: record.handoff.requirement_hash, pr: prNum,
+        generation: record.generation, at: new Date().toISOString(), source: 'github',
+      };
+      record.event_cursor = Math.max(record.event_cursor, check.event.id);
+    }
+    const current = this.store.getTaskById(task.id);
+    if (!current || !['AWAITING_HUMAN', 'MERGING'].includes(current.status) || this.store.activeRunForTask(task.id)) {
+      record.diagnostic = '合并前任务状态已变化（可能被停止或并发处理）'; this.saveWorkflow(task, record); return;
+    }
+    if (approvalHash(issue) !== record.handoff.requirement_hash) {
+      record.diagnostic = '合并前 Issue 需求已变化'; record.handoff = null; this.saveWorkflow(task, record);
+      await this.setWorkflowLabel(task, project, record, 'Human Review'); return;
+    }
+    record.approval = approval;
+    this.saveWorkflow(task, record);
+    this.store.setTaskStatus(task.id, 'MERGING', { approved_sha: pr.headSha, approved_by: 'human', pr_url: pr.url });
+    try {
+      await this.tracker.mergePr(project.repo, prNum, pr.headSha);
+    } catch (error) {
+      const attempts = this.store.bumpMergeAttempts(task.id);
+      // A conflict cannot be retried into success: hand it to a human now.
+      const conflict = /conflict/i.test(String(error));
+      record.diagnostic = `合并失败：${String(error).slice(0, 300)}`;
+      this.saveWorkflow(task, record);
+      const parked = conflict || attempts >= MAX_MERGE_ATTEMPTS;
+      this.setTaskStatus(task.id, parked ? 'AWAITING_HUMAN' : 'MERGING');
+      if (parked) await this.setWorkflowLabel(task, project, record, 'Human Review');
+      return;
+    }
+    const state = await this.tracker.getPrState(project.repo, prNum).catch(() => 'UNKNOWN');
+    if (state !== 'MERGED') {
+      record.diagnostic = '合并调用返回但 PR 未达到 MERGED';
+      this.saveWorkflow(task, record);
+      this.setTaskStatus(task.id, 'AWAITING_HUMAN');
+      await this.setWorkflowLabel(task, project, record, 'Human Review');
+      return;
+    }
+    await this.completeWorkflowLanded(task, project, record);
+  }
+
+  private async completeWorkflowLanded(task: TaskRow, project: ProjectConfig, record: WorkflowRecord) {
+    this.store.setTaskStatus(task.id, 'COMPLETED');
+    this.appLog.event('workflow_task_completed', { task: task.id, repo: task.repo, issue: task.issue_number });
+    await this.setWorkflowLabel(task, project, record, 'Done');
+    await this.tracker.closeIssue(project.repo, task.issue_number)
+      .catch(error => this.appLog.event('issue_close_error', { task: task.id, error: String(error) }));
+    await this.cleanupMerged(project, task);
+  }
+
+  private async startWorkflowRework(task: TaskRow, project: ProjectConfig, record: WorkflowRecord) {
+    const prNum = prNumberFromUrl(task.pr_url);
+    if (!record.rework) {
+      const board = record.board_approval?.target === 'Rework' ? record.board_approval : null;
+      if (board) {
+        if (board.generation !== record.generation) {
+          record.diagnostic = '面板返工批准与当前代际不匹配';
+          record.board_approval = null;
+          this.saveWorkflow(task, record);
+          await this.setWorkflowLabel(task, project, record, 'Human Review');
+          return;
+        }
+        record.rework = { event_id: 0, actor: board.actor, from_generation: record.generation, source: 'board' };
+        record.board_approval = null;
+      } else {
+        const events = await this.tracker.issueLabelEvents(project.repo, task.issue_number);
+        const event = events.filter(item => item.event === 'labeled' && item.label === WORKFLOW_LABEL.Rework && item.id > record.event_cursor).at(-1);
+        if (!event) { record.diagnostic = '缺少可核验的人工 Rework 事件'; this.saveWorkflow(task, record); return; }
+        const hostLogin = await this.tracker.authLogin().catch(() => null);
+        const permission = await this.tracker.collaboratorPermission(project.repo, event.actor).catch(() => null);
+        if (!permission || !['admin', 'maintain', 'write', 'push'].includes(permission) || event.actorType !== 'User'
+          || (hostLogin && hostLogin === event.actor)) {
+          record.diagnostic = 'Rework 操作者不可核验或为宿主身份'; this.saveWorkflow(task, record); return;
+        }
+        record.rework = { event_id: event.id, actor: event.actor, from_generation: record.generation, source: 'github' };
+        record.event_cursor = event.id;
+      }
+      record.history.push({ generation: record.generation, pr_url: task.pr_url, branch: task.branch, head_sha: record.handoff?.head_sha ?? null, closed_at: new Date().toISOString(), reason: `Rework by ${record.rework.actor}` });
+      record.generation += 1;
+      record.handoff = null; record.approval = null; record.diagnostic = null;
+      this.saveWorkflow(task, record);
+    }
+    if (prNum) await this.tracker.closePr(project.repo, prNum).catch(error => this.appLog.event('rework_close_pr_error', { task: task.id, error: String(error) }));
+    try {
+      await this.workspace.fetchBranch(project.local_repo, project.base_branch, project.git_remote);
+    } catch (error) {
+      // Do not build a generation on a stale base: keep the persisted rework
+      // intent and retry on the next tick.
+      record.diagnostic = `Rework 无法刷新目标分支：${String(error).slice(0, 200)}`;
+      this.saveWorkflow(task, record);
+      await this.setWorkflowLabel(task, project, record, 'Human Review');
+      return;
+    }
+    const branch = `${project.branch_prefix}${task.issue_number}-r${record.generation}`;
+    this.store.tx(() => {
+      this.store.setTaskStatus(task.id, 'DISCOVERED', { branch, pr_url: null, pending_fix: null, approved_sha: null, approved_by: null, merge_attempts: 0 });
+      this.store.saveReviewControl(task.id, null);
+    });
+    const reworkActor = record.rework?.actor ?? 'unknown';
+    record.rework = null;
+    this.saveWorkflow(task, record);
+    await this.setWorkflowLabel(task, project, record, 'In Progress');
+    this.appLog.event('workflow_rework_started', { task: task.id, generation: record.generation, actor: reworkActor });
+  }
+
   private async reconcileMergeStates() {
     for (const task of [
       ...this.store.listTasks('AWAITING_REVIEW'),
@@ -557,7 +981,7 @@ export class Engine {
       if (this.stopping) return; // no new merge/approval consumption mid-shutdown
       try {
         const project = this.projectFor(task.repo);
-        if (!project) continue;
+        if (!project || isWorkflowTask(task) || workflowEnabled(project)) continue;
         const prNum = prNumberFromUrl(task.pr_url) ?? undefined;
         if (task.status === 'MERGING') {
           // A conflict-repair run is part of landing: the task stays MERGING
@@ -829,7 +1253,7 @@ export class Engine {
     for (const project of this.config.projects) {
       let issues: IssueData[];
       try {
-        if (acceptsAllIssues(project)) continue;
+        if (acceptsAllIssues(project) || workflowEnabled(project)) continue;
         issues = await this.tracker.listReadyIssues(project.repo, project.ready_label);
       } catch (err) {
         this.appLog.event('discover_error', { repo: project.repo, error: String(err) });
@@ -876,6 +1300,9 @@ export class Engine {
    */
   private async discoverPrs() {
     for (const project of this.config.projects) {
+      // Bare-PR review belongs to the legacy path; a github-mode project only
+      // accepts seven-state Issue tasks.
+      if (workflowEnabled(project)) continue;
       // 'manual' still scans: the agent-review label is the only way an
       // external PR gets reviewed there, so skipping the project entirely
       // would make the documented summon path dead.
@@ -962,6 +1389,13 @@ export class Engine {
 
   /** Gate check + claim + launch for one task. All gating failures are explicit. */
   private async tryDispatch(task: TaskRow, project: ProjectConfig) {
+    if (isWorkflowTask(task)) { await this.tryDispatchWorkflow(task, project); return; }
+    // A github-mode project runs only its seven-state tasks. Pre-upgrade rows
+    // are historical execution records; they must not re-enter the old path.
+    if (workflowEnabled(project)) {
+      this.appLog.event('dispatch_skip', { task: task.id, why: 'legacy task retired by github workflow project' });
+      return;
+    }
     const issue = await this.tracker.getIssue(project.repo, task.issue_number);
     if (issue && !await this.triage.authorize(project, issue)) return;
     if (!issue || issue.state !== 'OPEN') {
@@ -1417,8 +1851,9 @@ export class Engine {
         const stamp = Date.now();
         const logPath = join(artifactsDir, `agent-${stamp}.jsonl`);
         const spawned: { pid: number | null; identity: string | null } = { pid: null, identity: null };
-        const firstCodeRun = store.runsForTask(task.id).find(candidate => candidate.kind === 'code') ?? run;
-        const complex = ctx.issue.labels.includes(COMPLEX_LABEL);
+        const firstCodeRun = store.runsForTask(task.id).find(candidate => candidate.kind === 'code' && candidate.branch === run.branch)
+          ?? store.runsForTask(task.id).find(candidate => candidate.kind === 'code') ?? run;
+        const complex = !isWorkflowTask(task) && ctx.issue.labels.includes(COMPLEX_LABEL);
         const model = complex ? this.config.agent.complex_model ?? this.config.agent.model : this.config.agent.model;
         const thinking = complex
           ? this.config.agent.complex_reasoning_effort ?? this.config.agent.reasoning_effort
@@ -1458,10 +1893,13 @@ export class Engine {
           case 'PREPARING': {
             const gate = await this.gateApproval(project, task);
             if (gate !== 'ok') { this.finish(run, task, gate, 'approval gate failed at prepare'); return; }
+            const generation = workflowOf(task)?.generation ?? 1;
             const wt = await this.workspace.ensureWorktree({
               repoDir: project.local_repo,
               branch: run.branch ?? `${project.branch_prefix}${task.issue_number}`,
-              baseBranch: project.base_branch,
+              // A rework generation starts from the freshly fetched remote base,
+              // never from a possibly stale local branch ref.
+              baseBranch: isWorkflowTask(task) && generation > 1 ? `${project.git_remote}/${project.base_branch}` : project.base_branch,
               worktreePath: this.worktreePathFor(project, task),
             });
             worktreePath = wt.path;
@@ -1684,7 +2122,7 @@ export class Engine {
                 return;
               }
               store.transition(runId, phase, phase, { kind: 'pr_published', head_sha: verifiedHead, pr_url: pr.url });
-              await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-pr');
+              if (!isWorkflowTask(task)) await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-pr');
               // A conflict repair creates a new head and cannot carry its old approval.
               if (mergeRepair) store.setTaskStatus(task.id, store.getTaskById(task.id)!.status, { approved_sha: null, approved_by: null });
               const policy = store.getReviewControl(task.id);
@@ -1694,6 +2132,11 @@ export class Engine {
                 delete updated.assessment;
                 store.saveReviewControl(task.id, updated);
                 store.setTaskStatus(task.id, store.getTaskById(task.id)!.status, { approved_sha: null, approved_by: null });
+              }
+              if (isWorkflowTask(task)) {
+                await this.handoffWorkflow(task, project, pr, verifiedHead);
+                this.finish(run, task, 'AWAITING_HUMAN', `PR published: ${pr.url}`, { pr_url: pr.url });
+                return;
               }
               this.finish(run, task,
                 project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN',
@@ -1738,6 +2181,7 @@ export class Engine {
       if (this.stopping) return;
       const project = this.projectFor(task.repo);
       if (!project) continue;
+      if (project.workflow_mode === 'github' && !isWorkflowTask(task)) continue;
       // Manual-review projects never enter AWAITING_REVIEW — the PR parks
       // in AWAITING_HUMAN and a human reviews and merges, no run is spent.
       // reviewsPr() owns the exception for bare PRs.
@@ -1767,7 +2211,7 @@ export class Engine {
           // the UI would show "reviewing" for a task that cannot move. BLOCKED
           // is the honest label and it is retryable — retry clears the verdict.
           this.setTaskStatus(task.id, 'BLOCKED');
-          await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-blocked');
+          if (!isWorkflowTask(task)) await this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-blocked');
           this.appLog.event('review_stranded', { task: task.id, head_sha: pr.headSha, pr: prNum });
           continue;
         }
@@ -1898,7 +2342,7 @@ export class Engine {
         }
       }
       store.updateRunFields(runId, { workspace: sitePath });
-      if (prNum) { await this.setPrLabel(project.repo, prNum, true); labelApplied = true; }
+      if (prNum && !isWorkflowTask(task)) { await this.setPrLabel(project.repo, prNum, true); labelApplied = true; }
 
       // --- run the read-only reviewer ----------------------------------------
       const ctx = await this.makePromptContext(run, task, project);
@@ -2140,10 +2584,10 @@ export class Engine {
         }
       });
       if (ATTENTION_PHASES.includes(finalPhase)) void this.notifyTaskAttention(task, finalPhase, reason);
-      if (finalPhase === 'BLOCKED' || finalPhase === 'BLOCKED_APPROVAL_CHANGED') {
+      if (!isWorkflowTask(task) && (finalPhase === 'BLOCKED' || finalPhase === 'BLOCKED_APPROVAL_CHANGED')) {
         void this.labelQuietly(task.repo, task.issue_number, 'add', 'agent-blocked');
       }
-      void this.labelQuietly(task.repo, task.issue_number, 'remove', 'agent-running');
+      if (!isWorkflowTask(task)) void this.labelQuietly(task.repo, task.issue_number, 'remove', 'agent-running');
     } catch (err) {
       this.appLog.event('finish_error', { run: run.run_id, error: String(err) });
       this.recordError('finish_error', err);
@@ -2445,8 +2889,12 @@ export class Engine {
     // label to re-check and no approval hash to drift.
     if (task.source === 'pr') return 'ok';
     const issue = await this.tracker.getIssue(project.repo, task.issue_number);
-    if (!issue || issue.state !== 'OPEN' || !acceptsAllIssues(project) && !issue.labels.includes(project.ready_label)) return 'CANCELED';
-    if (acceptsAllIssues(project)) {
+    if (!issue || issue.state !== 'OPEN') return 'CANCELED';
+    if (isWorkflowTask(task)) {
+      const { state, conflicts } = stateFromLabels(issue.labels);
+      if (conflicts.length || !state || !['In Progress', 'Human Review'].includes(state)) return 'CANCELED';
+    } else if (!acceptsAllIssues(project) && !issue.labels.includes(project.ready_label)) return 'CANCELED';
+    if (!isWorkflowTask(task) && acceptsAllIssues(project)) {
       const state = this.triage.state(task.repo, task.issue_number);
       if (state && (state.kind || state.locked || state.pending || state.error) || issue.labels.includes('agent-human-hold') || issue.labels.includes('agent-needs-human')) return 'BLOCKED';
     }
@@ -2627,12 +3075,12 @@ export class Engine {
         this.store.setTaskStatus(task.id, taskPhase, taskFields);
       });
       if (ATTENTION_PHASES.includes(finalPhase)) void this.notifyTaskAttention(task, finalPhase, reason);
-      if (finalPhase === 'BLOCKED' || finalPhase === 'BLOCKED_APPROVAL_CHANGED') {
+      if (!isWorkflowTask(task) && (finalPhase === 'BLOCKED' || finalPhase === 'BLOCKED_APPROVAL_CHANGED')) {
         const project = this.projectFor(task.repo);
         if (project) void this.labelQuietly(project.repo, task.issue_number, 'add', 'agent-blocked');
       }
       const project = this.projectFor(task.repo);
-      if (project) void this.labelQuietly(project.repo, task.issue_number, 'remove', 'agent-running');
+      if (project && !isWorkflowTask(task)) void this.labelQuietly(project.repo, task.issue_number, 'remove', 'agent-running');
     } catch (err) {
       this.appLog.event('finish_error', { run: run.run_id, error: String(err) });
       this.recordError('finish_error', err);
@@ -2752,7 +3200,9 @@ export class Engine {
 
   private worktreePathFor(project: ProjectConfig, task: TaskRow): string {
     const safeRepo = project.repo.replace(/[^\w.-]+/g, '_');
-    return resolve(this.config.server.worktree_root, safeRepo, `issue-${task.issue_number}`);
+    const generation = (() => { try { return workflowOf(task)?.generation ?? 1; } catch { return 1; } })();
+    return resolve(this.config.server.worktree_root, safeRepo,
+      isWorkflowTask(task) || generation > 1 ? `issue-${task.issue_number}-r${generation}` : `issue-${task.issue_number}`);
   }
 
   private artifactsDirFor(run: RunRow): string {
@@ -2776,19 +3226,26 @@ export class Engine {
    * siblings cannot be told apart from ghosts and are an accepted gap.
    * Losing leaves `agent-running` in place: it belongs to the winner.
    */
-  private async lostClaimRace(project: ProjectConfig, task: TaskRow, runId: string): Promise<boolean> {
+  private async lostClaimRace(
+    project: ProjectConfig, task: TaskRow, runId: string,
+    opts: { failClosed?: boolean; includeSameHost?: boolean } = {},
+  ): Promise<boolean> {
     await sleep(this.deps.claimArbitrationMs ?? 4000);
     const comments = await this.tracker.listIssueComments(project.repo, task.issue_number).catch((err) => {
       this.appLog.event('claim_arbiter_error', { task: task.id, error: String(err) });
       return null;
     });
-    if (comments === null) return false; // arbiter is best-effort; never stall dispatch on API failure
+    // Legacy dispatch accepts an API flake; the workflow path must not launch
+    // a second executor it cannot prove is alone.
+    if (comments === null) return opts.failClosed === true;
     const cutoff = Date.now() - 10 * 60_000;
     const claims = comments.filter(
       (c) => c.body.startsWith('agent-control: 已领取') && Date.parse(c.createdAt) >= cutoff,
     );
     const key = (c: { body: string; createdAt: string }) => `${c.createdAt}${c.body}`;
-    const rivals = claims.filter((c) => !c.body.includes(runId) && !c.body.includes(hostname()));
+    const ownRuns = this.store.runsForTask(task.id).map(run => run.run_id);
+    const rivals = claims.filter((c) => !c.body.includes(runId) && !ownRuns.some(id => c.body.includes(id))
+      && (opts.includeSameHost === true || !c.body.includes(hostname())));
     if (rivals.length === 0) return false;
     const mine = claims.filter((c) => c.body.includes(runId)).map(key).sort()[0];
     const earliestRival = rivals.map(key).sort()[0]!;

@@ -53,6 +53,7 @@ export interface CheckSpec {
 }
 
 export interface ProjectConfig {
+  workflow_mode?: 'github' | 'legacy';
   human_review_paths?: string[];
   issue_intake?: 'all' | 'labeled';
   /** Optional allowlist of GitHub `author_association` values for
@@ -204,6 +205,8 @@ export interface PendingFix {
 }
 
 export interface TaskRow {
+  /** NULL means the pre-#6 legacy workflow; never inferred from project config. */
+  issue_workflow_json: string | null;
   review_control_json: string | null;
   id: number;
   repo: string;

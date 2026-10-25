@@ -6,6 +6,7 @@ import type { Phase, RunRow, TaskRow } from '../types.js';
 import type { Engine } from './engine.js';
 import { approvalHash, type GitHubTracker } from '../tracker/github.js';
 import { retryReview } from '../verify/review-policy.js';
+import { isWorkflowTask, stateFromLabels } from './issue-workflow.js';
 import type { AppConfig } from '../types.js';
 
 export interface RecoveryDeps {
@@ -144,7 +145,9 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
             report.recoveryRequired.push({ run_id: run.run_id, why });
             break;
           }
-          const labelled = !!issue && issue.state === 'OPEN' && issue.labels.includes(project.ready_label);
+          const labelled = !!issue && issue.state === 'OPEN' && (isWorkflowTask(task)
+            ? ['In Progress', 'Human Review'].includes(stateFromLabels(issue.labels).state ?? '')
+            : issue.labels.includes(project.ready_label));
           const hashOk = !!issue && (!task.approved_hash || approvalHash(issue) === task.approved_hash);
           if (labelled && hashOk && task.status === 'MERGING') {
             // A merge-conflict repair publishes back into MERGING carrying
@@ -162,7 +165,8 @@ export async function reconcile(deps: RecoveryDeps): Promise<RecoveryReport> {
             // Publish already happened. Reviews are separate runs now — an
             // auto-review project lands in AWAITING_REVIEW for dispatch; a
             // manual-review project parks straight on the human merge path.
-            const afterPublish: Phase = project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN';
+            const afterPublish: Phase = isWorkflowTask(task) ? 'AWAITING_HUMAN'
+              : project.review_mode === 'auto' ? 'AWAITING_REVIEW' : 'AWAITING_HUMAN';
             const control = store.getReviewControl(task.id);
             let details: Awaited<ReturnType<GitHubTracker['getPrDetails']>> | undefined;
             try { if (control) details = await deps.tracker.getPrDetails(project.repo, existing.number); }

@@ -10,6 +10,7 @@ import type { Phase } from '../src/types.js';
 import type { Store } from '../src/store/sqlite.js';
 import { makeConfig, makeFakeTracker, makeStore, nullLog, teardown } from './helpers.js';
 import { newReviewControl } from '../src/verify/review-policy.js';
+import { newWorkflowRecord } from '../src/scheduler/issue-workflow.js';
 
 for (const failures of [0, 1, 2]) test(`v2 interrupted review with ${failures} prior infra failures consumes persistent budget instead of resuming`, async () => {
   const env = setup();
@@ -501,5 +502,20 @@ test('PUBLISHING_PR with existing PR on a MERGING repair → resume publish, not
     assert.equal(env.store.getTaskById(task.id)!.status, 'MERGING', 'repair task stays MERGING');
     assert.equal(env.store.getTaskById(task.id)!.approved_by, 'human');
     assert.equal(env.store.getRun(run.run_id)!.phase, 'PUBLISHING_PR');
+  } finally { env.done(); }
+});
+
+test('workflow publish recovery accepts In Progress instead of a ready label', async () => {
+  const env = setup();
+  try {
+    const { task, run } = await seedRun(env.store, 'PUBLISHING_PR');
+    env.store.saveIssueWorkflow(task.id, JSON.stringify(newWorkflowRecord()));
+    env.store.updateRunFields(run.run_id, { workspace: env.dir });
+    env.tracker.issues.set(1, { title: 't', body: 'b', labels: ['In Progress'], state: 'OPEN', url: 'u' });
+    env.tracker.prs.set('agent/issue-1', { number: 100, url: 'https://x/pull/100', state: 'OPEN', isDraft: true });
+    const report = await reconcile({ store: env.store, config: env.config, tracker: env.tracker as unknown as GitHubTracker,
+      appLog: nullLog, engine: env.fakeEngine, findProcs: async () => [], isPidAlive: () => false });
+    assert.deepEqual(report.finalized, [run.run_id]);
+    assert.equal(env.store.getTaskById(task.id)?.status, 'AWAITING_HUMAN');
   } finally { env.done(); }
 });

@@ -144,7 +144,7 @@ export async function startService(app: App): Promise<void> {
           triage: engine.triage,
           checkRepoExists: (repo) => tracker.checkRepoExists(repo),
           resolveRepo: (repo) => tracker.resolveRepo(repo),
-          provisionRepo: (repo, readyLabel, triageEnabled) => provisionLabels(tracker, repo, readyLabel, triageEnabled),
+          provisionRepo: (repo, readyLabel, triageEnabled, workflow) => provisionLabels(tracker, repo, readyLabel, triageEnabled, workflow),
         },
         host: config.server.ui.host,
         port: config.server.ui.port,
@@ -215,9 +215,9 @@ export async function startService(app: App): Promise<void> {
 }
 
 /** Best-effort label provisioning for a UI-added project; returns warnings. */
-async function provisionLabels(tracker: GitHubTracker, repo: string, readyLabel: string, triageEnabled: boolean): Promise<string[]> {
+async function provisionLabels(tracker: GitHubTracker, repo: string, readyLabel: string, triageEnabled: boolean, workflow = false): Promise<string[]> {
   const warnings: string[] = [];
-  const wanted = requiredLabelsForProject(readyLabel, triageEnabled);
+  const wanted = requiredLabelsForProject(readyLabel, triageEnabled, workflow);
   let missing: string[];
   try {
     missing = (await tracker.ensureLabels(repo, wanted)).missing;
@@ -293,7 +293,7 @@ export async function runDoctor(config: AppConfig | null, configError?: string):
       ? { name: `project:${p.repo}`, status: 'PASS', detail: `local repo ${p.local_repo}` }
       : { name: `project:${p.repo}`, status: 'FAIL', detail: `${p.local_repo} is not a git repo` });
     try {
-      const labels = await tracker.ensureLabels(p.repo, requiredLabelsForProject(p.ready_label, acceptsAllIssues(p)));
+      const labels = await tracker.ensureLabels(p.repo, requiredLabelsForProject(p.ready_label, acceptsAllIssues(p), p.workflow_mode === 'github'));
       items.push(labels.ok
         ? { name: `labels:${p.repo}`, status: 'PASS', detail: 'required labels exist' }
         : { name: `labels:${p.repo}`, status: 'UNVERIFIED', detail: `missing: ${labels.missing.join(', ')}` });
