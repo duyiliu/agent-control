@@ -22,7 +22,7 @@ export function groupOf(status: Phase): GroupKey {
 export const GROUPS: { key: GroupKey; label: string; dot: string }[] = [
   { key: 'queued', label: '等待派发', dot: 'bg-fg-dim' },
   { key: 'active', label: '执行中', dot: 'bg-ok' },
-  { key: 'reviewing', label: '评审中', dot: 'bg-info' },
+  { key: 'reviewing', label: '评审', dot: 'bg-info' },
   { key: 'merging', label: '合并中', dot: 'bg-ok' },
   { key: 'human', label: '待人工处理', dot: 'bg-warn' },
   { key: 'done', label: '已完成', dot: 'bg-fg-dim' },

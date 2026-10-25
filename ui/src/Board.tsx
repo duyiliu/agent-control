@@ -71,7 +71,8 @@ export default function Board(props: {
   const matching = tasks.filter(t => !kw || t.issue_title.toLowerCase().includes(kw) || String(t.issue_number).includes(kw) || t.repo.toLowerCase().includes(kw));
   const hasDisposition = (t: TaskSummary) => !t.active_run && !['COMPLETED', 'MERGING', 'AWAITING_REVIEW', 'AWAITING_HUMAN'].includes(t.status);
   const phaseOf = (t: TaskSummary) => (t.status === 'MERGING' ? 'MERGING' : (t.active_run?.phase ?? t.status));
-  const parked = (t: TaskSummary) => !['COMPLETED', 'CANCELED'].includes(t.status) && hasDisposition(t) && (t.intake?.kind === 'deferred' || t.attention?.kind === 'hold');
+  const parked = (t: TaskSummary) => !['COMPLETED', 'CANCELED'].includes(t.status)
+    && (t.attention?.kind === 'hold' || hasDisposition(t) && t.intake?.kind === 'deferred');
   const history = (t: TaskSummary) => t.attention?.kind === 'advisory' || groupOf(phaseOf(t)) === 'done' || hasDisposition(t) && t.intake?.kind === 'skipped';
   const taskGroup = (t: TaskSummary): GroupKey => hasDisposition(t) && t.intake && (t.intake.kind === 'human' || t.intake.locked || t.intake.external_hold || t.intake.external_needs || t.intake.error || t.intake.pending) ? 'human' : groupOf(phaseOf(t));
   const executionError = (t: TaskSummary) => !parked(t) && !history(t) && (['execution_error', 'recovery'].includes(t.attention?.kind ?? '') || !t.attention?.kind && taskGroup(t) === 'blocked');
