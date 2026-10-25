@@ -85,6 +85,7 @@ export default function Board(props: {
     history: scoped.filter(history).length,
   };
   const overdueCount = scoped.filter(t => parked(t) && isDeferredDue(t.intake)).length;
+  const recentDone = scoped.filter(history).sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id - a.id).slice(0, 10);
   const inView = matching.filter(t => {
     if (disposition === 'history') return history(t) && (historyResult === 'all' || (historyResult === 'skipped' ? t.intake?.kind === 'skipped' && !['COMPLETED', 'CANCELED'].includes(t.status) : t.status === historyResult));
     if (disposition === 'attention') return attention(t);
@@ -188,7 +189,7 @@ export default function Board(props: {
           </button>;
         })}
       </div>}
-      {disposition === 'history' ? <HistoryList key={`${activeFilter}:${keyword}:${historyResult}`} tasks={visible} selected={selected} onSelect={onSelect} /> : (
+      {disposition === 'history' ? <HistoryList key={`${activeFilter}:${keyword}:${historyResult}`} tasks={visible} selected={selected} onSelect={onSelect} /> : (<>
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-3 lg:flex-row lg:gap-3 lg:overflow-x-auto lg:overflow-y-hidden lg:p-4">
         {displayGroups.map((g) => {
           const items = byGroup.get(g.key)!;
@@ -230,7 +231,25 @@ export default function Board(props: {
             </section>
           );
         })}
-      </div>)}
+      </div>
+      {disposition === 'active' && recentDone.length > 0 && (
+        <section className="shrink-0 border-t border-edge px-3 py-2 sm:px-4">
+          <header className="flex items-baseline gap-2 pb-1 text-[11px]">
+            <span className="font-medium text-fg-muted">最近完成</span>
+            <button type="button" onClick={() => { setDisposition('history'); setMobileGroup(null); }} className="text-info hover:underline">查看历史记录</button>
+          </header>
+          <ul className="grid max-h-40 gap-x-4 gap-y-0.5 overflow-y-auto sm:grid-cols-2 xl:grid-cols-3">
+            {recentDone.map(t => <li key={t.id}>
+              <button type="button" onClick={() => onSelect(t.id)} className="flex min-h-8 w-full items-center gap-2 rounded px-1 text-left text-[11px] hover:bg-elevated">
+                <span className="shrink-0 text-fg-dim">{t.source === 'pr' ? 'PR #' : '#'}{t.issue_number}</span>
+                <span className="min-w-0 flex-1 truncate text-fg-muted">{t.issue_title || '(无标题)'}</span>
+                <span className={`shrink-0 ${t.status === 'COMPLETED' ? 'text-ok' : 'text-fg-muted'}`}>{t.status === 'COMPLETED' ? '已完成' : t.status === 'CANCELED' ? '已取消' : t.attention?.kind === 'advisory' ? '评审完成' : '无需处理'}</span>
+              </button>
+            </li>)}
+          </ul>
+        </section>
+      )}
+      </>)}
     </div>
   );
 }
