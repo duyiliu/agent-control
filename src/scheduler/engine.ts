@@ -697,7 +697,10 @@ export class Engine {
    */
   private async driveMerge(task: TaskRow, project: ProjectConfig, prNumber: number | undefined) {
     const store = this.store;
-    if (task.approved_by !== 'human' && task.approved_by !== 'review') {
+    // 'review' is the host's v2 auto-approval marker; a legacy task has no
+    // v2 control to justify it, so only an explicit human approval lands.
+    const autoApproved = task.approved_by === 'review' && !!this.store.getReviewControl(task.id);
+    if (task.approved_by !== 'human' && !autoApproved) {
       this.setTaskStatus(task.id, 'AWAITING_HUMAN', { approved_sha: null, approved_by: null });
       this.appLog.event('merge_approval_required', { task: task.id, approved_by: task.approved_by, approved_sha: task.approved_sha });
       return;
@@ -1969,7 +1972,7 @@ export class Engine {
             logPath: summary.outcomes.at(-1)!.logPath,
           }; }
         }
-        if (!outcome) outcome = await this.runReviewFn(ctx, this.testEvidenceFor(task, reviewedSha), reviewDiff.patch, {
+        if (!outcome) outcome = await this.runReviewFn(ctx, this.testEvidenceFor(task, reviewedSha) + await this.prChecksEvidence(project, prNum, reviewedSha), reviewDiff.patch, {
           agentConfig: this.config.agent,
           timeoutMs: Math.min(this.config.server.max_task_minutes, this.store.getReviewControl(task.id) ? this.config.review_policy?.timeout_minutes ?? 10 : this.config.server.max_task_minutes) * 60_000,
           policyVersion: this.store.getReviewControl(task.id) ? 2 : 1,
@@ -2344,6 +2347,26 @@ export class Engine {
       const guard = guards.get(row.run_id)!;
       return guard.valid && row.created_at <= guard.at;
     });
+  }
+
+  /**
+   * The reviewer cannot reach GitHub, so a request for runtime proof (an
+   * Extension Host smoke, a real CI workflow) is unfalsifiable for it and
+   * blocks forever. Feed the host-fetched CI rollup for the reviewed head so
+   * that evidence is inspectable instead of demanded.
+   */
+  private async prChecksEvidence(project: ProjectConfig, prNumber: number | null, headSha: string): Promise<string> {
+    if (!prNumber) return '';
+    try {
+      const pr = await this.tracker.getPrDetails(project.repo, prNumber);
+      if (pr.headSha !== headSha) return '';
+      const checks = pr.checks ?? [];
+      if (!checks.length) return '\n\n# PR CI 检查（数据）\n该 SHA 上 PR 尚无 CI 检查记录。';
+      return '\n\n# PR CI 检查（数据，GitHub 报告于同一 SHA）\n'
+        + checks.map((c) => `- ${c.name}: ${c.status}${c.conclusion ? ` / ${c.conclusion}` : ''}`).join('\n');
+    } catch (err) {
+      return `\n\n# PR CI 检查（数据）\n无法读取 PR CI 状态：${String(err).slice(0, 120)}`;
+    }
   }
 
   private testEvidenceFor(task: TaskRow, headSha: string): string {

@@ -92,6 +92,14 @@ test('v2 prompt names meaningful boundary coverage and no shell authority', () =
     assert.match(p, /非 Error 拒绝值/); assert.match(p, /契约版本号、文件数\/行数/); assert.match(p, /不得修改文件、运行 shell/); assert.doesNotMatch(p, /risk=high/);
   } finally { cleanup(e.dir); }
 });
+test('v2 prompt treats PR CI records as evidence and forbids unattestable runtime requests', () => {
+  const e = setup(); try {
+    const p = buildReviewPrompt(e.ctx, 'checks', 'diff', 'sha', false, 2);
+    assert.match(p, /PR CI 检查/);
+    assert.match(p, /同一 SHA 上 CI 作业的通过记录与本地 checks 同等可信/);
+    assert.match(p, /不得作为阻塞请求/);
+  } finally { cleanup(e.dir); }
+});
 test('v2 incremental scope narrows the prompt to the delta and prior open items', () => {
   const e = setup(); try {
     const scope = { fromSha: 'aaaabbbbccccdddd', toSha: 'eeeeffff00001111', priorItems: '[finding] src/a.js:1 x → y；验证：z\n[verification] c；场景：s；通过标准：e' };

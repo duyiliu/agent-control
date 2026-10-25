@@ -90,6 +90,7 @@ export interface FakeTracker {
   mergeable: Map<number, 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN'>;
   mergeErrors: Map<number, Error>;
   prLabels: Map<number, string[]>;
+  prChecks: Map<number, { name: string; status: string; conclusion: string | null }[]>;
   /** Successive `getPrDetails` calls consume this queue before `headSha`,
    *  so a test can show a head moving between dispatch and pre-flight. */
   headShaSequence: string[];
@@ -136,6 +137,7 @@ export function makeFakeTracker(): FakeTracker & {
     mergeable: new Map(),
     mergeErrors: new Map(),
     prLabels: new Map(),
+    prChecks: new Map(),
     headShaSequence: [],
     openPrs: [],
   };
@@ -181,6 +183,7 @@ export function makeFakeTracker(): FakeTracker & {
         url: pr?.url ?? `https://github.com/x/y/pull/${n}`,
         body: '',
         mergeable: t.mergeable.get(n) ?? 'MERGEABLE',
+        checks: t.prChecks.get(n) ?? [],
       };
     },
     async listOpenPrs(_repo: string) {

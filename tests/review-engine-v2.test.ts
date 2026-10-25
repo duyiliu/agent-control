@@ -40,7 +40,7 @@ function boot(options: { assessment?: ReviewAssessment; failReview?: boolean; pr
   store.setTaskStatus(task.id, 'AWAITING_REVIEW', { pr_url: 'https://example.test/pull/40', branch: options.bare ? 'feature/ext' : 'agent/issue-40' });
   if (!options.bare) tracker.prs.set('agent/issue-40', { number: 40, url: 'https://example.test/pull/40', state: 'OPEN', isDraft: true });
   store.saveReviewControl(task.id, newReviewControl(approvalHash(issue)));
-  const calls = { reviews: 0, checks: 0, coder: 0 };
+  const calls = { reviews: 0, checks: 0, coder: 0, evidence: '' };
   const workspace = {
     head: async () => SHA, refSha: async () => 'base-sha', isDirty: async () => false,
     diffVsBase: async () => options.diff ?? patch(), fetchBranch: async () => {}, removeWorktree: async () => {},
@@ -57,8 +57,8 @@ function boot(options: { assessment?: ReviewAssessment; failReview?: boolean; pr
         return { spec, command: spec.argv.join(' '), exitCode: 0, timedOut: false, tail: 'focused tests passed', logPath };
       }) };
     },
-    runReviewFn: async (_ctx, _tests, _diff, reviewDeps) => {
-      calls.reviews++; assert.equal(reviewDeps.policyVersion, 2); assert.equal(reviewDeps.headSha, SHA);
+    runReviewFn: async (_ctx, tests, _diff, reviewDeps) => {
+      calls.reviews++; calls.evidence = tests; assert.equal(reviewDeps.policyVersion, 2); assert.equal(reviewDeps.headSha, SHA);
       if (options.previousFix) assert.match(reviewDeps.previousReviewContext ?? '', /unhandled plugin rejection/);
       if (options.failReview) throw new ReviewInfraError('model unavailable');
       return { result: { verdict: 'PASS', risk: 'high', summary: 'canned model assessment', findings: [], assessment: options.assessment ?? assessment() }, logPath: join(dir, 'model.jsonl') };
@@ -72,6 +72,19 @@ async function tick(e: ReturnType<typeof boot>) {
   for (let i = 0; i < 200 && e.engine.activeCount(); i++) await new Promise(resolve => setTimeout(resolve, 5));
   assert.equal(e.engine.activeCount(), 0, 'run must finish');
 }
+
+test('v2 engine feeds the PR CI rollup for the reviewed head into the review evidence', async () => {
+  const e = boot(); try {
+    e.tracker.prChecks.set(40, [
+      { name: 'Extension Host smoke (VS Code 1.85)', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'CLI (typecheck, tests)', status: 'COMPLETED', conclusion: 'SUCCESS' },
+    ]);
+    await tick(e);
+    assert.match(e.calls.evidence, /PR CI 检查/);
+    assert.match(e.calls.evidence, /Extension Host smoke \(VS Code 1\.85\): COMPLETED \/ SUCCESS/);
+    assert.match(e.calls.evidence, /CLI \(typecheck, tests\): COMPLETED \/ SUCCESS/);
+  } finally { e.done(); }
+});
 
 test('v2 engine #40 compatible additive change hands a Ready PR to a human without auto-merging', async () => {
   const e = boot({ diff: patch('src/cli.js', 409) }); try {

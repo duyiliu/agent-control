@@ -227,9 +227,14 @@ export class GitHubTracker {
     url: string;
     body: string;
     mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
+    checks?: { name: string; status: string; conclusion: string | null }[];
   }> {
-    const r = await this.ghJson<{ state: string; headRefOid: string; baseRefOid?: string; labels: { name: string }[]; isDraft: boolean; url: string; body: string; mergeable: string }>([
-      'pr', 'view', String(prNumber), '-R', repo, '--json', 'state,headRefOid,baseRefOid,labels,isDraft,url,body,mergeable',
+    const r = await this.ghJson<{
+      state: string; headRefOid: string; baseRefOid?: string; labels: { name: string }[]; isDraft: boolean;
+      url: string; body: string; mergeable: string;
+      statusCheckRollup?: ({ name?: string; context?: string; status?: string; conclusion?: string | null; state?: string })[];
+    }>([
+      'pr', 'view', String(prNumber), '-R', repo, '--json', 'state,headRefOid,baseRefOid,labels,isDraft,url,body,mergeable,statusCheckRollup',
     ]);
     return {
       state: r.state === 'MERGED' ? 'MERGED' : r.state === 'CLOSED' ? 'CLOSED' : 'OPEN',
@@ -240,6 +245,11 @@ export class GitHubTracker {
       url: r.url,
       body: r.body ?? '',
       mergeable: r.mergeable === 'CONFLICTING' ? 'CONFLICTING' : r.mergeable === 'MERGEABLE' ? 'MERGEABLE' : 'UNKNOWN',
+      checks: (r.statusCheckRollup ?? []).map((c) => ({
+        name: c.name ?? c.context ?? '-',
+        status: c.status ?? 'COMPLETED',
+        conclusion: c.conclusion ?? c.state ?? null,
+      })),
     };
   }
 

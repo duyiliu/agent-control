@@ -19,7 +19,7 @@ type MergeMethods = {
   maybeHumanMergeApproval(task: TaskRow, project: ProjectConfig, pr: number): Promise<void>;
 };
 
-function setup(options: { manual?: boolean; bare?: boolean; checks?: 'PASS' | 'FAIL' | 'missing' | 'unguarded'; approvedBy?: 'review' | 'human' } = {}) {
+function setup(options: { manual?: boolean; bare?: boolean; checks?: 'PASS' | 'FAIL' | 'missing' | 'unguarded'; approvedBy?: 'review' | 'human' | null } = {}) {
   const dir = tmpDir('ac-merge-v2-');
   const config = makeConfig(dir, { review_policy: { version: 2 } });
   config.approvals.auto_merge.enabled = true;
@@ -50,7 +50,7 @@ function setup(options: { manual?: boolean; bare?: boolean; checks?: 'PASS' | 'F
   store.setApprovedHash(task.id, approvalHash(issue));
   const control = { ...newReviewControl(approvalHash(issue)), head_sha: head, base_sha: base, rounds: 1, ...(!options.manual ? { assessment: pass() } : {}) };
   store.saveReviewControl(task.id, control);
-  store.setTaskStatus(task.id, 'MERGING', { approved_sha: head, approved_by: options.manual ? 'human' : options.approvedBy ?? 'review', branch: 'agent/issue-40', pr_url: 'https://example.test/pull/40' });
+  store.setTaskStatus(task.id, 'MERGING', { approved_sha: head, approved_by: options.manual ? 'human' : options.approvedBy === undefined ? 'review' : options.approvedBy, branch: 'agent/issue-40', pr_url: 'https://example.test/pull/40' });
   if (!options.bare) tracker.prs.set('agent/issue-40', { number: 40, url: 'https://example.test/pull/40', state: 'OPEN', isDraft: false });
   let patch = '';
   const workspace = { head: async () => head, isDirty: async () => false, diffVsBase: async () => patch,
@@ -66,8 +66,8 @@ function setup(options: { manual?: boolean; bare?: boolean; checks?: 'PASS' | 'F
     done() { teardown(dir, [store]); } };
 }
 
-test('v2 AI review pass is not merge authorization', async () => {
-  const e = setup(); try { await e.drive(); assert.deepEqual(e.tracker.merged, []); assert.equal(e.current().status, 'AWAITING_HUMAN'); assert.equal(e.current().approved_by, null); } finally { e.done(); }
+test('v2 AI review pass is not merge authorization without an approval marker', async () => {
+  const e = setup({ approvedBy: null }); try { await e.drive(); assert.deepEqual(e.tracker.merged, []); assert.equal(e.current().status, 'AWAITING_HUMAN'); assert.equal(e.current().approved_by, null); } finally { e.done(); }
 });
 
 test('a moved PR base returns a Ready handoff to Draft and queues a fresh review without a merge label', async () => {
