@@ -216,7 +216,7 @@ export class Engine {
       r.request_id === d.request_id && r.requirement_hash === control.requirement_hash && r.head_sha === sha && r.selected_option === '拒绝当前提交'));
   }
 
-  private async v2MergeGate(task: TaskRow, project: ProjectConfig, pr: { headSha: string; baseSha?: string }): Promise<boolean> {
+  private async v2MergeGate(task: TaskRow, project: ProjectConfig, pr: { headSha: string; baseSha?: string }, humanApprovalPending = false): Promise<boolean> {
     const control = this.store.getReviewControl(task.id);
     if (!control) return true;
     if (task.source === 'pr') return false;
@@ -239,7 +239,7 @@ export class Engine {
     // Evidence-only leftovers may pass solely on an explicit human approval:
     // a fix round already proved them non-actionable. Automatic merge never
     // gets here with them (autoMergeEligibility requires zero requests).
-    const evidenceOnly = control.evidence_only_sha === pr.headSha && task.approved_by === 'human';
+    const evidenceOnly = control.evidence_only_sha === pr.headSha && (task.approved_by === 'human' || humanApprovalPending);
     if (control.assessment && (control.assessment.findings.length || (!evidenceOnly && control.assessment.verification_requests.length)
       || control.assessment.compatibility.kind === 'unknown' || control.assessment.compatibility.kind === 'breaking')) return false;
     if (project.review_mode === 'auto' && !control.assessment) return false;
@@ -659,7 +659,7 @@ export class Engine {
       this.appLog.event('human_merge_stale', { task: task.id, reviewed_sha: reviewedSha, head_sha: pr.headSha });
       return;
     }
-    if (!await this.v2MergeGate(task, project, pr)) return;
+    if (!await this.v2MergeGate(task, project, pr, true)) return;
     // Consume the label first: a crash between the CAS and the removal would
     // otherwise leave a one-shot approval armed for a future, unreviewed head.
     await this.prLabelQuietly(project.repo, prNumber, 'agent-merge', false);

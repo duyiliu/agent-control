@@ -70,6 +70,20 @@ test('v2 AI review pass is not merge authorization without an approval marker', 
   const e = setup({ approvedBy: null }); try { await e.drive(); assert.deepEqual(e.tracker.merged, []); assert.equal(e.current().status, 'AWAITING_HUMAN'); assert.equal(e.current().approved_by, null); } finally { e.done(); }
 });
 
+test('agent-merge consumes an evidence-only head into MERGING', async () => {
+  const e = setup({ approvedBy: null }); try {
+    const c = e.store.getReviewControl(e.task.id)!;
+    c.assessment!.verification_requests.push({ claim: 'CI ran', scenario: 'green run', expected: 'all jobs pass' });
+    e.store.saveReviewControl(e.task.id, { ...c, evidence_only_sha: head });
+    e.store.setTaskStatus(e.task.id, 'AWAITING_HUMAN', { approved_sha: null, approved_by: null });
+    e.tracker.prLabels.set(40, ['agent-merge']);
+    await e.approve();
+    assert.equal(e.current().status, 'MERGING');
+    assert.equal(e.current().approved_by, 'human');
+    assert.equal(e.current().approved_sha, head);
+  } finally { e.done(); }
+});
+
 test('a moved PR base returns a Ready handoff to Draft and queues a fresh review without a merge label', async () => {
   const e = setup(); try {
     e.store.setTaskStatus(e.task.id, 'AWAITING_HUMAN', { approved_sha: null, approved_by: null });
