@@ -1550,7 +1550,7 @@ export class Engine {
             const gate = await this.gateApproval(project, task);
             if (gate !== 'ok') { this.finish(run, task, gate, 'approval changed before checks'); return; }
             const headBeforeChecks = await this.workspace.head(worktreePath);
-            const checkPlan = resolveCheckPlan(project.checks, worktreePath);
+            const checkPlan = resolveCheckPlan(project.checks, worktreePath, project.verify_bootstrap ?? this.config.approvals.auto_merge.verify_bootstrap);
             store.transition(runId, phase, phase, {
               kind: 'checks_started', head_sha: headBeforeChecks,
               source: checkPlan.source,
@@ -1950,7 +1950,9 @@ export class Engine {
       let reviewError: unknown;
       let hostCheckFailed = false;
       try {
-        const plan: CheckPlan = task.source === 'issue' ? resolveCheckPlan(project.checks, sitePath) : { checks: [], source: 'none' };
+        const plan: CheckPlan = task.source === 'issue'
+          ? resolveCheckPlan(project.checks, sitePath, project.verify_bootstrap ?? this.config.approvals.auto_merge.verify_bootstrap)
+          : { checks: [], source: 'none' };
         const evidence = this.guardedCheckEvidence(task.id, reviewedSha);
         const missing = checksForPlatform(plan.checks).some(check => !evidence.some(row => row.command === check.argv.join(' ') && row.verdict === 'PASS'));
         if (plan.error || plan.checks.length && (!evidence.length || missing)) {
@@ -2289,7 +2291,7 @@ export class Engine {
 
   private async callChecks(run: RunRow, log: RunLog, worktreePath: string, signal: AbortSignal, headSha?: string | null, plan?: CheckPlan): Promise<ChecksSummary> {
     const project = this.projectFor((this.store.getTaskById(run.task_id))!.repo)!;
-    const resolved = plan ?? resolveCheckPlan(project.checks, worktreePath);
+    const resolved = plan ?? resolveCheckPlan(project.checks, worktreePath, project.verify_bootstrap ?? this.config.approvals.auto_merge.verify_bootstrap);
     const summary: ChecksSummary = resolved.error ? { ok: false, outcomes: [], skipped: [], infraError: resolved.error, failureEvidence: resolved.error } : await this.runChecksFn(
       resolved.checks, worktreePath,
       (i) => join(this.artifactsDirFor(run), `check-${i}-${Date.now()}.log`),

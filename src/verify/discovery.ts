@@ -9,8 +9,15 @@ export interface CheckPlan {
   error?: string;
 }
 
-export function resolveCheckPlan(configured: CheckSpec[], workdir: string): CheckPlan {
-  if (configured.length) return { checks: configured, source: 'configured' };
+export function resolveCheckPlan(configured: CheckSpec[], workdir: string, bootstrapSpec?: CheckSpec): CheckPlan {
+  const needsDeps = !existsSync(join(workdir, 'node_modules')) && existsSync(join(workdir, 'package-lock.json'));
+  if (configured.length) {
+    // Configured checks in a fresh materialization still need deps installed
+    // first — the early return used to skip bootstrap and a bare `npm run
+    // check` could only fail with ERR_MODULE_NOT_FOUND.
+    const bootstrap = !!bootstrapSpec && needsDeps;
+    return { checks: bootstrap ? [bootstrapSpec, ...configured] : configured, source: 'configured', ...(bootstrap ? { bootstrap } : {}) };
+  }
   const path = join(workdir, 'package.json');
   if (!existsSync(path)) return { checks: [], source: 'none' };
   try {

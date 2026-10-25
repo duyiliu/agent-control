@@ -15,6 +15,19 @@ test('explicit checks override automatic discovery even for invalid package JSON
   } finally { cleanup(dir); }
 });
 
+test('configured checks bootstrap in a fresh materialization when a spec is provided', () => {
+  const dir = tmpDir();
+  try {
+    const checks = [{ argv: ['npm', 'run', 'check'] }];
+    const spec = { argv: ['npm', 'ci'], timeout_seconds: 600 };
+    assert.deepEqual(resolveCheckPlan(checks, dir, spec), { checks, source: 'configured' });
+    writeFileSync(join(dir, 'package-lock.json'), '{}');
+    assert.deepEqual(resolveCheckPlan(checks, dir, spec), { checks: [spec, ...checks], source: 'configured', bootstrap: true });
+    mkdirSync(join(dir, 'node_modules'));
+    assert.deepEqual(resolveCheckPlan(checks, dir, spec), { checks, source: 'configured' });
+  } finally { cleanup(dir); }
+});
+
 test('automatic checks use fixed script names and bootstrap only a fresh locked npm workspace', () => {
   const dir = tmpDir();
   try {
