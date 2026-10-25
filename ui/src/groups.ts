@@ -1,6 +1,38 @@
-import type { Phase } from './api';
+import type { Phase, TaskSummary, WorkflowState } from './api.js';
 
-export type GroupKey = 'queued' | 'active' | 'reviewing' | 'merging' | 'human' | 'done' | 'blocked';
+/** Board columns. The first seven mirror the GitHub Issue labels. */
+export type GroupKey = 'backlog' | 'todo' | 'active' | 'human' | 'rework' | 'merging' | 'done' | 'blocked';
+
+export interface BoardColumn {
+  key: GroupKey;
+  /** Canonical GitHub label; the legacy-only error column has no label. */
+  label: string;
+  sub: string;
+  dot: string;
+}
+
+export const COLUMNS: Record<GroupKey, BoardColumn> = {
+  backlog: { key: 'backlog', label: 'Backlog', sub: '待办池 · 拖到 Todo 才会派发', dot: 'bg-fg-dim' },
+  todo: { key: 'todo', label: 'Todo', sub: '等待调度器领取', dot: 'bg-info' },
+  active: { key: 'active', label: 'In Progress', sub: '执行中 · 运行状态只在本机记录', dot: 'bg-ok' },
+  human: { key: 'human', label: 'Human Review', sub: '待人工审核 · 拖到 Merging 或 Rework', dot: 'bg-warn' },
+  rework: { key: 'rework', label: 'Rework', sub: '完整返工 · 新分支与新 PR', dot: 'bg-warn' },
+  merging: { key: 'merging', label: 'Merging', sub: '人工批准后合并', dot: 'bg-ok' },
+  done: { key: 'done', label: 'Done', sub: '已合并并关闭 Issue', dot: 'bg-fg-dim' },
+  blocked: { key: 'blocked', label: '异常', sub: '状态缺失/冲突或旧流程阻塞', dot: 'bg-danger' },
+};
+
+export const WORKFLOW_TEXT: Record<WorkflowState, string> = {
+  Backlog: '待办池',
+  Todo: '待派发',
+  'In Progress': '执行中',
+  'Human Review': '待人工审核',
+  Rework: '返工',
+  Merging: '合并中',
+  Done: '已完成',
+};
+
+type Tone = 'emerald' | 'sky' | 'zinc' | 'rose' | 'amber';
 
 const ACTIVE: Phase[] = ['CLAIMED', 'PREPARING', 'RUNNING', 'VERIFYING', 'FIXING', 'PUBLISHING_PR'];
 /** PR exists and is being reviewed: the run is alive, but coding is done. */
@@ -9,27 +41,45 @@ const REVIEW_PHASES: Phase[] = ['REVIEWING'];
 const REVIEW_WAIT_PHASES: Phase[] = ['AWAITING_REVIEW'];
 const BLOCKED: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED'];
 
-export function groupOf(status: Phase): GroupKey {
-  if (ACTIVE.includes(status)) return 'active';
-  if (REVIEW_PHASES.includes(status) || REVIEW_WAIT_PHASES.includes(status)) return 'reviewing';
-  if (status === 'MERGING') return 'merging';
-  if (status === 'AWAITING_HUMAN') return 'human';
-  if (status === 'COMPLETED' || status === 'CANCELED') return 'done';
-  if (BLOCKED.includes(status)) return 'blocked';
-  return 'queued';
+export function workflowBucket(state: WorkflowState | null): GroupKey {
+  switch (state) {
+    case 'Backlog': return 'backlog';
+    case 'Todo': return 'todo';
+    case 'In Progress': return 'active';
+    case 'Human Review': return 'human';
+    case 'Rework': return 'rework';
+    case 'Merging': return 'merging';
+    case 'Done': return 'done';
+    default: return 'blocked';
+  }
 }
 
-export const GROUPS: { key: GroupKey; label: string; dot: string }[] = [
-  { key: 'queued', label: '等待派发', dot: 'bg-fg-dim' },
-  { key: 'active', label: '执行中', dot: 'bg-ok' },
-  { key: 'reviewing', label: '评审', dot: 'bg-info' },
-  { key: 'merging', label: '合并中', dot: 'bg-ok' },
-  { key: 'human', label: '待人工处理', dot: 'bg-warn' },
-  { key: 'done', label: '已完成', dot: 'bg-fg-dim' },
-  { key: 'blocked', label: '异常需介入', dot: 'bg-danger' },
-];
+/** Legacy tasks keep their phase/intake presentation; they are frozen records. */
+function legacyBucket(task: TaskSummary): GroupKey {
+  const intake = task.intake;
+  if (intake) {
+    if (intake.kind === 'skipped') return 'done';
+    if (intake.kind === 'deferred') return 'backlog';
+    if (intake.kind === 'human' || intake.locked || intake.external_hold || intake.external_needs) return 'human';
+    if (intake.error || intake.pending) return 'blocked';
+  }
+  const phase = task.active_run?.phase ?? task.status;
+  if (phase === 'DISCOVERED') return 'todo';
+  if (ACTIVE.includes(phase) || REVIEW_PHASES.includes(phase) || REVIEW_WAIT_PHASES.includes(phase)) return 'active';
+  if (phase === 'AWAITING_HUMAN') return 'human';
+  if (phase === 'MERGING') return 'merging';
+  if (phase === 'COMPLETED' || phase === 'CANCELED') return 'done';
+  return 'blocked';
+}
 
-type Tone = 'emerald' | 'sky' | 'zinc' | 'rose' | 'amber';
+export function bucketOf(task: TaskSummary): GroupKey {
+  if (!task.workflow) return legacyBucket(task);
+  // The Issue label is the business state. A local CANCELED status is an
+  // execution record (e.g. a human paused In Progress), not "Done".
+  if (task.workflow_state) return workflowBucket(task.workflow_state);
+  if (task.status === 'COMPLETED' || task.status === 'CANCELED') return 'done';
+  return 'blocked';
+}
 
 const PHASE_TONE: Record<Phase, Tone> = {
   DISCOVERED: 'zinc',
@@ -49,6 +99,16 @@ const PHASE_TONE: Record<Phase, Tone> = {
   FAILED: 'rose',
   CANCELED: 'zinc',
   RECOVERY_REQUIRED: 'amber',
+};
+
+const WORKFLOW_TONE: Record<WorkflowState, Tone> = {
+  Backlog: 'zinc',
+  Todo: 'sky',
+  'In Progress': 'emerald',
+  'Human Review': 'amber',
+  Rework: 'amber',
+  Merging: 'emerald',
+  Done: 'zinc',
 };
 
 const TONE_HEX: Record<Tone, string> = {
@@ -89,8 +149,10 @@ const PHASE_LABEL: Record<Phase, string> = {
 };
 
 export const phaseLabel = (p: Phase | string) => PHASE_LABEL[p as Phase] ?? p;
-export const phaseHex = (p: Phase) => TONE_HEX[PHASE_TONE[p]];
-export const phaseTextClass = (p: Phase) => TONE_TEXT[PHASE_TONE[p]];
+export const phaseHex = (p: Phase) => TONE_HEX[PHASE_TONE[p] ?? 'zinc'];
+export const phaseTextClass = (p: Phase) => TONE_TEXT[PHASE_TONE[p] ?? 'zinc'];
+export const workflowHex = (s: WorkflowState | null) => TONE_HEX[s ? WORKFLOW_TONE[s] ?? 'rose' : 'rose'];
+export const workflowTextClass = (s: WorkflowState | null) => TONE_TEXT[s ? WORKFLOW_TONE[s] ?? 'rose' : 'rose'];
 /** Any phase where a live process is still working (coding or reviewing). */
 export const isActivePhase = (p: Phase) => ACTIVE.includes(p) || REVIEW_PHASES.includes(p);
 export const isBlockedGroup = (p: Phase) => BLOCKED.includes(p);

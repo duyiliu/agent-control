@@ -2,16 +2,19 @@ import { acceptsAllIssues } from '../triage/intake.js';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createReadStream, statSync } from 'node:fs';
 import { timingSafeEqual } from 'node:crypto';
-import { extname, join, resolve, sep } from 'node:path';
+import { basename, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppLog } from '../telemetry/logging.js';
 import { approveMergeTask, resolveReviewDecision, OpsError, rereviewTask, retryTask, stopTask } from '../ops.js';
+import { setWorkflowStateFromBoard, type WorkflowBoardTracker } from '../workflow-board.js';
 import type { TriageAction } from '../triage/service.js';
 import {
   addProjectPayload,
   artifactPayload,
   healthPayload,
   projectsPayload,
+  readLogChunk,
+  runLogFile,
   tailPayload,
   taskPayload,
   tasksPayload,
@@ -74,6 +77,21 @@ function serveStatic(path: string, res: ServerResponse): boolean {
 }
 
 const TOKEN_COOKIE = 'ac_ui_token';
+
+/**
+ * Mobile OSes hand `github.com` links to the GitHub app before the browser
+ * sees them. The dashboard links to this same-origin endpoint instead; the
+ * browser follows the 302 and stays in the browser.
+ */
+export function githubRedirectTarget(raw: string): string | null {
+  let parsed: URL;
+  try { parsed = new URL(raw); } catch { return null; }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return null;
+  const host = parsed.hostname.toLowerCase();
+  if (host !== 'github.com' && host !== 'www.github.com') return null;
+  if (!/^\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(?:\/(?:issues|pull)\/\d+)?\/?$/.test(parsed.pathname)) return null;
+  return `https://github.com${parsed.pathname}${parsed.search}`;
+}
 
 function tokenEq(given: string, expected: string): boolean {
   const a = Buffer.from(given);
@@ -178,12 +196,116 @@ function notBuilt(res: ServerResponse) {
   );
 }
 
+const LIVE_TICK_MS = 250;
+const LIVE_KEEPALIVE_MS = 15_000;
+/** Stop reading while the client's socket buffer is this far behind. */
+const LIVE_MAX_BUFFERED = 4 * 1024 * 1024;
+const LIVE_MAX_STREAMS = 32;
+
+const liveStreams = new Set<() => void>();
+
+/**
+ * Server-sent events over a run's agent log: one connection per open live
+ * view, pushed as soon as whole JSONL records land. Polling `/tail` stays for
+ * clients that cannot hold a stream (and as the reconnect fallback).
+ */
+function streamRunLog(
+  deps: UiDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+  runId: string,
+  rawFile: string | null,
+): void {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    'x-accel-buffering': 'no',
+  });
+  res.write(': connected\n\n');
+
+  let file: string | null = null;
+  let offset: number | null = null;
+  let pending = -1;
+  let closed = false;
+
+  const send = (event: string, data: unknown) => {
+    if (closed) return;
+    try {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    } catch {
+      stop();
+    }
+  };
+
+  const stop = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(tickTimer);
+    clearInterval(pingTimer);
+    liveStreams.delete(stop);
+  };
+
+  const tick = () => {
+    if (closed) return;
+    // A slow reader must not make the scheduler buffer an unbounded log.
+    if (res.writableLength > LIVE_MAX_BUFFERED) return;
+    try {
+      const picked = runLogFile(deps.config.server.logs_dir, runId, rawFile);
+      if (picked.status !== 200) {
+        send('waiting', { error: picked.error });
+        return;
+      }
+      if (picked.file !== file) {
+        file = picked.file!;
+        offset = null;
+        send('switch', { file: basename(file) });
+      }
+      const out = readLogChunk(file, offset);
+      if (out.status !== 200) {
+        send('waiting', { error: out.error });
+        return;
+      }
+      offset = out.offset!;
+      if (out.chunk) {
+        pending = out.pending!;
+        send('chunk', { file: basename(file), offset: out.offset, chunk: out.chunk, pending, skipped: out.skipped });
+      } else if (out.pending !== pending) {
+        pending = out.pending!;
+        send('status', { pending });
+      }
+    } catch {
+      // A file rotated/removed between stat and read is transient: the next
+      // tick re-resolves it. Never let an interval callback throw — that is
+      // an uncaught exception and takes the whole scheduler down.
+    }
+  };
+
+  const tickTimer = setInterval(tick, LIVE_TICK_MS);
+  const pingTimer = setInterval(() => {
+    if (closed) return;
+    try { res.write(': ping\n\n'); } catch { stop(); }
+  }, LIVE_KEEPALIVE_MS);
+  liveStreams.add(stop);
+  res.on('close', stop);
+  req.on('close', stop);
+  tick();
+}
+
 async function handle(deps: UiDeps, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const path = url.pathname;
   const method = req.method ?? 'GET';
 
   if (!checkAuth(deps, req, res, url)) return;
+
+  if (method === 'GET' && path === '/api/open') {
+    const target = githubRedirectTarget(url.searchParams.get('url') ?? '');
+    if (!target) { json(res, 400, { error: 'only github repo/issue/pull URLs are allowed' }); return; }
+    res.writeHead(302, { location: target, 'cache-control': 'no-store' });
+    res.end();
+    return;
+  }
 
   if (method === 'GET' && path === '/api/triage') {
     json(res, 200, { issues: deps.triage?.list() ?? [], projects: deps.config.projects.map(p => ({ repo: p.repo, enabled: acceptsAllIssues(p) })) });
@@ -263,6 +385,21 @@ async function handle(deps: UiDeps, req: IncomingMessage, res: ServerResponse): 
     return;
   }
 
+  const streamApi = /^\/api\/runs\/([A-Za-z0-9_-]+)\/stream$/.exec(path);
+  if (method === 'GET' && streamApi) {
+    if (!deps.store.getRun(streamApi[1]!)) { json(res, 404, { error: 'no such run' }); return; }
+    if (liveStreams.size >= LIVE_MAX_STREAMS) { json(res, 503, { error: 'too many live log streams' }); return; }
+    const pinned = url.searchParams.get('file');
+    // A pinned file must be rejected before the stream opens; once the SSE
+    // headers are out the status is already 200.
+    if (pinned) {
+      const picked = runLogFile(deps.config.server.logs_dir, streamApi[1]!, pinned);
+      if (picked.status !== 200) { json(res, picked.status, { error: picked.error }); return; }
+    }
+    streamRunLog(deps, req, res, streamApi[1]!, pinned);
+    return;
+  }
+
   const tailApi = /^\/api\/runs\/([A-Za-z0-9_-]+)\/tail$/.exec(path);
   if (method === 'GET' && tailApi) {
     if (!deps.store.getRun(tailApi[1]!)) { json(res, 404, { error: 'no such run' }); return; }
@@ -287,6 +424,26 @@ async function handle(deps: UiDeps, req: IncomingMessage, res: ServerResponse): 
       const params = Object.fromEntries(keys.map(k => [k, body[k]])) as unknown as import('../ops.js').ResolveDecisionParams;
       json(res, 200, { message: await resolveReviewDecision(deps.store, deps.config, deps.tracker, task, decision[2]!, params) });
     } catch (err) { json(res, err instanceof OpsError ? 400 : 500, { error: err instanceof Error ? err.message : String(err) }); }
+    return;
+  }
+
+  const workflowState = /^\/api\/tasks\/(\d+)\/workflow-state$/.exec(path);
+  if (method === 'POST' && workflowState) {
+    const task = deps.store.getTaskById(Number(workflowState[1]));
+    if (!task) { json(res, 404, { error: 'no such task' }); return; }
+    try {
+      const body = await readBody(req) as Record<string, unknown> | null;
+      if (!body || typeof body.state !== 'string' || typeof body.expected_updated_at !== 'string' || !body.expected_updated_at) {
+        throw new OpsError('状态操作需要目标状态和当前任务版本，请刷新后重试');
+      }
+      const message = await setWorkflowStateFromBoard(
+        deps.store, deps.config, deps.tracker as unknown as WorkflowBoardTracker,
+        task, body.state, body.expected_updated_at,
+      );
+      json(res, 200, { message });
+    } catch (err) {
+      json(res, err instanceof OpsError ? 400 : 500, { error: err instanceof Error ? err.message : String(err) });
+    }
     return;
   }
 

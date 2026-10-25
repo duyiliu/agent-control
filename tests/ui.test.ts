@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startUiServer } from '../src/ui/server.js';
@@ -125,6 +125,68 @@ test('web ui', async (t) => {
   await t.test('GET /api/runs/:id/tail rejects foreign file names', async () => {
     const r = await fetch(`${ui.url}/api/runs/${run.run_id}/tail?file=${encodeURIComponent('../secrets.jsonl')}`);
     assert.equal(r.status, 400);
+  });
+
+  await t.test('GET /api/runs/:id/stream pushes records and follows appends', async () => {
+    const dir5 = join(config.server.logs_dir, 'artifacts', run.run_id);
+    mkdirSync(dir5, { recursive: true });
+    const file = join(dir5, 'agent-stream.jsonl');
+    writeFileSync(file, '{"type":"agent_start"}\n');
+
+    const ctrl = new AbortController();
+    const r = await fetch(`${ui.url}/api/runs/${run.run_id}/stream?file=agent-stream.jsonl`, { signal: ctrl.signal });
+    assert.equal(r.status, 200);
+    assert.match(r.headers.get('content-type') ?? '', /text\/event-stream/);
+
+    const reader = r.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    const readUntil = async (needle: string) => {
+      const deadline = Date.now() + 5000;
+      while (!text.includes(needle) && Date.now() < deadline) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+      }
+      assert.ok(text.includes(needle), `missing ${needle} in ${text.slice(-400)}`);
+    };
+
+    await readUntil('agent_start');
+    assert.match(text, /event: switch/);
+    // A half-written record must stay buffered; the completed one streams.
+    appendFileSync(file, '{"type":"turn_start"');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.doesNotMatch(text, /turn_start/);
+    appendFileSync(file, '}\n');
+    await readUntil('turn_start');
+    ctrl.abort();
+    await reader.cancel().catch(() => {});
+  });
+
+  await t.test('GET /api/runs/:id/stream rejects unknown runs and foreign files', async () => {
+    assert.equal((await fetch(`${ui.url}/api/runs/nope/stream`)).status, 404);
+    const foreign = await fetch(`${ui.url}/api/runs/${run.run_id}/stream?file=${encodeURIComponent('../secrets.jsonl')}`);
+    assert.equal(foreign.status, 400);
+  });
+
+  await t.test('a log deleted mid-stream never takes the server down', async () => {
+    const dir6 = join(config.server.logs_dir, 'artifacts', run.run_id);
+    mkdirSync(dir6, { recursive: true });
+    const file = join(dir6, 'agent-vanish.jsonl');
+    writeFileSync(file, '{"type":"agent_start"}\n');
+
+    const ctrl = new AbortController();
+    const r = await fetch(`${ui.url}/api/runs/${run.run_id}/stream?file=agent-vanish.jsonl`, { signal: ctrl.signal });
+    assert.equal(r.status, 200);
+    const reader = r.body!.getReader();
+    await reader.read();
+
+    rmSync(file);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const alive = await fetchJson(`${ui.url}/api/health`);
+    assert.equal(alive.pid, process.pid);
+    ctrl.abort();
+    await reader.cancel().catch(() => {});
   });
 
   await t.test('GET /api/artifact parses jsonl line by line', async () => {
@@ -253,6 +315,25 @@ test('web ui token auth', async (t) => {
       headers: { authorization: 'Bearer wrong' },
     });
     assert.equal(wrongBearer.status, 401);
+  });
+
+  await t.test('live log stream is behind the same token gate', async () => {
+    const { task } = store.upsertDiscovered({
+      repo: 'me/sandbox', issue_number: 77, issue_title: 'stream auth',
+      issue_url: 'https://github.com/me/sandbox/issues/77',
+    });
+    const run = store.claimRun(task.id);
+    const anon = await fetch(`${ui.url}/api/runs/${run.run_id}/stream`);
+    assert.equal(anon.status, 401);
+    await anon.text().catch(() => {});
+    const ctrl = new AbortController();
+    const authed = await fetch(`${ui.url}/api/runs/${run.run_id}/stream`, {
+      headers: { cookie: 'ac_ui_token=s3cr3t-token' }, signal: ctrl.signal,
+    });
+    assert.equal(authed.status, 200);
+    assert.match(authed.headers.get('content-type') ?? '', /text\/event-stream/);
+    ctrl.abort();
+    await authed.body?.cancel().catch(() => {});
   });
 });
 

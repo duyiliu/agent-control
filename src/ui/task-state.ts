@@ -3,6 +3,7 @@ import type { DecisionRequest } from '../types.js';
 import type { AppConfig, RunRow, TaskRow } from '../types.js';
 import { RUN_ACTIVE_PHASES } from '../types.js';
 import type { IntakeState } from '../triage/intake.js';
+import { parseWorkflow, type WorkflowRecord } from '../scheduler/issue-workflow.js';
 
 export interface TaskActions {
   stop: boolean;
@@ -23,6 +24,11 @@ export interface Attention {
 }
 
 export function taskActions(task: TaskRow, active: boolean, intake: IntakeState | null, config?: AppConfig): TaskActions {
+  // A github-workflow task is advanced only by a verified Issue label event;
+  // the panel may stop an in-flight run but never approve, retry or rereview.
+  if (task.issue_workflow_json !== null) {
+    return { stop: active, retry: false, rereview: false, approve_merge: false };
+  }
   const project = config?.projects.find(p => p.repo === task.repo);
   const hold = !!intake && (!intake.imported || !!intake.kind || intake.locked || !!intake.pending || !!intake.error || !!intake.external_hold || !!intake.external_needs);
   const control = parseReviewControl(task.review_control_json);
@@ -72,4 +78,38 @@ export function taskAttention(task: TaskRow, last: RunRow | undefined, intake: I
     return { kind: 'approval', summary: /high risk|review requires human/.test(reason) ? '评审发现需要人工确认的风险' : '等待人工审阅或合并', detail, next_step: '核对评审意见后批准合并，或重新评审' };
   }
   return { kind: 'execution_error', summary: task.status === 'FAILED' ? '任务执行失败' : '任务被阻塞', detail: detail || '当前任务状态已变化，历史运行结论可能不再适用', next_step: task.pr_url ? '先查看 PR 当前状态和最新日志，再选择继续处理' : '查看最新日志后继续处理' };
+}
+
+/** Parse the cached workflow record without ever treating corruption as legacy. */
+export function workflowRecordOf(task: TaskRow): { record: WorkflowRecord | null; corrupt: boolean } {
+  if (task.issue_workflow_json === null) return { record: null, corrupt: false };
+  try {
+    return { record: parseWorkflow(task.issue_workflow_json), corrupt: false };
+  } catch {
+    return { record: null, corrupt: true };
+  }
+}
+
+/**
+ * A github-workflow task is driven by its Issue label, so attention text must
+ * point at the GitHub action that advances it. Legacy review/merge advice is
+ * deliberately not reused here.
+ */
+export function workflowAttention(task: TaskRow, record: WorkflowRecord | null, corrupt: boolean): Attention | null {
+  if (corrupt || !record) return { kind: 'execution_error', summary: '工作流记录损坏', detail: '无法读取本地工作流记录，任务不会自动推进', next_step: '检查数据库中的 issue_workflow_json，或人工在 GitHub 核对 Issue 状态' };
+  const state = record.observed_state;
+  if (!state) return { kind: 'execution_error', summary: '缺少 Issue 状态', detail: record.diagnostic ?? 'Issue 上没有唯一的七状态标签', next_step: '在 GitHub 上为 Issue 设置唯一的七状态标签' };
+  const reason = record.diagnostic ?? '';
+  if (state === 'Human Review') {
+    if (reason) return { kind: 'execution_error', summary: '需要人工处理', detail: reason, next_step: '在看板把状态改回 Todo 重新执行，或改为 Rework 完整返工' };
+    if (!task.pr_url) return { kind: 'execution_error', summary: '还没有可审查的 PR', detail: '当前 Human Review 没有关联 PR', next_step: '把状态改回 Todo 让调度器重新执行并发布 PR；有 PR 后再批准合并' };
+    if (!record.handoff) return { kind: 'recovery', summary: '交付范围尚未绑定', detail: 'PR 已关联，但还没有写入交付绑定；下一次对账会自动补上', next_step: '稍等片刻刷新；仍无绑定就把状态改回 Todo 重新走一次交付' };
+    return { kind: 'approval', summary: '等待人工审核 PR', detail: 'PR 已绑定到当前 head/base 与需求哈希；系统不会自动合并', next_step: '审核后在看板点「批准合并」或「要求返工」' };
+  }
+  if (state === 'Merging' && reason) return { kind: 'execution_error', summary: '合并未完成', detail: reason, next_step: '核对 PR、CI 和分支保护后重试，或在看板撤回合并' };
+  if (task.status === 'CANCELED' && reason) return { kind: 'execution_error', summary: 'Issue 已结束', detail: reason, next_step: '核对 Issue/PR 最终状态；需要继续时重新打开 Issue 并在看板改状态' };
+  if (state === 'In Progress' && ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'RECOVERY_REQUIRED', 'CANCELED'].includes(task.status)) {
+    return { kind: 'execution_error', summary: '执行中断，等待状态对账', detail: reason || '当前运行未正常完成', next_step: '调度器会把 Issue 移到 Human Review；也可在看板暂停执行' };
+  }
+  return null;
 }

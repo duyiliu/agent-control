@@ -4,6 +4,18 @@ import { fmtTime } from './groups';
 
 const PAGE_SIZE = 20;
 
+function resultOf(task: TaskSummary): { label: string; tone: string } {
+  if (task.workflow) {
+    if (task.status === 'CANCELED') return { label: '已取消', tone: 'text-fg-muted' };
+    if (task.workflow_state === 'Done' || task.status === 'COMPLETED') return { label: 'Done', tone: 'text-ok' };
+    return { label: task.workflow_state ?? '—', tone: 'text-fg-muted' };
+  }
+  if (task.status === 'COMPLETED') return { label: '已完成', tone: 'text-ok' };
+  if (task.status === 'CANCELED') return { label: '已取消', tone: 'text-fg-muted' };
+  if (task.attention?.kind === 'advisory') return { label: '评审完成', tone: 'text-fg-muted' };
+  return { label: '无需处理', tone: 'text-fg-muted' };
+}
+
 export default function HistoryList({ tasks, selected, onSelect }: {
   tasks: TaskSummary[]; selected: number | null; onSelect: (id: number) => void;
 }) {
@@ -20,19 +32,25 @@ export default function HistoryList({ tasks, selected, onSelect }: {
           <th scope="col" className="px-4 py-3 font-medium">任务</th>
           <th scope="col" className="hidden px-4 py-3 font-medium md:table-cell">项目</th>
           <th scope="col" className="whitespace-nowrap px-4 py-3 font-medium">结果</th>
+          <th scope="col" className="hidden px-4 py-3 font-medium sm:table-cell">加入时间</th>
           <th scope="col" className="hidden px-4 py-3 font-medium sm:table-cell">最后更新</th>
         </tr></thead>
         <tbody className="divide-y divide-edge">
-          {rows.map(task => <tr key={task.id} className={selected === task.id ? 'bg-elevated' : 'bg-card hover:bg-elevated'}>
+          {rows.map(task => {
+            const result = resultOf(task);
+            return <tr key={task.id} className={selected === task.id ? 'bg-elevated' : 'bg-card hover:bg-elevated'}>
             <td className="max-w-sm px-4 py-3"><button type="button" onClick={() => onSelect(task.id)} className="min-h-9 w-full rounded text-left leading-relaxed text-fg focus-visible:outline-2 focus-visible:outline-brand">
               <span className="mr-2 text-fg-dim">{task.source === 'pr' ? 'PR #' : '#'}{task.issue_number}</span>{task.issue_title || '(无标题)'}
               <span className="mt-1 block break-all text-[11px] text-fg-muted md:hidden">{task.repo}</span>
+              <span className="mt-0.5 block text-[11px] text-fg-muted sm:hidden">加入 {fmtTime(task.created_at).slice(0, 16)} · 更新 {fmtTime(task.updated_at).slice(0, 16)}</span>
             </button></td>
             <td className="hidden px-4 py-3 text-fg-muted md:table-cell">{task.repo}</td>
-            <td className={`whitespace-nowrap px-4 py-3 ${task.status === 'COMPLETED' ? 'text-ok' : 'text-fg-muted'}`}>{task.status === 'COMPLETED' ? '已完成' : task.status === 'CANCELED' ? '已取消' : task.attention?.kind === 'advisory' ? '评审完成' : '无需处理'}</td>
+            <td className={`whitespace-nowrap px-4 py-3 ${result.tone}`}>{result.label}</td>
+            <td className="hidden whitespace-nowrap px-4 py-3 text-fg-muted sm:table-cell">{fmtTime(task.created_at)}</td>
             <td className="hidden whitespace-nowrap px-4 py-3 text-fg-muted sm:table-cell">{fmtTime(task.updated_at)}</td>
-          </tr>)}
-          {rows.length === 0 && <tr><td colSpan={4} className="px-4 py-12 text-center text-fg-muted">暂无匹配的历史记录，试试调整项目、结果或搜索条件。</td></tr>}
+          </tr>;
+          })}
+          {rows.length === 0 && <tr><td colSpan={5} className="px-4 py-12 text-center text-fg-muted">暂无匹配的历史记录，试试调整项目、结果或搜索条件。</td></tr>}
         </tbody>
       </table>
     </div>

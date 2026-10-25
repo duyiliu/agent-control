@@ -19,6 +19,9 @@ export type Phase =
 
 export type TaskSource = 'issue' | 'pr';
 
+/** The seven mutually exclusive Issue labels owned by the github workflow. */
+export type WorkflowState = 'Backlog' | 'Todo' | 'In Progress' | 'Human Review' | 'Rework' | 'Merging' | 'Done';
+
 export interface IntakeState {
   external_hold?: boolean; external_needs?: boolean;
   kind: 'human' | 'deferred' | 'skipped' | null; reason: string; locked: boolean; defer_until: string | null;
@@ -26,6 +29,11 @@ export interface IntakeState {
 }
 
 export interface TaskSummary {
+  workflow: boolean;
+  workflow_state: WorkflowState | null;
+  workflow_reason: string | null;
+  workflow_generation: number | null;
+  workflow_handoff: boolean;
   actions?: { stop: boolean; retry: boolean; rereview: boolean; approve_merge: boolean };
   attention?: { kind?: 'decision' | 'approval' | 'execution_error' | 'recovery' | 'advisory' | 'hold'; summary: string; detail: string; next_step: string; next_attempt_at?: string | null; decision_version?: string; head_sha?: string; decisions?: { request_id?: string; question: string; options: string[]; impact: string; reason: string; file?: string; line?: number }[] } | null;
   intake?: IntakeState | null;
@@ -90,6 +98,7 @@ export interface ProjectInfo {
   git_remote: string;
   ready_label: string;
   branch_prefix: string;
+  workflow_mode: 'github' | 'legacy';
   review_mode: 'auto' | 'manual';
   pr_review: 'auto' | 'manual';
   checks: { argv: string[]; timeout_seconds?: number; platforms?: string[] }[];
@@ -110,6 +119,7 @@ export interface NewProjectInput {
   git_remote?: string;
   ready_label?: string;
   branch_prefix?: string;
+  workflow_mode?: 'github' | 'legacy';
   review_mode?: 'auto' | 'manual';
   pr_review?: 'auto' | 'manual';
   checks?: { argv: string[]; timeout_seconds?: number }[];
@@ -192,6 +202,24 @@ export const fetchTail = (runId: string, offset: number | null, file: string | n
 
 export async function postAction(id: number, action: 'stop' | 'retry' | 'rereview' | 'approve-merge', expectedUpdatedAt?: string): Promise<string> {
   const r = await fetch(`/api/tasks/${id}/${action}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ expected_updated_at: expectedUpdatedAt }) });
+  const d = (await r.json().catch(() => ({}))) as { message?: string; error?: string };
+  if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+  return d.message ?? 'done';
+}
+
+export type WorkflowTarget = 'Backlog' | 'Todo' | 'Human Review' | 'Rework' | 'Merging';
+
+/** Route GitHub links through the same-origin redirector so mobile OSes do not hand them to the GitHub app. */
+export function githubLink(url: string | null | undefined): string {
+  return url ? `/api/open?url=${encodeURIComponent(url)}` : '#';
+}
+
+export async function postWorkflowState(id: number, state: WorkflowTarget, expectedUpdatedAt: string): Promise<string> {
+  const r = await fetch(`/api/tasks/${id}/workflow-state`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ state, expected_updated_at: expectedUpdatedAt }),
+  });
   const d = (await r.json().catch(() => ({}))) as { message?: string; error?: string };
   if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
   return d.message ?? 'done';

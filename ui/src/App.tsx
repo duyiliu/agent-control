@@ -40,6 +40,7 @@ export default function App() {
   const [health, setHealth] = useState<HealthInfo | null>(null);
   const [projectRepos, setProjectRepos] = useState<string[]>([]);
   const [selected, setSelected] = useState<number | null>(null);
+  const selectedRef = useRef<number | null>(null);
   const [showProjects, setShowProjects] = useState(false);
   const [tick, setTick] = useState(0);
   const [toast, setToast] = useState<Toast | null>(null);
@@ -102,6 +103,45 @@ export default function App() {
     setTasks(current => current?.map(t => t.id === id && (!t.intake || state.version >= t.intake.version) ? { ...t, intake: state } : t) ?? null);
   }, []);
 
+  const openTask = useCallback((id: number) => {
+    const wasOpen = selectedRef.current !== null;
+    selectedRef.current = id;
+    setSelected(id);
+    const url = new URL(window.location.href);
+    url.searchParams.set('task', String(id));
+    if (wasOpen) window.history.replaceState({ task: id }, '', url);
+    else window.history.pushState({ task: id }, '', url);
+  }, []);
+
+  const closeTask = useCallback(() => {
+    const url = new URL(window.location.href);
+    if (url.searchParams.has('task')) {
+      const state = window.history.state as { task?: number } | null;
+      if (state?.task != null) {
+        window.history.back();
+        return;
+      }
+      url.searchParams.delete('task');
+      if ([...url.searchParams.keys()].length === 0) url.search = '';
+      window.history.replaceState(null, '', url);
+    }
+    selectedRef.current = null;
+    setSelected(null);
+  }, []);
+
+  useEffect(() => {
+    const fromUrl = () => {
+      const raw = new URLSearchParams(window.location.search).get('task');
+      const id = raw ? Number(raw) : null;
+      const next = id != null && Number.isInteger(id) && id > 0 ? id : null;
+      selectedRef.current = next;
+      setSelected(next);
+    };
+    fromUrl();
+    window.addEventListener('popstate', fromUrl);
+    return () => window.removeEventListener('popstate', fromUrl);
+  }, []);
+
   return (
     <div className="flex h-full flex-col">
       <header className="flex min-h-11 shrink-0 flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-edge px-3 py-2 sm:px-4 md:h-11 md:flex-nowrap md:gap-x-4 md:py-0">
@@ -131,7 +171,7 @@ export default function App() {
         projectRepos={projectRepos}
         tick={tick}
         selected={selected}
-        onSelect={setSelected}
+        onSelect={openTask}
         onStop={stopByDrag}
         onIntakeChanged={updateIntake}
         onChanged={refresh}
@@ -140,7 +180,7 @@ export default function App() {
       {selected !== null && (
         <DetailDrawer
           taskId={selected}
-          onClose={() => setSelected(null)}
+          onClose={closeTask}
           onChanged={refresh}
           onToast={setToast}
         />

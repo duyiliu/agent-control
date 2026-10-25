@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ChevronLeft, FolderGit2, GitBranch, Plus, TriangleAlert } from 'lucide-react';
 import { addProject, fetchProjects, type NewProjectInput, type ProjectInfo, type ProjectsPayload } from './api';
+import GithubLink from './GithubLink';
 import type { Toast } from './App';
 
 /** Split one command line into argv; double/single quotes group a token. */
@@ -106,18 +107,26 @@ function ProjectCard({ project: p }: { project: ProjectInfo }) {
   return (
     <div className="rounded-md border border-edge bg-card p-3">
       <div className="flex items-center gap-2">
-        <a
-          href={`https://github.com/${p.repo}`}
-          target="_blank"
-          rel="noopener noreferrer"
+        <GithubLink
+          url={`https://github.com/${p.repo}`}
           title={`https://github.com/${p.repo}`}
           className="font-mono text-[12.5px] font-medium text-info hover:underline"
         >
           {p.repo}
-        </a>
+        </GithubLink>
         <span className="ml-auto flex items-center gap-1.5">
-          <Badge>{p.review_mode === 'auto' ? '自动评审' : '人工评审'}</Badge>
-          <Badge>{p.pr_review === 'auto' ? '外部PR自动评审' : '外部PR需召唤'}</Badge>
+          {p.workflow_mode === 'github' ? (
+            <>
+              <Badge>七状态工作流</Badge>
+              <Badge>人工批准合并</Badge>
+            </>
+          ) : (
+            <>
+              <Badge>旧流程</Badge>
+              <Badge>{p.review_mode === 'auto' ? '自动评审' : '人工评审'}</Badge>
+              <Badge>{p.pr_review === 'auto' ? '外部PR自动评审' : '外部PR需召唤'}</Badge>
+            </>
+          )}
           {p.issue_intake === 'all' && <Badge>自动接手 Issue</Badge>}
         </span>
       </div>
@@ -161,6 +170,7 @@ function AddProjectForm(props: {
   const [gitRemote, setGitRemote] = useState('origin');
   const [readyLabel, setReadyLabel] = useState('agent-ready');
   const [branchPrefix, setBranchPrefix] = useState('agent/issue-');
+  const [workflowMode, setWorkflowMode] = useState<'github' | 'legacy'>('github');
   const [reviewMode, setReviewMode] = useState<'auto' | 'manual'>('auto');
   const [prReview, setPrReview] = useState<'auto' | 'manual'>('auto');
   const [issueTriage, setIssueTriage] = useState(false);
@@ -194,7 +204,8 @@ function AddProjectForm(props: {
       git_remote: gitRemote.trim() || 'origin',
       ready_label: readyLabel.trim() || 'agent-ready',
       branch_prefix: branchPrefix.trim() || 'agent/issue-',
-      review_mode: reviewMode,
+      workflow_mode: workflowMode,
+      review_mode: workflowMode === 'github' ? 'manual' : reviewMode,
       pr_review: prReview,
       issue_intake: issueTriage ? 'all' : 'labeled',
       ...(checks.length > 0 ? { checks } : {}),
@@ -250,7 +261,13 @@ function AddProjectForm(props: {
             <Field label="git 远程名" hint="调度器 push/fetch 的 remote；origin 指向公司镜像时可填 github">
               <input value={gitRemote} onChange={(e) => setGitRemote(e.target.value)} className={inputCls} />
             </Field>
-            <Field label="就绪标签" hint="打上此标签的 issue 会被领取">
+            <Field label="工作流模式" hint="github：Issue 七状态标签驱动，人工批准后才合并；legacy：旧的 ready label + 自动评审流程">
+              <select value={workflowMode} onChange={(e) => setWorkflowMode(e.target.value as 'github' | 'legacy')} className={inputCls}>
+                <option value="github">github — 七状态 Issue 工作流</option>
+                <option value="legacy">legacy — 旧流程</option>
+              </select>
+            </Field>
+            <Field label="就绪标签" hint={workflowMode === 'github' ? 'workflow 模式不使用就绪标签：所有 Issue 进入 Backlog' : '打上此标签的 issue 会被领取'}>
               <input value={readyLabel} onChange={(e) => setReadyLabel(e.target.value)} className={inputCls} />
             </Field>
             <Field label="分支前缀">
@@ -264,19 +281,21 @@ function AddProjectForm(props: {
                 className={inputCls}
               />
             </Field>
-            <Field label="评审模式" hint="auto：每个 PR head 派独立评审，低危 PASS 自动合并">
+            {workflowMode === 'legacy' && <Field label="评审模式" hint="auto：每个 PR head 派独立评审，低危 PASS 自动合并">
               <select value={reviewMode} onChange={(e) => setReviewMode(e.target.value as 'auto' | 'manual')} className={inputCls}>
                 <option value="auto">auto — 自动评审+低危自动合并</option>
                 <option value="manual">manual — PR 停人工评审</option>
               </select>
-            </Field>
+            </Field>}
             <Field label="外部 PR 评审" hint="无 issue 的 PR 是否自动评审">
               <select value={prReview} onChange={(e) => setPrReview(e.target.value as 'auto' | 'manual')} className={inputCls}>
                 <option value="auto">auto — 自动评审</option>
                 <option value="manual">manual — 仅 agent-review 召唤</option>
               </select>
             </Field>
-            <Field label="自动接手 Issue" hint="新 Issue 默认排队，同一个 Agent 判断并处理；人工锁定和暂缓项不会启动">
+            <Field label="自动接手 Issue" hint={workflowMode === 'github'
+              ? issueTriage ? '新 Issue 进入 Backlog，人工移到 Todo 后才派发' : '只有带就绪标签的 Issue 会建卡并进入 Backlog'
+              : '新 Issue 默认排队，同一个 Agent 判断并处理；人工锁定和暂缓项不会启动'}>
               <div className="flex h-[31px] items-center gap-2 text-[11.5px] text-fg-muted">
                 <input type="checkbox" checked={issueTriage} onChange={e => setIssueTriage(e.target.checked)} className="accent-brand" />
                 开启全量扫描

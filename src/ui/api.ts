@@ -8,12 +8,25 @@ import { appendProjectToConfigFile, ConfigError } from '../config.js';
 import { runProc } from '../proc.js';
 import { requiredLabelsForProject } from '../tracker/github.js';
 import type { IssueTriage } from '../triage/service.js';
-import { taskActions, taskAttention, type Attention, type TaskActions } from './task-state.js';
+import { taskActions, taskAttention, workflowAttention, workflowRecordOf, type Attention, type TaskActions } from './task-state.js';
+import type { WorkflowState } from '../scheduler/issue-workflow.js';
 
-export interface TaskSummary {
+export type { WorkflowState } from '../scheduler/issue-workflow.js';
+
+export interface TaskPresentation {
   actions?: TaskActions;
+  /** True when the task is pinned to the GitHub seven-state workflow. */
+  workflow: boolean;
+  /** Cached GitHub workflow state for #6 tasks; legacy tasks are null. */
+  workflow_state: WorkflowState | null;
+  workflow_reason: string | null;
+  workflow_generation: number | null;
+  workflow_handoff: boolean;
   attention?: Attention | null;
   intake?: IntakeState | null;
+}
+
+export interface TaskSummary extends TaskPresentation {
   id: number;
   repo: string;
   issue_number: number;
@@ -36,7 +49,7 @@ export interface RunDetail extends RunRow {
 }
 
 export interface TaskDetail {
-  task: TaskRow & { intake?: IntakeState | null; actions?: TaskActions; attention?: Attention | null };
+  task: TaskRow & TaskPresentation;
   runs: RunDetail[];
   has_active_run: boolean;
   retryable: boolean;
@@ -65,7 +78,7 @@ export interface UiDeps {
   /** Optional canonical-name resolution (follows rename redirects). */
   resolveRepo?: (repo: string) => Promise<string>;
   /** Optional label provisioning; returns warnings. */
-  provisionRepo?: (repo: string, readyLabel: string, triageEnabled: boolean) => Promise<string[]>;
+  provisionRepo?: (repo: string, readyLabel: string, triageEnabled: boolean, workflow?: boolean) => Promise<string[]>;
 }
 
 export interface ProjectInfo {
@@ -77,6 +90,7 @@ export interface ProjectInfo {
   git_remote: string;
   ready_label: string;
   branch_prefix: string;
+  workflow_mode: 'github' | 'legacy';
   review_mode: 'auto' | 'manual';
   pr_review: 'auto' | 'manual';
   checks: { argv: string[]; timeout_seconds?: number; platforms?: string[] }[];
@@ -94,6 +108,7 @@ export function projectsPayload(deps: UiDeps): { projects: ProjectInfo[]; config
       git_remote: p.git_remote,
       ready_label: p.ready_label,
       branch_prefix: p.branch_prefix,
+      workflow_mode: p.workflow_mode ?? 'github',
       review_mode: p.review_mode,
       pr_review: p.pr_review,
       issue_triage: p.issue_triage ?? { enabled: false, timeout_seconds: 180 },
@@ -184,6 +199,8 @@ export async function addProjectPayload(
     const v = optStr(o, key);
     if (v !== undefined && v !== 'auto' && v !== 'manual') return err(400, `${key} 只能是 auto 或 manual`);
   }
+  const workflowMode = optStr(o, 'workflow_mode') ?? 'github';
+  if (workflowMode !== 'github' && workflowMode !== 'legacy') return err(400, 'workflow_mode 只能是 github 或 legacy');
   if (o['checks'] !== undefined && !Array.isArray(o['checks'])) return err(400, 'checks 必须是数组');
 
   const warnings: string[] = [];
@@ -217,7 +234,8 @@ export async function addProjectPayload(
     git_remote: gitRemote,
     ready_label: optStr(o, 'ready_label') ?? 'agent-ready',
     branch_prefix: optStr(o, 'branch_prefix') ?? 'agent/issue-',
-    review_mode: optStr(o, 'review_mode') ?? 'auto',
+    workflow_mode: workflowMode,
+    review_mode: optStr(o, 'review_mode') ?? (workflowMode === 'github' ? 'manual' : 'auto'),
     pr_review: optStr(o, 'pr_review') ?? 'auto',
   };
   if (Array.isArray(o['checks']) && o['checks'].length > 0) raw['checks'] = o['checks'];
@@ -237,12 +255,12 @@ export async function addProjectPayload(
 
   if (deps.provisionRepo) {
     try {
-      warnings.push(...await deps.provisionRepo(repo, project?.ready_label ?? 'agent-ready', project ? acceptsAllIssues(project) : false));
+      warnings.push(...await deps.provisionRepo(repo, project?.ready_label ?? 'agent-ready', project ? acceptsAllIssues(project) : false, project?.workflow_mode === 'github'));
     } catch (e) {
       warnings.push(`标签准备失败：${String(e).slice(0, 160)}`);
     }
   } else {
-    warnings.push(`请确认 ${repo} 存在标签：${requiredLabelsForProject(project?.ready_label ?? 'agent-ready', project ? acceptsAllIssues(project) : false).join(', ')}（ac doctor 可检查）`);
+    warnings.push(`请确认 ${repo} 存在标签：${requiredLabelsForProject(project?.ready_label ?? 'agent-ready', project ? acceptsAllIssues(project) : false, project?.workflow_mode === 'github').join(', ')}（ac doctor 可检查）`);
   }
 
   return {
@@ -259,6 +277,7 @@ const RED_PHASES: Phase[] = ['BLOCKED', 'BLOCKED_APPROVAL_CHANGED', 'FAILED', 'R
 
 function taskPresentation(store: Store, task: TaskRow, last: RunRow | undefined, active: boolean, config?: AppConfig) {
   const intake = store.getIntake<IntakeState>(task.repo, task.issue_number);
+  const workflow = workflowRecordOf(task);
   let reviewSummary = '';
   if (last && (last.phase === task.status || task.source === 'pr' && task.status === 'AWAITING_HUMAN' && last.kind === 'review' && last.phase === 'COMPLETED') && ['AWAITING_HUMAN', 'BLOCKED', 'FAILED'].includes(task.status)) {
     for (const event of store.eventsForRun(last.run_id).reverse()) {
@@ -268,7 +287,18 @@ function taskPresentation(store: Store, task: TaskRow, last: RunRow | undefined,
       } catch { /* Older event details may not be structured. */ }
     }
   }
-  return { intake, actions: taskActions(task, active, intake, config), attention: taskAttention(task, last, intake, reviewSummary) };
+  return {
+    intake,
+    workflow: task.issue_workflow_json !== null,
+    workflow_state: workflow.record?.observed_state ?? null,
+    workflow_reason: workflow.corrupt ? '工作流记录损坏，无法判断 Issue 状态' : workflow.record?.diagnostic ?? null,
+    workflow_generation: workflow.record?.generation ?? null,
+    workflow_handoff: workflow.record?.handoff !== null && workflow.record?.handoff !== undefined,
+    actions: taskActions(task, active, intake, config),
+    attention: workflow.corrupt || workflow.record
+      ? workflowAttention(task, workflow.record, workflow.corrupt)
+      : taskAttention(task, last, intake, reviewSummary),
+  };
 }
 
 export function tasksPayload(store: Store, config?: AppConfig): { tasks: TaskSummary[] } {
@@ -311,7 +341,7 @@ export function taskPayload(store: Store, id: number, config?: AppConfig): TaskD
     task: { ...task, ...taskPresentation(store, task, store.runsForTask(id).at(-1), !!store.activeRunForTask(id), config) },
     runs,
     has_active_run: store.activeRunForTask(id) !== null,
-    retryable: [...RED_PHASES, 'CANCELED'].includes(task.status),
+    retryable: task.issue_workflow_json === null && [...RED_PHASES, 'CANCELED'].includes(task.status),
   };
 }
 
@@ -386,54 +416,59 @@ export function artifactPayload(
 }
 
 /**
- * Incremental read of a run's agent log for the live view. The client passes
- * the byte offset it already consumed; we answer with whole lines only, so a
- * half-written JSONL record is never handed out.
+ * Pick the agent log a live view should follow: an explicitly named one (the
+ * client pinned it) or the newest one — the coder log during RUNNING/FIXING,
+ * the reviewer log during REVIEWING.
  */
-export function tailPayload(
+export function runLogFile(
   logsDir: string,
   runId: string,
   rawFile: string | null,
-  rawOffset: string | null,
-): { status: number; body: Record<string, unknown> } {
-  if (!/^[A-Za-z0-9_-]+$/.test(runId)) return { status: 400, body: { error: 'bad run id' } };
+): { status: number; error?: string; file?: string } {
+  if (!/^[A-Za-z0-9_-]+$/.test(runId)) return { status: 400, error: 'bad run id' };
   const root = resolve(logsDir);
   const dir = resolve(join(root, 'artifacts', runId));
-  if (!dir.startsWith(root + sep)) return { status: 403, body: { error: 'path outside logs_dir' } };
+  if (!dir.startsWith(root + sep)) return { status: 403, error: 'path outside logs_dir' };
 
-  let file: string;
   if (rawFile) {
     const base = rawFile.split(/[\\/]/).pop() ?? '';
     if (!/^(?:agent|review-agent)-[\w.-]+\.jsonl$/.test(base)) {
-      return { status: 400, body: { error: 'not an agent log' } };
+      return { status: 400, error: 'not an agent log' };
     }
-    file = join(dir, base);
-  } else {
-    let names: string[];
-    try { names = readdirSync(dir); } catch { return { status: 404, body: { error: 'no artifacts for run' } }; }
-    // Follow whichever log is being written now: the coder log during
-    // RUNNING/FIXING, the reviewer log during REVIEWING.
-    const agentLogs = names
-      .filter((n) => /^(?:agent|review-agent)-[\w.-]+\.jsonl$/.test(n))
-      .map((n) => ({ n, m: statSync(join(dir, n)).mtimeMs }))
-      .sort((a, b) => b.m - a.m);
-    if (agentLogs.length === 0) return { status: 404, body: { error: 'no agent log yet' } };
-    file = join(dir, agentLogs[0]!.n);
+    return { status: 200, file: join(dir, base) };
   }
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return { status: 404, error: 'no artifacts for run' }; }
+  const agentLogs = names
+    .filter((n) => /^(?:agent|review-agent)-[\w.-]+\.jsonl$/.test(n))
+    .map((n) => ({ n, m: statSync(join(dir, n)).mtimeMs }))
+    .sort((a, b) => b.m - a.m);
+  if (agentLogs.length === 0) return { status: 404, error: 'no agent log yet' };
+  return { status: 200, file: join(dir, agentLogs[0]!.n) };
+}
 
+/**
+ * Incremental read of one agent log. `offset === null` means "first read":
+ * tail the file instead of replaying megabytes of history. Only whole lines
+ * are returned, so a half-written JSONL record is never handed out.
+ */
+export function readLogChunk(
+  file: string,
+  offset: number | null,
+  window = MAX_TAIL_CHUNK,
+): { status: number; error?: string; size?: number; offset?: number; chunk?: string; pending?: number; skipped?: number } {
   let size: number;
   try {
     const st = statSync(file);
-    if (!st.isFile()) return { status: 404, body: { error: 'not a file' } };
+    if (!st.isFile()) return { status: 404, error: 'not a file' };
     size = st.size;
   } catch {
-    return { status: 404, body: { error: 'log disappeared' } };
+    return { status: 404, error: 'log disappeared' };
   }
 
   let start: number;
-  const initial = rawOffset == null;
+  const initial = offset == null;
   if (initial) {
-    // First poll: tail the file instead of replaying megabytes of history.
     start = Math.max(0, size - INITIAL_TAIL_BYTES);
     if (start > 0 && start < size) {
       // Align to the next line boundary so the first record is not a fragment.
@@ -446,11 +481,10 @@ export function tailPayload(
       } finally { closeSync(fd); }
     }
   } else {
-    const asked = Number(rawOffset);
-    start = Number.isFinite(asked) && asked > 0 ? Math.floor(asked) : 0;
+    start = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
     if (start > size) start = 0; // rotated or truncated file
   }
-  const window = initial ? INITIAL_TAIL_BYTES : MAX_TAIL_CHUNK;
+  const readWindow = initial ? INITIAL_TAIL_BYTES : window;
 
   const readAt = (from: number, len: number): Buffer => {
     const buf = Buffer.alloc(Math.max(0, len));
@@ -460,7 +494,7 @@ export function tailPayload(
   };
 
   let skipped = 0;
-  let buf = readAt(start, Math.min(window, size - start));
+  let buf = readAt(start, Math.min(readWindow, size - start));
   let lastLf = buf.lastIndexOf(0x0a);
   // A single record can dwarf the window (pi echoes the whole system prompt in
   // one message_start line, several MB). Skipping it beats stalling the view.
@@ -470,7 +504,7 @@ export function tailPayload(
     if (lf >= 0) {
       skipped = lf + 1;
       start += skipped;
-      buf = readAt(start, Math.min(window, size - start));
+      buf = readAt(start, Math.min(readWindow, size - start));
       lastLf = buf.lastIndexOf(0x0a);
     } else {
       skipped = scan.length;
@@ -480,19 +514,40 @@ export function tailPayload(
     }
   }
   // Never return a partial trailing line: everything after the last LF waits
-  // for the next poll. (A caller that starts mid-record may receive one
+  // for the next read. (A caller that starts mid-record may receive one
   // fragment; clients skip lines that fail to parse.)
   const usable = lastLf >= 0 ? buf.subarray(0, lastLf + 1) : Buffer.alloc(0);
   const consumed = start + usable.length;
   return {
     status: 200,
+    size,
+    offset: consumed,
+    chunk: usable.toString('utf8'),
+    pending: size - consumed,
+    skipped,
+  };
+}
+
+export function tailPayload(
+  logsDir: string,
+  runId: string,
+  rawFile: string | null,
+  rawOffset: string | null,
+): { status: number; body: Record<string, unknown> } {
+  const picked = runLogFile(logsDir, runId, rawFile);
+  if (picked.status !== 200) return { status: picked.status, body: { error: picked.error } };
+  const offset = rawOffset == null ? null : Number(rawOffset);
+  const out = readLogChunk(picked.file!, offset);
+  if (out.status !== 200) return { status: out.status, body: { error: out.error } };
+  return {
+    status: 200,
     body: {
-      file: file.split(/[\\/]/).pop(),
-      size,
-      offset: consumed,
-      chunk: usable.toString('utf8'),
-      pending: size - consumed,
-      skipped,
+      file: picked.file!.split(/[\\/]/).pop(),
+      size: out.size,
+      offset: out.offset,
+      chunk: out.chunk,
+      pending: out.pending,
+      skipped: out.skipped,
     },
   };
 }
