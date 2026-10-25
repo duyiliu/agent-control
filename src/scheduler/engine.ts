@@ -236,7 +236,11 @@ export class Engine {
       return false;
     }
     if (unresolvedDecisions(control, pr.headSha).length || this.reviewDenied(control, pr.headSha)) return false;
-    if (control.assessment && (control.assessment.findings.length || control.assessment.verification_requests.length
+    // Evidence-only leftovers may pass solely on an explicit human approval:
+    // a fix round already proved them non-actionable. Automatic merge never
+    // gets here with them (autoMergeEligibility requires zero requests).
+    const evidenceOnly = control.evidence_only_sha === pr.headSha && task.approved_by === 'human';
+    if (control.assessment && (control.assessment.findings.length || (!evidenceOnly && control.assessment.verification_requests.length)
       || control.assessment.compatibility.kind === 'unknown' || control.assessment.compatibility.kind === 'breaking')) return false;
     if (project.review_mode === 'auto' && !control.assessment) return false;
     if (!pr.baseSha || !control.base_sha || pr.baseSha !== control.base_sha) {
@@ -1644,6 +1648,16 @@ export class Engine {
             // review already BLOCKED — there is nothing new to publish.
             const reviewedSha = this.store.getRun(runId)?.head_sha ?? run.head_sha;
             if (reviewedSha && verifiedHead === reviewedSha) {
+              // A fix round with nothing to commit proves the leftovers are not
+              // code-actionable. When only verification requests remain (no
+              // findings), demanding another repair round can never converge:
+              // hand the evidence judgement to the human instead of dead-ending.
+              const control = this.store.getReviewControl(task.id);
+              if (control?.assessment && !control.assessment.findings.length && control.assessment.verification_requests.length) {
+                this.store.saveReviewControl(task.id, { ...control, evidence_only_sha: verifiedHead });
+                this.finish(run, task, 'AWAITING_HUMAN', '仅剩无法由代码修复的验证证据项，已转人工判断');
+                return;
+              }
               this.finish(run, task, 'BLOCKED', 'fix run produced no new commits; reviewed sha unchanged');
               return;
             }

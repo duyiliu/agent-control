@@ -323,4 +323,8 @@ export interface ReviewControl {
   assessment?: ReviewAssessment;
   decisions: DecisionRequest[];
   resolutions: DecisionResolution[];
+  /** Head whose remaining verification requests were proven non-actionable by
+   *  a fix round that produced no commits. Only an explicit human approval may
+   *  merge past them; automatic merge stays strict. */
+  evidence_only_sha?: string | null;
 }

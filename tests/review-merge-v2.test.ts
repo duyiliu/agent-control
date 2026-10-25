@@ -94,6 +94,30 @@ for (const check of ['FAIL', 'missing', 'unguarded'] as const) test(`v2 merge re
   const e = setup({ checks: check, approvedBy: 'human' }); try { await e.drive(); assert.deepEqual(e.tracker.merged, []); } finally { e.done(); }
 });
 
+test('evidence-only verification requests merge only on explicit human approval', async () => {
+  const e = setup({ approvedBy: 'human' }); try {
+    const c = e.store.getReviewControl(e.task.id)!;
+    c.assessment!.verification_requests.push({ claim: 'Extension Host smoke ran in the target host', scenario: 'green CI on this sha', expected: 'non-zero exit on assertion failure' });
+    e.store.saveReviewControl(e.task.id, c);
+    await e.drive();
+    assert.deepEqual(e.tracker.merged, [], 'without the waiver the requests still block');
+    e.store.saveReviewControl(e.task.id, { ...e.store.getReviewControl(e.task.id)!, evidence_only_sha: head });
+    await e.drive();
+    assert.deepEqual(e.tracker.merged, [40]);
+  } finally { e.done(); }
+});
+
+test('automatic approval never merges past verification requests even with the waiver', async () => {
+  const e = setup(); try {
+    const c = e.store.getReviewControl(e.task.id)!;
+    c.assessment!.verification_requests.push({ claim: 'CI ran', scenario: 'green run', expected: 'all jobs pass' });
+    e.store.saveReviewControl(e.task.id, { ...c, evidence_only_sha: head });
+    await e.drive();
+    assert.deepEqual(e.tracker.merged, []);
+    assert.notEqual(e.current().status, 'COMPLETED');
+  } finally { e.done(); }
+});
+
 for (const obstacle of ['finding', 'verification', 'unknown', 'no-assessment', 'decision', 'denied'] as const) test(`v2 ${obstacle} cannot be bypassed by direct merge or agent-merge`, async () => {
   const e = setup({ approvedBy: 'human' }); try {
     const c = e.store.getReviewControl(e.task.id)!;
