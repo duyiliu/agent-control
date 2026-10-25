@@ -16,9 +16,9 @@ import { assessmentResult } from '../verify/review-v2.js';
 import { runReview, ReviewInfraError } from '../verify/review.js';
 import { createHash } from 'node:crypto';
 import { newReviewControl, reserveReview, reserveFix, retryReview, unresolvedDecisions, validateReviewAssessment } from '../verify/review-policy.js';
-import type { ReviewControl, ReviewAssessment, DecisionRequest } from '../types.js';
+import type { ReviewControl, ReviewAssessment, ReviewScope, DecisionRequest } from '../types.js';
 import { publishDraftPr, PublishError } from '../publish/pr.js';
-import { buildCoderPrompt, buildFixPrompt, CODER_RESUME_NOTE, type PromptContext } from './prompts.js';
+import { buildCoderPrompt, buildFixPrompt, CODER_RESUME_NOTE, MAX_REVIEW_DIFF_CHARS, type PromptContext } from './prompts.js';
 import {
   classifyPath, DEFAULT_POLICY, filterGenerated, SENSITIVE_PATH, splitDiff, type PathPolicy,
 } from './diff-paths.js';
@@ -79,6 +79,14 @@ function fmtSpan(fromIso: string, toIso: string | null): string {
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
+function priorReviewItems(assessment: ReviewAssessment): string {
+  const items = [
+    ...assessment.findings.map(f => `[finding] ${f.file}:${f.line} ${f.trigger} → ${f.impact}；验证：${f.verification}`),
+    ...assessment.verification_requests.map(v => `[verification] ${v.claim}；场景：${v.scenario}；通过标准：${v.expected}`),
+  ];
+  return items.length ? items.join('\n') : '（上轮无未解决项）';
 }
 
 export class Engine {
@@ -1878,6 +1886,24 @@ export class Engine {
         return;
       }
 
+      // Incremental re-review: a completed prior assessment at an older head
+      // scopes the reviewer to the fix delta plus that round's open items.
+      // The full diff stays in review-diff.patch; any delta failure falls back.
+      let reviewScope: ReviewScope | undefined;
+      const priorControl = this.store.getReviewControl(task.id);
+      if (priorControl?.assessment && priorControl.head_sha && priorControl.head_sha !== reviewedSha) {
+        try {
+          const delta = filterGenerated(await this.workspace.diffVsBase(sitePath, priorControl.head_sha, Number.POSITIVE_INFINITY), this.pathPolicy());
+          if (delta.patch.trim() && delta.patch.length <= MAX_REVIEW_DIFF_CHARS / 2) {
+            reviewDiff = delta;
+            reviewScope = { fromSha: priorControl.head_sha, toSha: reviewedSha, priorItems: priorReviewItems(priorControl.assessment) };
+            this.appLog.event('review_incremental_scope', { run: runId, from: priorControl.head_sha.slice(0, 8), to: reviewedSha.slice(0, 8), chars: delta.patch.length });
+          }
+        } catch (err) {
+          this.appLog.event('review_incremental_fallback', { run: runId, error: String(err).slice(0, 200) });
+        }
+      }
+
       let outcome: Awaited<ReturnType<typeof runReview>> | undefined;
       let reviewError: unknown;
       let hostCheckFailed = false;
@@ -1904,6 +1930,7 @@ export class Engine {
           timeoutMs: Math.min(this.config.server.max_task_minutes, this.store.getReviewControl(task.id) ? this.config.review_policy?.timeout_minutes ?? 10 : this.config.server.max_task_minutes) * 60_000,
           policyVersion: this.store.getReviewControl(task.id) ? 2 : 1,
           previousReviewContext: this.previousReviewContext(task),
+          reviewScope,
           artifactsDir: this.artifactsDirFor(run), signal, headSha: reviewedSha,
           onSpawn: (pid, identity) => store.updateRunFields(runId, { pid, process_identity: identity }),
         });

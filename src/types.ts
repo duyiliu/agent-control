@@ -304,6 +304,13 @@ export interface ReviewAssessment {
   compatibility: { kind: 'unchanged' | 'additive' | 'breaking' | 'unknown'; evidence: string[] };
 }
 
+/** Incremental re-review scope: delta between the last reviewed head and the current head. */
+export interface ReviewScope {
+  fromSha: string;
+  toSha: string;
+  priorItems: string;
+}
+
 export interface ReviewControl {
   policy_version: 2;
   requirement_hash: string;

@@ -92,3 +92,18 @@ test('v2 prompt names meaningful boundary coverage and no shell authority', () =
     assert.match(p, /非 Error 拒绝值/); assert.match(p, /契约版本号、文件数\/行数/); assert.match(p, /不得修改文件、运行 shell/); assert.doesNotMatch(p, /risk=high/);
   } finally { cleanup(e.dir); }
 });
+test('v2 incremental scope narrows the prompt to the delta and prior open items', () => {
+  const e = setup(); try {
+    const scope = { fromSha: 'aaaabbbbccccdddd', toSha: 'eeeeffff00001111', priorItems: '[finding] src/a.js:1 x → y；验证：z\n[verification] c；场景：s；通过标准：e' };
+    const p = buildReviewPrompt(e.ctx, 'checks', 'delta', 'sha', false, 2, '', scope);
+    assert.match(p, /增量复审/);
+    assert.match(p, /aaaabbbb/);
+    assert.match(p, /\[finding\] src\/a\.js:1 x → y/);
+    assert.match(p, /增量未触及的代码不得新报 findings/);
+    assert.match(p, /增量改动（数据）/);
+    assert.doesNotMatch(p, /待审变更（数据）/);
+    const full = buildReviewPrompt(e.ctx, 'checks', 'diff', 'sha', false, 2);
+    assert.match(full, /待审变更（数据）/);
+    assert.doesNotMatch(full, /增量复审/);
+  } finally { cleanup(e.dir); }
+});

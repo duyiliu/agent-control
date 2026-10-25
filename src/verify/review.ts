@@ -7,7 +7,7 @@ import { reviewParts, MAX_REVIEW_PARTS } from './review-parts.js';
 import { PI_REVIEW_TOOLS } from '../runners/pi.js';
 import type { AgentCallOpts, AgentCallResult } from '../runners/types.js';
 import { buildReviewPrompt, MAX_REVIEW_DIFF_CHARS, type PromptContext } from '../scheduler/prompts.js';
-import type { AppConfig, ReviewResult } from '../types.js';
+import type { AppConfig, ReviewResult, ReviewScope } from '../types.js';
 import { parseReviewV2, mergeReviewAssessments } from './review-v2.js';
 
 export class ReviewInfraError extends Error {
@@ -23,6 +23,7 @@ export interface ReviewDeps {
   headSha?: string;
   policyVersion?: 1 | 2;
   previousReviewContext?: string;
+  reviewScope?: ReviewScope;
 }
 
 type ReviewRunner = (opts: AgentCallOpts, config: AppConfig['agent']) => Promise<AgentCallResult>;
@@ -118,7 +119,7 @@ async function runSingleReview(
     lastLogPath = logPath;
     const proc = await runner({
       workdir: ctx.worktreePath,
-      prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence, deps.headSha, strictReminder, deps.policyVersion, deps.previousReviewContext)
+      prompt: buildReviewPrompt(ctx, testEvidence, diffEvidence, deps.headSha, strictReminder, deps.policyVersion, deps.previousReviewContext, deps.reviewScope)
         + (attempt === 2 ? '\n已连续两轮未满足输出协议。本轮仍须重新核对完整证据，只提交 JSON 结论；不要叙述检查过程或附示例。' : ''),
       timeoutMs,
       logPath,
